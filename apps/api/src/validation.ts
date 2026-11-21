@@ -12,3 +12,9 @@ export function parseInput<T>(schema: ZodType<T>, input: unknown): T {
   }
   return result.data;
 }
+
+export function postgresErrorCode(error: unknown): string | undefined {
+  const cause = error instanceof Error ? error.cause : undefined;
+  if (cause instanceof Error && 'code' in cause && typeof cause.code === 'string') return cause.code;
+  return undefined;
+}

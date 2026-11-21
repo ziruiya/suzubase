@@ -1,3 +1,4 @@
+import { fieldTypes, type FieldChange, type RecordData } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -71,7 +72,7 @@ export const appVersions = pgTable('app_versions', {
   foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
 ]);
 
-export const fieldType = pgEnum('field_type', ['text', 'number']);
+export const fieldType = pgEnum('field_type', fieldTypes);
 
 export const fields = pgTable('fields', {
   tenantId: tenantId(),
@@ -104,7 +105,7 @@ export const records = pgTable('records', {
   appId: uuid('app_id').notNull(),
   id: uuid().notNull().defaultRandom(),
   recordNo: bigint('record_no', { mode: 'bigint' }).notNull(),
-  data: jsonb().$type<Record<string, string>>().notNull(),
+  data: jsonb().$type<RecordData>().notNull(),
   schemaVersion: integer('schema_version').notNull(),
   revision: integer().notNull().default(1),
   status: text().notNull().default('active'),
@@ -148,5 +149,46 @@ export const recordReferences = pgTable('record_references', {
     name: 'record_references_target_fk',
     columns: [t.tenantId, t.targetAppId, t.targetRecordId],
     foreignColumns: [records.tenantId, records.appId, records.id],
+  }),
+]);
+
+export const recordEvents = pgTable('record_events', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  eventId: uuid('event_id').notNull().defaultRandom(),
+  recordId: uuid('record_id').notNull(),
+  recordRevision: integer('record_revision').notNull(),
+  schemaVersion: integer('schema_version').notNull(),
+  actorId: uuid('actor_id').notNull(),
+  source: text().notNull(),
+  kind: text().notNull(),
+  occurredAt: time('occurred_at').notNull().defaultNow(),
+  changes: jsonb().$type<FieldChange[]>().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.eventId] }),
+  unique().on(t.tenantId, t.appId, t.recordId, t.recordRevision),
+  foreignKey({
+    columns: [t.tenantId, t.appId, t.recordId],
+    foreignColumns: [records.tenantId, records.appId, records.id],
+  }),
+  foreignKey({
+    columns: [t.tenantId, t.appId, t.schemaVersion],
+    foreignColumns: [appVersions.tenantId, appVersions.appId, appVersions.version],
+  }),
+  foreignKey({ columns: [t.tenantId, t.actorId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
+export const outbox = pgTable('outbox', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  eventId: uuid('event_id').notNull(),
+  topic: text().notNull(),
+  createdAt: time('created_at').notNull().defaultNow(),
+  processedAt: time('processed_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.eventId] }),
+  foreignKey({
+    columns: [t.tenantId, t.appId, t.eventId],
+    foreignColumns: [recordEvents.tenantId, recordEvents.appId, recordEvents.eventId],
   }),
 ]);

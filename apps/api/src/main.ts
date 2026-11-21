@@ -3,6 +3,8 @@ import { randomBytes } from 'node:crypto';
 import { JwtModule } from '@nestjs/jwt';
 import { SessionController, SessionGuard } from './identity';
 import { AuthorizationService } from './authorization';
+import { AppSchemaController, AppSchemaService } from './app-schema';
+import { RecordService, RecordsController } from './records';
 import { Controller, Get, Module, ServiceUnavailableException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
@@ -30,8 +32,8 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController],
-  providers: [AuthorizationService, SessionGuard],
+  controllers: [HealthController, SessionController, AppSchemaController, RecordsController],
+  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService],
 })
 class AppModule {}
 

@@ -67,4 +67,18 @@ async function login(identity) {
   return result.accessToken;
 }
 
-module.exports = { configureRuntime, expectRequest, login, provision };
+async function createApp(token, code = 'orders') {
+  return expectRequest(201, '/apps', { method: 'POST', token, body: { code, name: 'Orders' } });
+}
+
+async function addField(token, appId, code, type) {
+  return expectRequest(201, `/apps/${appId}/fields`, {
+    method: 'POST', token, body: { code, name: code, type },
+  });
+}
+
+async function publish(token, appId) {
+  return expectRequest(201, `/apps/${appId}/publish`, { method: 'POST', token });
+}
+
+module.exports = { addField, configureRuntime, createApp, expectRequest, login, provision, publish };

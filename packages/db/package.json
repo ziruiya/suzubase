@@ -9,6 +9,7 @@
     "migrate": "node dist/migrate.js"
   },
   "dependencies": {
+    "@suzubase/shared-types": "workspace:*",
     "drizzle-orm": "^0.44.7",
     "pg": "^8.16.3"
   },
