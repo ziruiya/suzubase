@@ -48,6 +48,8 @@ services:
   web:
     <<: *workspace
     command: pnpm --filter @suzubase/web exec vite preview --host 0.0.0.0 --port 5173
+    environment:
+      SUZUBASE_API_ORIGIN: http://api:3000
     ports:
       - "127.0.0.1:${WEB_PORT:-5173}:5173"
 

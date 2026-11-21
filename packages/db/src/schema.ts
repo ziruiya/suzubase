@@ -12,6 +12,8 @@ export const tenants = pgTable('tenants', {
   id: uuid().primaryKey().defaultRandom(),
   name: text().notNull(),
   allowAppCreation: boolean('allow_app_creation').notNull().default(false),
+  localDrafts: boolean('local_drafts').notNull().default(true),
+  timeZone: text('time_zone').notNull().default('Asia/Tokyo'),
   passwordMinimum: integer('password_minimum').notNull().default(12),
   passwordComplexity: boolean('password_complexity').notNull().default(true),
 });
@@ -83,6 +85,7 @@ export const apps = pgTable('apps', {
   attachmentMaxBytes: integer('attachment_max_bytes').notNull().default(1048576),
   attachmentMaxCount: integer('attachment_max_count').notNull().default(5),
   attachmentTypes: jsonb('attachment_types').$type<string[]>().notNull().default(sql`'["image/png","image/jpeg","application/pdf"]'::jsonb`),
+  localDrafts: boolean('local_drafts').notNull().default(true),
   adminMemo: text('admin_memo').notNull().default(''),
   archivedAt: time('archived_at'),
   deletedAt: time('deleted_at'),

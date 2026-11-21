@@ -21,6 +21,14 @@ const newUser = z.strictObject({
 });
 const organization = z.strictObject({ name, parentId: identifier.nullable() });
 const policy = z.strictObject({
+  localDrafts: z.boolean().optional(),
+  timeZone: z.string().max(64).refine((value) => {
+    try {
+      return /^[A-Za-z0-9_+/-]+$/.test(value) && Boolean(new Intl.DateTimeFormat('en', { timeZone: value }));
+    } catch {
+      return false;
+    }
+  }).optional(),
   allowAppCreation: z.boolean(), passwordMinimum: z.number().int().min(8).max(128), passwordComplexity: z.boolean(),
 });
 

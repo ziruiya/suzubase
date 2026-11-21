@@ -381,6 +381,19 @@ export class RecordService {
     });
   }
 
+  async form(context: TenantContext, appId: string, id: string) {
+    return withTenantTransaction(context, async (tx) => {
+      const { access } = await this.appSchema.access(tx, context, appId, 'view');
+      const record = await this.findRecord(tx, context, appId, id);
+      const fields = await this.appSchema.getFields(tx, context, appId, record.schemaVersion);
+      const matchingActions = await tx.select({
+        edit: sql<boolean>`COALESCE(${this.authorization.recordScope(access, 'edit') ?? sql`true`}, false)`,
+        delete: sql<boolean>`COALESCE(${this.authorization.recordScope(access, 'delete') ?? sql`true`}, false)`,
+      }).from(records).where(and(eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, id)));
+      return { record, fields: this.appSchema.formFields(fields, access), can: matchingActions[0] };
+    });
+  }
+
   async history(context: TenantContext, appId: string, id: string) {
     return withTenantTransaction(context, async (tx) => {
       await this.findRecord(tx, context, appId, id);
@@ -496,6 +509,12 @@ export class RecordsController {
     @Param('recordId') id: string, @Body() body: unknown) {
     const { revision } = parseInput(revisionInput, body);
     return this.service.changeLifecycle(context, parseInput(identifier, appId), parseInput(identifier, id), revision, true);
+  }
+
+  @Get(':recordId/form')
+  @AllowApiToken('view')
+  form(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') id: string) {
+    return this.service.form(context, parseInput(identifier, appId), parseInput(identifier, id));
   }
 
   @Get(':recordId/history')

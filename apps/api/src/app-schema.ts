@@ -25,6 +25,7 @@ const appInput = z.strictObject(metadata);
 const settingsInput = z.strictObject({
   name: metadata.name.optional(),
   description: z.string().max(4000).optional(),
+  localDrafts: z.boolean().optional(),
   icon: z.string().max(64).nullable().optional(),
   themeColor: z.string().regex(/^#[0-9a-f]{6}$/i).nullable().optional(),
   titleFieldId: identifier.nullable().optional(),
@@ -151,9 +152,9 @@ export class AppSchemaService {
       return await withTenantTransaction(context, async (tx) => {
         if (!await this.authorization.canCreateApp(tx, context)) throw new ForbiddenException('无权限');
         const source = await this.managedApp(tx, context, appId);
-        const { description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes } = source;
+        const { description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes, localDrafts } = source;
         const [copy] = await tx.insert(apps).values({
-          ...input, description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes,
+          ...input, description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes, localDrafts,
           tenantId: context.tenantId, createdBy: context.userId,
         }).returning();
         const identity = { tenantId: context.tenantId, appId: copy.id };
@@ -211,14 +212,31 @@ export class AppSchemaService {
   async getPublished(context: TenantContext, appId: string) {
     return withTenantTransaction(context, async (tx) => {
       const { app, fields, access } = await this.access(tx, context, appId, 'view');
-      const definitions = fields.filter(({ fieldId }) => this.authorization.fieldDecision(access, fieldId, 'view').allowed);
+      const definitions = this.formFields(fields, access);
+      const can = await this.formActions(tx, context, appId);
       const views = this.visibleViews(await this.getViews(tx, context, appId, app.publishedSchemaVersion), access);
       return { id: app.id, name: app.name, code: app.code, description: app.description, icon: app.icon,
         themeColor: app.themeColor,
         titleFieldId: app.titleFieldId && this.authorization.fieldDecision(access, app.titleFieldId, 'view').allowed
           ? app.titleFieldId : null,
-        archivedAt: app.archivedAt, schemaVersion: app.publishedSchemaVersion, fields: definitions, ...views };
+        archivedAt: app.archivedAt, localDrafts: app.localDrafts, can, schemaVersion: app.publishedSchemaVersion, fields: definitions, ...views };
     });
+  }
+
+  formFields(fields: Awaited<ReturnType<AppSchemaService['getFields']>>, access: RecordAccess) {
+    return fields.filter(({ fieldId }) => this.authorization.fieldDecision(access, fieldId, 'view').allowed)
+      .map((field) => ({ ...field, editable: field.type !== 'autoNumber' && this.authorization.editable(access, field.fieldId) }));
+  }
+
+  async formActions(tx: TenantTransaction, context: TenantContext, appId: string) {
+    const [allowed] = await tx.select({
+      create: sql<boolean>`COALESCE(${this.authorization.appScope(context, appId, 'create')}, false)`,
+      edit: sql<boolean>`COALESCE(${this.authorization.appScope(context, appId, 'edit')}, false)`,
+      delete: sql<boolean>`COALESCE(${this.authorization.appScope(context, appId, 'delete')}, false)`,
+      manage: sql<boolean>`COALESCE(${this.authorization.appScope(context, appId, 'manage')}, false)`,
+      export: sql<boolean>`COALESCE(${this.authorization.appScope(context, appId, 'export')}, false)`,
+    }).from(apps).where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
+    return allowed;
   }
 
   visibleViews(configuration: ViewConfiguration, access: RecordAccess) {

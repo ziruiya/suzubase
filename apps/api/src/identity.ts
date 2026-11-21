@@ -1,10 +1,10 @@
 import {
   Body, CanActivate, Controller, createParamDecorator, ExecutionContext, HttpCode,
-  Injectable, Post, SetMetadata, UnauthorizedException,
+  Get, Injectable, Post, SetMetadata, UnauthorizedException, UseGuards,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { ApiBody, ApiOkResponse, ApiTags } from '@nestjs/swagger';
-import { and, eq, tenantMembers, TenantContext, verifyApiToken, verifyLogin, withTenantTransaction } from '@suzubase/db';
+import { ApiBearerAuth, ApiBody, ApiOkResponse, ApiTags } from '@nestjs/swagger';
+import { and, eq, tenantMembers, tenants, users, TenantContext, verifyApiToken, verifyLogin, withTenantTransaction } from '@suzubase/db';
 import { z } from 'zod';
 import { ApiTokenAction } from '@suzubase/shared-types';
 import { identifier, parseInput } from './validation';
@@ -92,3 +92,26 @@ export const AuthenticatedTenant = createParamDecorator(
   (_data: unknown, context: ExecutionContext): TenantContext =>
     context.switchToHttp().getRequest<AuthenticatedRequest>().tenantContext,
 );
+
+@ApiTags('session')
+@ApiBearerAuth()
+@UseGuards(SessionGuard)
+@Controller('auth')
+export class SessionProfileController {
+  @Get('profile')
+  async profile(@AuthenticatedTenant() context: TenantContext) {
+    return withTenantTransaction(context, async (tx) => {
+      const [profile] = await tx.select({
+        displayName: users.displayName, email: users.email, isAdmin: tenantMembers.isAdmin,
+        canManageRecycleBin: tenantMembers.canManageRecycleBin, canCreateApps: tenantMembers.canCreateApps,
+        allowAppCreation: tenants.allowAppCreation, timeZone: tenants.timeZone, localDrafts: tenants.localDrafts,
+      }).from(tenantMembers).innerJoin(users, and(
+        eq(users.tenantId, tenantMembers.tenantId), eq(users.id, tenantMembers.userId),
+      )).innerJoin(tenants, eq(tenants.id, tenantMembers.tenantId)).where(and(
+        eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, context.userId),
+      ));
+      if (!profile) throw new UnauthorizedException('无权限');
+      return { ...profile, ...context, localDraftLogout: 'clear', draftExpiryHours: 168 };
+    });
+  }
+}
