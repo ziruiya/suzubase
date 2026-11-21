@@ -18,14 +18,24 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+  migrate:
+    <<: *workspace
+    command: pnpm --filter @suzubase/db migrate
+    environment:
+      ADMIN_DATABASE_URL: postgres://suzubase:suzubase-dev@postgres:5432/suzubase
+      MIGRATION_DATABASE_URL: postgres://suzubase_migration:suzubase-migration-dev@postgres:5432/suzubase
+      RUNTIME_DATABASE_PASSWORD: suzubase-runtime-dev
+    depends_on:
+      postgres:
+        condition: service_healthy
   api:
     <<: *workspace
     command: pnpm --filter @suzubase/api start
     environment:
       DATABASE_URL: postgres://suzubase:suzubase-dev@postgres:5432/suzubase
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:${API_PORT:-3000}:3000"
   web:
