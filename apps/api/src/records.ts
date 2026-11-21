@@ -312,7 +312,7 @@ export class RecordService {
 @UseGuards(SessionGuard)
 @Controller('apps/:appId/records')
 export class RecordsController {
-  constructor(private readonly service: RecordService) {}
+  constructor(private readonly service: RecordService, private readonly queries: RecordQueryService) {}
 
   @Post()
   @ApiHeader({
@@ -334,6 +334,16 @@ export class RecordsController {
   @Get()
   list(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
     return this.service.list(context, parseInput(identifier, appId), parseInput(pageInput, query));
+  }
+
+  @Get('aggregates')
+  aggregate(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
+    const { view, fields } = parseInput(z.strictObject({
+      view: identifier.optional(),
+      fields: z.string().max(369).transform((value) => value.split(','))
+        .pipe(z.array(identifier).max(10).refine((values) => new Set(values).size === values.length)).optional(),
+    }), query);
+    return this.queries.aggregate(context, parseInput(identifier, appId), view, fields ?? []);
   }
 
   @Post('batch')

@@ -31,6 +31,13 @@ test('G1-05 views publish atomically, filter by current user, and paginate numer
   const amounts = [...first.items, ...next.items].map(({ data }) => data[amount.fieldId]);
   assert.deepEqual(amounts, ['20', '100']);
   assert.equal(next.nextCursor, null);
+  const aggregates = await request(200, 'GET', '/records/aggregates?fields=' + amount.fieldId);
+  assert.equal(aggregates.count, '2');
+  assert.equal(aggregates.fields[0].sum, '120');
+  assert.equal(Number(aggregates.fields[0].average), 60);
+  await request(400, 'GET', '/records/aggregates?fields=' + assignee.fieldId);
+  t.diagnostic(JSON.stringify({ aggregates, handChecked: { count: 2, sum: 20 + 100, average: (20 + 100) / 2 } }));
+
   await request(200, 'DELETE', '/draft/views/' + view.id);
   assert.equal((await request(200, 'GET', '/records')).items.length, 2);
   await publish(token, app.id);
