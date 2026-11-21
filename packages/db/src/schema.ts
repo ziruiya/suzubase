@@ -1,4 +1,4 @@
-import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -418,4 +418,32 @@ export const apiTokens = authentication.table('api_tokens', {
   unique().on(t.secretHash),
   foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
   foreignKey({ columns: [t.tenantId, t.issuedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
+
+export const runtimeIndexState = pgEnum('runtime_index_state', ['building', 'available', 'failed']);
+export const runtimeIndexes = pgTable('runtime_indexes', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  fieldId: uuid('field_id').notNull(),
+  fieldType: fieldType('field_type').$type<FieldType>().notNull(),
+  purpose: text().$type<IndexPurpose>().notNull(),
+  reason: text().notNull(),
+  state: runtimeIndexState().notNull().default('building'),
+  requestedBy: uuid('requested_by').notNull(),
+  requestedAt: time('requested_at').notNull().defaultNow(),
+  availableAt: time('available_at'),
+  failureReason: text('failure_reason'),
+  problems: jsonb().$type<{ recordNo: string; value: string | null; reason: string }[]>().notNull().default(sql`'[]'::jsonb`),
+  problemCount: integer('problem_count').notNull().default(0),
+  retireRequested: time('retire_requested'),
+  retireReason: text('retire_reason'),
+  retiredAt: time('retired_at'),
+  lastUsedAt: time('last_used_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.fieldId], foreignColumns: [fields.tenantId, fields.appId, fields.fieldId] }),
+  foreignKey({ columns: [t.tenantId, t.requestedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  check('runtime_index_purpose', sql`${t.purpose} IN ('filter','sort','search')`),
 ]);

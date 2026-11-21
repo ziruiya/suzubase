@@ -6,7 +6,7 @@ import type { ApiTokenAction } from '@suzubase/shared-types';
 
 export { and, eq, inArray, or, isNull, lte, gt, sql } from 'drizzle-orm';
 export {
-  apiTokens, apps, appCounters, autoNumberCounters, issuedAutoNumbers, appVersions, csvJobs, permissionAudit, fields, fileReferences, files, outbox, recordCreateKeys, recordEvents, recordSearchValues, recordUniqueValues, records, recordReferences,
+  apiTokens, apps, appCounters, autoNumberCounters, issuedAutoNumbers, appVersions, csvJobs, permissionAudit, fields, fileReferences, files, outbox, recordCreateKeys, recordEvents, recordSearchValues, recordUniqueValues, records, recordReferences, runtimeIndexes,
   groupMembers, loginCredentials, memberGroups, organizations, tenantMembers, tenants, users,
 } from './schema';
 
@@ -71,3 +71,5 @@ export async function maintenanceTenants() {
     tenantId, userId: '00000000-0000-0000-0000-000000000000',
   }));
 }
+
+export { indexNumericPattern, runtimeIndexName, withIndexDdl, type IndexDdl } from './runtime-index-ddl';

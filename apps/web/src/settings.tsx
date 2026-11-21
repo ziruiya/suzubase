@@ -1,10 +1,11 @@
 import { autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, type FieldType, type FormLayout } from '@suzubase/shared-types';
 import { useEffect, useState, type FormEvent } from 'react';
+import { IndexSettings } from './index-settings';
 import { LayoutDesigner } from './form-layout';
 import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
 
 type Draft = { version: number | null; status: string | null; fields: Field[]; formLayout: FormLayout };
-const tabs = ['Form', 'Views', 'Workflow', 'Notifications', 'Permissions', 'General', 'Import / export'] as const;
+const tabs = ['Form', 'Views', 'Workflow', 'Notifications', 'Permissions', 'General', 'Import / export', 'Indexes'] as const;
 
 export function Settings({ app, session, narrow, onClose, reload }: {
   app: App; session: Session; narrow: boolean; onClose: () => void; reload: () => Promise<void>;
@@ -163,6 +164,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
       <label className="option"><input type="checkbox" name="drafts" defaultChecked={app.localDrafts} /> Enable local record drafts</label>
       <button className="primary" disabled={busy}>Save settings</button>
     </form>}
+    {active === 'Indexes' && <IndexSettings app={app} session={session} />}
     {active === 'Import / export' && <CsvSettings app={app} session={session} />}
     {(active === 'Form' || active === 'Views' || active === 'Permissions') && draft?.version && <div className="inline">
       <button className="primary" disabled={busy} onClick={() => void run(async () => {

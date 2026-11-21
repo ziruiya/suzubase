@@ -155,6 +155,13 @@
       "when": 1795275571902,
       "tag": "0021_attachment_retention",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1795275719511,
+      "tag": "0022_runtime_index_registry",
+      "breakpoints": true
     }
   ]
 }

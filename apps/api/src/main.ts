@@ -8,6 +8,7 @@ import { AppSchemaController, AppSchemaService } from './app-schema';
 import { FileController, FileService, maxAttachmentBytes } from './files';
 import { ApiTokenController, ApiTokenService } from './api-tokens';
 import { CsvController, CsvService } from './csv';
+import { RuntimeIndexController, RuntimeIndexService } from './runtime-indexes';
 import { SearchService } from './search';
 import { RecordQueryService } from './record-query';
 import { RecordService, RecordsController } from './records';
@@ -38,8 +39,8 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, TenantAdminController, FileController, CsvController, ApiTokenController],
-  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, TenantAdminService, FileService, SearchService, CsvService, ApiTokenService],
+  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, TenantAdminController, FileController, CsvController, ApiTokenController, RuntimeIndexController],
+  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, TenantAdminService, FileService, SearchService, CsvService, ApiTokenService, RuntimeIndexService],
 })
 class AppModule {}
 

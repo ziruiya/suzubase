@@ -53,6 +53,7 @@ services:
     environment:
       DATABASE_URL: postgres://suzubase_runtime:suzubase-runtime-dev@postgres:5432/suzubase
       ATTACHMENT_DIRECTORY: /workspace/attachments
+      INDEX_DATABASE_URL: postgres://suzubase_migration:suzubase-migration-dev@postgres:5432/suzubase
       ATTACHMENT_RETENTION_HOURS: ${ATTACHMENT_RETENTION_HOURS:-720}
       ATTACHMENT_TEMPORARY_EXPIRY_HOURS: ${ATTACHMENT_TEMPORARY_EXPIRY_HOURS:-24}
       MAINTENANCE_INTERVAL_SECONDS: ${MAINTENANCE_INTERVAL_SECONDS:-60}

@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { maintenanceTenants } from '@suzubase/db';
+import { maintenanceTenants, withIndexDdl } from '@suzubase/db';
+import { runIndexJob } from './runtime-index-worker';
 import { cleanupFiles } from './file-maintenance';
 
 function configuredInteger(name: string, fallback: number) {
@@ -23,7 +24,8 @@ async function main() {
   });
   do {
     try {
-      for (const context of await maintenanceTenants()) {
+      const tenants = await maintenanceTenants();
+      for (const context of tenants) {
         if (stopping) break;
         try {
           const result = await cleanupFiles(context, retention);
@@ -35,6 +37,19 @@ async function main() {
           console.error('Attachment maintenance failed', { tenantId: context.tenantId, error });
           if (once) process.exitCode = 1;
         }
+      }
+      const indexConnection = process.env.INDEX_DATABASE_URL;
+      if (indexConnection && !stopping) {
+        await withIndexDdl(indexConnection, async (ddl) => {
+          for (const context of tenants) {
+            if (stopping) break;
+            const result = await runIndexJob(context, ddl);
+            if (result) console.info('Runtime index job', { tenantId: context.tenantId, ...result });
+          }
+        }).catch((error) => {
+          console.error('Runtime index channel failed', error instanceof Error ? error.message : String(error));
+          if (once) process.exitCode = 1;
+        });
       }
     } catch (error) {
       console.error('Could not enumerate maintenance tenants', error);

@@ -85,7 +85,7 @@ function empty(field: FieldDefinition, value: string | undefined) {
   return !value || (value === '[]' && (multiOptionFieldTypes.has(field.type) || field.type === 'attachment'));
 }
 
-function normalized(field: FieldDefinition, value: string) {
+export function preflightNormalize(field: FieldDefinition, value: string) {
   if (field.type === 'attachment') {
     try {
       const ids = z.array(identifier).max(25).safeParse(JSON.parse(value));
@@ -139,7 +139,7 @@ export async function dataPreflight(tx: TenantTransaction, context: TenantContex
       const { fieldId, name, type } = field;
       const original = row.data[fieldId];
       const old = previousById.get(fieldId);
-      let value = empty(field, original) ? undefined : normalized(field, original!);
+      let value = empty(field, original) ? undefined : preflightNormalize(field, original!);
       const directoryIds = directory[type as keyof typeof directory];
       if (type !== old?.type && directoryIds && value && !directoryIds.has(value)) value = undefined;
       if (value && type !== old?.type && type === 'attachment') {

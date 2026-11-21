@@ -90,3 +90,9 @@ export interface FieldDefinition {
 export const layoutWidths = [3, 4, 6, 8, 9, 12] as const;
 export type LayoutCell = { fieldId: string; width: (typeof layoutWidths)[number] };
 export type FormLayout = { id: string; groupFieldId?: string; cells: LayoutCell[] }[];
+
+export const indexPurposes = ['filter', 'sort', 'search'] as const;
+export type IndexPurpose = (typeof indexPurposes)[number];
+export const boundedSortTypes: ReadonlySet<FieldType> = new Set([
+  'number', 'radio', 'select', 'date', 'time', 'datetime', 'email', 'user', 'organization', 'group', 'autoNumber',
+]);

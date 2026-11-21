@@ -16,6 +16,7 @@ import { formulaInput } from './formula';
 import { normalizeValue } from './field-values';
 import { dataPreflight, formLayoutInput, isDestructive, migrationInput, referencesPreflight, uniqueKey,
   validLayout, withoutLayoutField, type MigrationStrategy } from './schema-preflight';
+import { retireChangedIndexes } from './runtime-index-state';
 import { fieldChanges, serializeRecord, writeRecordEvent } from './record-events';
 import { projectSearchValues } from './search-projection';
 import { viewInput } from './view-input';
@@ -27,6 +28,7 @@ const metadata = {
   name: z.string().trim().min(1).max(120).refine((value) => !/[\x00\p{Surrogate}]/u.test(value)),
 };
 const appInput = z.strictObject(metadata);
+const createAppInput = appInput.extend({ template: z.literal('customers').optional() });
 const settingsInput = z.strictObject({
   name: metadata.name.optional(),
   description: z.string().max(4000).optional(),
@@ -74,7 +76,7 @@ const metadataProperties = {
 export class AppSchemaService {
   constructor(private readonly authorization: AuthorizationService) {}
 
-  async createApp(context: TenantContext, input: z.infer<typeof appInput>) {
+  async createApp(context: TenantContext, { template, ...input }: z.infer<typeof createAppInput>) {
     try {
       return await withTenantTransaction(context, async (tx) => {
         if (!await this.authorization.canCreateApp(tx, context)) throw new ForbiddenException('Permission denied');
@@ -84,6 +86,19 @@ export class AppSchemaService {
         const identity = { tenantId: context.tenantId, appId: app.id };
         await tx.insert(appVersions).values({ ...identity, version: app.publishedSchemaVersion });
         await tx.insert(appCounters).values(identity);
+        if (template === 'customers') {
+          const [customer] = await tx.insert(fields).values([
+            { ...identity, introducedIn: 1, type: 'text', code: 'name', name: 'Name', searchMode: 'name' },
+            { ...identity, introducedIn: 1, type: 'text', code: 'name-kana', name: 'Name kana', searchMode: 'kana' },
+            { ...identity, introducedIn: 1, type: 'text', code: 'customer-id', name: 'Customer ID', searchMode: 'customer-id' },
+            { ...identity, introducedIn: 1, type: 'phone', code: 'phone', name: 'Phone' },
+            { ...identity, introducedIn: 1, type: 'email', code: 'email', name: 'Email' },
+          ]).returning({ fieldId: fields.fieldId });
+          app.titleFieldId = customer.fieldId;
+          await tx.update(apps).set({ titleFieldId: customer.fieldId }).where(and(
+            eq(apps.tenantId, context.tenantId), eq(apps.id, app.id),
+          ));
+        }
         return app;
       });
     } catch (error) {
@@ -499,6 +514,14 @@ export class AppSchemaService {
           problems: [...disclosedIssues, ...dependencyProblems], migrationRequired: needsMigration, skippedDependencies: ['workflow', 'lookup'],
         } };
       }
+      const retiring = await retireChangedIndexes(tx, context, appId, currentFields, draftFields);
+      if (retiring.length) {
+        await tx.update(apps).set({ draftStatus: 'validation-failed' }).where(scope);
+        return { failure: { appId, version, message: 'Wait for concurrent index retirement, then publish again',
+          problems: retiring.map(({ fieldId, id }) => ({ fieldId, indexId: id, dependency: 'runtime-index', reason: 'Retirement queued' })),
+          skippedDependencies: ['workflow', 'lookup'],
+        } };
+      }
       await tx.update(apps).set({ draftStatus: 'publishable' }).where(scope);
       const [published] = await tx.update(apps).set({
         publishedSchemaVersion: version, draftSchemaVersion: null, draftStatus: null,
@@ -667,7 +690,7 @@ export class AppSchemaController {
     type: 'object', required: ['code', 'name'], additionalProperties: false, properties: metadataProperties,
   } })
   create(@AuthenticatedTenant() context: TenantContext, @Body() body: unknown) {
-    return this.schemas.createApp(context, parseInput(appInput, body));
+    return this.schemas.createApp(context, parseInput(createAppInput, body));
   }
 
   @Get()

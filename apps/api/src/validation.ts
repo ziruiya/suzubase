@@ -14,6 +14,7 @@ export function parseInput<T>(schema: ZodType<T>, input: unknown): T {
 }
 
 export function postgresErrorCode(error: unknown): string | undefined {
+  if (error instanceof Error && 'code' in error && typeof error.code === 'string') return error.code;
   const cause = error instanceof Error ? error.cause : undefined;
   if (cause instanceof Error && 'code' in cause && typeof cause.code === 'string') return cause.code;
   return undefined;

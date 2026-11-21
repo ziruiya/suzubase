@@ -1,6 +1,7 @@
+import { fieldContract } from '@suzubase/shared-types';
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import {
-  and, apps, appVersions, eq, groupMembers, isNull, memberGroups, or, organizations,
+  and, apps, appVersions, eq, indexNumericPattern, groupMembers, isNull, memberGroups, or, organizations,
   permissionAudit, records, sql, tenantMembers, tenants, TenantContext, TenantTransaction,
 } from '@suzubase/db';
 import {
@@ -110,7 +111,12 @@ export class AuthorizationService {
     const empty = type && (multiOptionFieldTypes.has(type) || type === 'attachment')
       ? sql`COALESCE(${value}, '') IN ('', '[]')` : sql`COALESCE(${value}, '') = ''`;
     switch (condition.operator) {
-      case 'eq': return sql`${value} = ${condition.value}`;
+      case 'eq': {
+        const exact = sql`${value} = ${condition.value}`;
+        if (type === 'number') return and(exact,
+          sql`(CASE WHEN ${value} ~ ${indexNumericPattern} THEN ${value}::numeric END) = ${condition.value}::numeric`);
+        return type && fieldContract[type].index ? and(exact, sql`md5(${value}) = md5(${condition.value})`) : exact;
+      }
       case 'ne': return sql`${value} <> ${condition.value}`;
       case 'empty': return empty;
       case 'nonempty': return sql`NOT (${empty})`;

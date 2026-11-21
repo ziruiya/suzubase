@@ -85,7 +85,9 @@ function Portal({ session, navigate, narrow }: { session: Session; navigate: (id
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     try {
-      const app = await api<AppSummary>('/apps', token, json('POST', { code: data.get('code'), name: data.get('name') }));
+      const app = await api<AppSummary>('/apps', token, json('POST', {
+        code: data.get('code'), name: data.get('name'), ...(data.get('template') && { template: data.get('template') }),
+      }));
       navigate(app.id);
     } catch (error) {
       setError(message(error));
@@ -99,6 +101,7 @@ function Portal({ session, navigate, narrow }: { session: Session; navigate: (id
     {creating && <form className="panel stack" onSubmit={(event) => void create(event)}>
       <label>Name <input name="name" required /></label>
       <label>App code <input name="code" required pattern="[a-z][a-z0-9_\-]{0,63}" /></label>
+      <label>Template <select name="template"><option value="">Blank application</option><option value="customers">Customers</option></select></label>
       <button className="primary">Create application</button>
     </form>}
     <div className="app-grid">{apps.map((app) =>
