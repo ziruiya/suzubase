@@ -7,7 +7,7 @@ import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, recordReferences, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, optionFieldTypes, SavedView, ViewConfiguration } from '@suzubase/shared-types';
+import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, optionFieldTypes, SavedView, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AuthorizationService, RecordAccess } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
@@ -45,12 +45,13 @@ const numbering = z.strictObject({
   enabled: z.boolean(),
 });
 const fieldInput = z.strictObject({
-  ...metadata, type: z.enum(fieldTypes), autoNumber: numbering.optional(), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
+  ...metadata, type: z.enum(fieldTypes), autoNumber: numbering.optional(), searchMode: z.enum(textSearchModes).optional(), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
 }).refine(({ options, type }) => optionFieldTypes.has(type) === (options.length > 0)
   && new Set(options.map(({ value }) => value)).size === options.length, { path: ['options'] })
   .refine(({ type, uniqueValue }) => !uniqueValue || fieldContract[type].unique, { path: ['uniqueValue'] })
   .refine(({ type, autoNumber, required }) => (type === 'autoNumber') === Boolean(autoNumber) &&
-    !(type === 'autoNumber' && required), { path: ['autoNumber'] });
+    !(type === 'autoNumber' && required), { path: ['autoNumber'] })
+  .refine(({ type, searchMode }) => !searchMode || type === 'text', { path: ['searchMode'] });
 const metadataProperties = {
   code: { type: 'string', pattern: codePattern.source },
   name: { type: 'string', minLength: 1, maxLength: 120 },
@@ -160,10 +161,10 @@ export class AppSchemaService {
         await tx.insert(appCounters).values(identity);
         const definitions = await this.getFields(tx, context, appId, source.publishedSchemaVersion);
         const fieldMapping = new Map(definitions.map(({ fieldId }) => [fieldId, randomUUID()]));
-        for (const { fieldId, code, name, type, required, uniqueValue, options, autoNumber } of definitions) {
+        for (const { fieldId, code, name, type, required, uniqueValue, options, autoNumber, searchMode } of definitions) {
           const copiedId = fieldMapping.get(fieldId)!;
           await tx.insert(fields).values({
-            ...identity, fieldId: copiedId, code, name, type, required, uniqueValue, options, introducedIn: 1,
+            ...identity, fieldId: copiedId, code, name, type, required, uniqueValue, options, searchMode, introducedIn: 1,
             autoNumber: autoNumber && {
               ...autoNumber, scopeFieldId: autoNumber.scopeFieldId && fieldMapping.get(autoNumber.scopeFieldId)!,
             },
@@ -229,7 +230,7 @@ export class AppSchemaService {
   }
 
   getFields(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
-    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required, uniqueValue: fields.uniqueValue, autoNumber: fields.autoNumber, options: fields.options })
+    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required, uniqueValue: fields.uniqueValue, autoNumber: fields.autoNumber, searchMode: fields.searchMode, options: fields.options })
       .from(fields).where(and(
         eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), lte(fields.introducedIn, version),
       )).orderBy(fields.introducedIn, fields.code);

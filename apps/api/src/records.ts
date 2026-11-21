@@ -16,6 +16,7 @@ import { AuthenticatedTenant, SessionGuard } from './identity';
 import { RecordQueryService } from './record-query';
 import { writeRecordEvent } from './record-events';
 import { FileService, fileIds } from './files';
+import { SearchService, searchInput } from './search';
 import { normalizeValue } from './field-values';
 import { identifier, parseInput } from './validation';
 
@@ -59,6 +60,7 @@ export class RecordService {
     private readonly authorization: AuthorizationService,
     private readonly query: RecordQueryService,
     private readonly files: FileService,
+    private readonly search: SearchService,
   ) {}
 
   private async normalizeData(
@@ -167,6 +169,7 @@ export class RecordService {
       const record = serializeRecord(row);
       await this.reserveUniqueValues(tx, context, record);
       await this.reconcileFiles(tx, context, record);
+      await this.search.project(tx, context, record, await this.appSchema.getFields(tx, context, appId, schemaVersion));
       await writeRecordEvent(tx, context, record, 'created', fieldChanges({}, data));
       if (key !== undefined) {
         await tx.insert(recordCreateKeys).values({
@@ -239,6 +242,7 @@ export class RecordService {
       await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, recordId));
       await this.reserveUniqueValues(tx, context, updated);
       await this.reconcileFiles(tx, context, updated);
+      await this.search.project(tx, context, updated, await this.appSchema.getFields(tx, context, appId, current.schemaVersion));
       await writeRecordEvent(tx, context, updated, 'updated', fieldChanges(current.data, data));
       return this.findRecord(tx, context, appId, recordId);
     });
@@ -406,7 +410,9 @@ export class RecordService {
 @UseGuards(SessionGuard)
 @Controller('apps/:appId/records')
 export class RecordsController {
-  constructor(private readonly service: RecordService, private readonly queries: RecordQueryService) {}
+  constructor(
+    private readonly service: RecordService, private readonly queries: RecordQueryService, private readonly search: SearchService,
+  ) {}
 
   @Post()
   @ApiHeader({
@@ -428,6 +434,11 @@ export class RecordsController {
   @Get()
   list(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
     return this.service.list(context, parseInput(identifier, appId), parseInput(pageInput, query));
+  }
+
+  @Get('search')
+  searchRecords(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
+    return this.search.search(context, parseInput(identifier, appId), parseInput(searchInput, query));
   }
 
   @Get('aggregates')

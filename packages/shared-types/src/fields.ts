@@ -47,3 +47,6 @@ export interface AutoNumberConfiguration {
 }
 
 export const autoNumberHelp = '自動採番は同じ採番範囲で重複しません。欠番のない連番は保証しません。';
+
+export const textSearchModes = ['name', 'kana', 'customer-id'] as const;
+export type TextSearchMode = (typeof textSearchModes)[number];

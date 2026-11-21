@@ -1,4 +1,4 @@
-import { fieldTypes, type AclConfiguration, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -120,6 +120,7 @@ export const fields = pgTable('fields', {
   type: fieldType().notNull(),
   required: boolean().notNull().default(false),
   uniqueValue: boolean('unique_value').notNull().default(false),
+  searchMode: text('search_mode').$type<TextSearchMode>(),
   autoNumber: jsonb('auto_number').$type<AutoNumberConfiguration>(),
   options: jsonb().$type<FieldOption[]>().notNull().default(sql`'[]'::jsonb`),
 }, (t) => [
@@ -352,4 +353,18 @@ export const issuedAutoNumbers = pgTable('issued_auto_numbers', {
     columns: [t.tenantId, t.appId, t.fieldId, t.scope],
     foreignColumns: [autoNumberCounters.tenantId, autoNumberCounters.appId, autoNumberCounters.fieldId, autoNumberCounters.scope],
   }),
+]);
+
+export const recordSearchValues = pgTable('record_search_values', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  recordId: uuid('record_id').notNull(),
+  fieldId: uuid('field_id').notNull(),
+  kind: text().notNull(),
+  value: text().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.recordId, t.fieldId, t.kind] }),
+  index('record_search_values_prefix_idx').on(t.tenantId, t.appId, t.fieldId, t.kind, t.value.op('text_pattern_ops')),
+  foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.fieldId], foreignColumns: [fields.tenantId, fields.appId, fields.fieldId] }),
 ]);

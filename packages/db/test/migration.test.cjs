@@ -42,7 +42,7 @@ test('all Drizzle migrations run from an empty PostgreSQL database and can be re
     `);
     assert.deepEqual(rows.map(({ relname }) => relname), [
       'app_counters', 'app_versions', 'apps', 'auto_number_counters', 'fields', 'file_references', 'files', 'group_members', 'issued_auto_numbers', 'login_credentials', 'member_groups', 'organizations', 'outbox', 'permission_audit',
-      'record_create_keys', 'record_events', 'record_references', 'record_unique_values', 'records', 'tenant_members', 'tenants', 'users',
+      'record_create_keys', 'record_events', 'record_references', 'record_search_values', 'record_unique_values', 'records', 'tenant_members', 'tenants', 'users',
     ]);
     assert.ok(rows.every(({ relrowsecurity, owner }) => relrowsecurity && owner === 'suzubase_migration'));
   } finally {
