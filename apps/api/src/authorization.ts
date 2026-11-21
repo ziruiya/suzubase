@@ -52,7 +52,7 @@ export class AuthorizationService {
   private appAction(context: TenantContext, action: AppAction) {
     return and(
       sql`EXISTS (SELECT 1 FROM ${tenantMembers} WHERE ${this.membership(context)})`,
-      or(
+      action === 'workflow-repair' ? this.appRuleMatches(context, action) : or(
         eq(apps.createdBy, context.userId),
         sql`EXISTS (SELECT 1 FROM ${tenantMembers} WHERE ${this.membership(context)} AND ${tenantMembers.isAdmin})`,
         this.appRuleMatches(context, action),

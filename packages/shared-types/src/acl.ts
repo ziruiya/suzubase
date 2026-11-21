@@ -1,6 +1,6 @@
 import type { ViewCondition } from './views';
 
-export const appActions = ['view', 'create', 'edit', 'delete', 'import', 'export', 'manage'] as const;
+export const appActions = ['view', 'create', 'edit', 'delete', 'import', 'export', 'manage', 'workflow-repair'] as const;
 export const recordActions = ['view', 'edit', 'delete'] as const;
 export const fieldActions = ['view', 'edit'] as const;
 

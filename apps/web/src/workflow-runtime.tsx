@@ -6,8 +6,12 @@ import type { SelectorOptions } from './selector-options';
 type State = { id: string; code: string; name: string; terminal: boolean };
 type Choice = { id: string; name: string; target: State; reason: string | null };
 type Runtime = {
-  version: number; state: State; actions: Choice[]; canReassign: boolean;
+  version: number; state: State; actions: Choice[]; canReassign: boolean; repairStates: State[];
   assignees: { id: string; name: string; disabled: boolean }[];
+};
+type WorkflowEvent = {
+  eventId: string; kind: string; occurredAt: string; actor: string; action: string | null; from: string | null;
+  to: string; reason: string | null;
 };
 type Task = { appId: string; appName: string; recordId: string; recordNo: string; state: string; stateName: string };
 type TaskPage = { items: Task[]; next: string | null };
@@ -19,6 +23,8 @@ export function WorkflowDetail({ record, session, refresh }: { record: RecordRes
   const [busy, setBusy] = useState(false);
   const [directory, setDirectory] = useState<SelectorOptions>();
   const [assignees, setAssignees] = useState<string[]>();
+  const [repairing, setRepairing] = useState(false);
+  const [history, setHistory] = useState<WorkflowEvent[]>();
   const dialog = useRef<HTMLDialogElement>(null);
   const { token } = session;
   const path = appPath(record.appId) + '/records/' + record.id + '/workflow';
@@ -39,6 +45,7 @@ export function WorkflowDetail({ record, session, refresh }: { record: RecordRes
       await api(path + suffix, token, json('POST', { revision: record.revision, ...data }));
       setChoice(undefined);
       setAssignees(undefined);
+      setRepairing(false);
       refresh();
     } catch (error) {
       setError(message(error));
@@ -79,6 +86,47 @@ export function WorkflowDetail({ record, session, refresh }: { record: RecordRes
         <button type="button" disabled={busy} onClick={() => setAssignees(undefined)}>Cancel</button>
       </div>
     </fieldset>}
+    {workflow.repairStates.length > 0 && !repairing && <button type="button" disabled={busy} onClick={() => {
+      setError('');
+      void api<SelectorOptions>(appPath(record.appId) + '/workflow/directory', token).then((options) => {
+        setDirectory(options);
+        setRepairing(true);
+      }).catch((error) => setError(message(error)));
+    }}>Repair workflow</button>}
+    {repairing && <form className="notice stack" onSubmit={(event) => {
+      event.preventDefault();
+      const values = new FormData(event.currentTarget);
+      const users = values.getAll('assignees');
+      void submit('/repair', { stateId: values.get('state'), reason: values.get('reason'),
+        ...(users.length > 0 && { userIds: users }) });
+    }}>
+      <h3>Repair record {record.recordNo}</h3>
+      <p>Current state · {workflow.state.name}</p>
+      <label>Target state <select name="state" required defaultValue="">
+        <option value="">Choose a state</option>
+        {workflow.repairStates.map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
+      </select></label>
+      <label>Assignees (optional) <select name="assignees" multiple>
+        {directory?.user.filter(({ disabled }) => !disabled).map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
+      </select></label>
+      <p className="muted">Leave assignees empty to use the target state’s rules.</p>
+      <label>Reason <textarea name="reason" required maxLength={2000} /></label>
+      <div className="inline">
+        <button type="submit" className="danger" disabled={busy}>Confirm repair</button>
+        <button type="button" disabled={busy} onClick={() => setRepairing(false)}>Cancel</button>
+      </div>
+    </form>}
+    <button type="button" aria-expanded={history !== undefined} onClick={() => {
+      if (history) { setHistory(undefined); return; }
+      void api<WorkflowEvent[]>(path + '/history', token).then(setHistory).catch((error) => setError(message(error)));
+    }}>{history ? 'Hide workflow history' : 'Show workflow history'}</button>
+    {history && <ol className="history" aria-label="Workflow history">{history.map((event) => <li key={event.eventId}>
+      <strong>{event.kind === 'WORKFLOW_REPAIR' ? 'Workflow repair' : event.action ??
+        (event.kind === 'workflow-reassigned' ? 'Reassigned' : 'Entered workflow')}</strong> · {event.actor}
+      <time>{new Date(event.occurredAt).toLocaleString(undefined, { timeZone: session.profile.timeZone })}</time>
+      <div>{event.from ? event.from + ' → ' : ''}{event.to}</div>
+      {event.reason && <p>{event.reason}</p>}
+    </li>)}</ol>}
     {choice && <dialog className="workflow-confirm" aria-label="Confirm workflow action" ref={dialog} onCancel={(event) => {
       event.preventDefault();
       if (!busy) setChoice(undefined);

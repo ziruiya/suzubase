@@ -6,7 +6,7 @@ export async function writeRecordEvent(
   tx: TenantTransaction,
   context: TenantContext,
   record: RecordResponse,
-  kind: 'created' | 'updated' | 'lookup-refetched' | 'deleted' | 'restored' | 'schema-migrated' | 'workflow-action' | 'workflow-reassigned',
+  kind: 'created' | 'updated' | 'lookup-refetched' | 'deleted' | 'restored' | 'schema-migrated' | 'workflow-action' | 'workflow-reassigned' | 'WORKFLOW_REPAIR',
   changes: FieldChange[],
   source: 'api' | 'import' | 'migration' = 'api',
 ): Promise<string> {
@@ -17,7 +17,7 @@ export async function writeRecordEvent(
   }).returning({ eventId: recordEvents.eventId });
   if (kind !== 'created') await tx.update(recordWorkflowState).set({ revision: record.revision })
     .where(workStateScope({ ...scope, recordId: record.id }));
-  await tx.insert(outbox).values({ ...scope, eventId, topic: `record.${kind}` });
+  if (kind !== 'WORKFLOW_REPAIR') await tx.insert(outbox).values({ ...scope, eventId, topic: `record.${kind}` });
   return eventId;
 }
 

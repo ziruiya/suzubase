@@ -257,7 +257,7 @@ function Records({ appId, initialRecord, session, narrow, leave }: { appId: stri
         </>}
       </div>
       {history && <section aria-label="Record history"><h2>History</h2><ol className="history">{history.events.map((event) =>
-        <li key={event.eventId}><strong>{event.kind}</strong> · {event.actorLabel}
+        <li key={event.eventId}><strong>{event.kind === 'WORKFLOW_REPAIR' ? 'Workflow repair' : event.kind}</strong> · {event.actorLabel}
           <time>{new Date(event.occurredAt).toLocaleString(undefined, { timeZone: session.profile.timeZone })}</time>
           {event.changes.map((change) => {
             const field = history.schemas[event.schemaVersion]?.find(({ fieldId }) => fieldId === change.fieldId);

@@ -221,6 +221,8 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [entry + '/workflow/actions']: { post: { body: workflowRuntimeHttp.executeInput, reply: workflowRuntimeHttp.mutation, conflict: errorSchema } },
   [entry + '/workflow/reassign']: { post: { body: workflowRuntimeHttp.reassignInput, reply: workflowRuntimeHttp.mutation, conflict: errorSchema } },
   [entry + '/workflow/handoff']: { post: { body: workflowRuntimeHttp.handoffInput, reply: workflowRuntimeHttp.mutation, conflict: errorSchema } },
+  [entry + '/workflow/repair']: { post: { body: workflowRuntimeHttp.repairInput, reply: workflowRuntimeHttp.mutation, conflict: errorSchema } },
+  [entry + '/workflow/history']: { get: { reply: workflowRuntimeHttp.history } },
   '/workflow/tasks': { get: { query: workflowRuntimeHttp.taskQuery, reply: workflowRuntimeHttp.taskPage } },
   '/workflow/unassigned': { get: { query: workflowRuntimeHttp.taskQuery, reply: workflowRuntimeHttp.taskPage } },
   [entry + '/related/{fieldId}']: { get: { query: recordHttp.relatedQuery, reply: z.object({
