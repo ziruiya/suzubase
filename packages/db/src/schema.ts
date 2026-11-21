@@ -1,4 +1,4 @@
-import { fieldTypes, type FieldChange, type RecordData } from '@suzubase/shared-types';
+import { fieldTypes, type FieldChange, type RecordData, type RecordResponse } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -191,4 +191,20 @@ export const outbox = pgTable('outbox', {
     columns: [t.tenantId, t.appId, t.eventId],
     foreignColumns: [recordEvents.tenantId, recordEvents.appId, recordEvents.eventId],
   }),
+]);
+
+export const recordCreateKeys = pgTable('record_create_keys', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  userId: uuid('user_id').notNull(),
+  key: text().notNull(),
+  recordId: uuid('record_id').notNull(),
+  response: jsonb().$type<RecordResponse>().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.userId, t.key] }),
+  foreignKey({
+    columns: [t.tenantId, t.appId, t.recordId],
+    foreignColumns: [records.tenantId, records.appId, records.id],
+  }).onDelete('cascade'),
+  foreignKey({ columns: [t.tenantId, t.userId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
 ]);
