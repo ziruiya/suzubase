@@ -19,6 +19,7 @@ test('G1-04 soft deletes release normalized uniqueness and a conflicting restore
   await request(404, 'GET', item);
   const second = await request(201, 'POST', '/records', { data: { [field.fieldId]: 'abc' } });
   await request(403, 'POST', item + '/restore', { revision: 2 });
+  await request(403, 'GET', '/records/recycle');
   const db = new Client({ connectionString: process.env.ADMIN_DATABASE_URL });
   await db.connect();
   try {
@@ -27,6 +28,8 @@ test('G1-04 soft deletes release normalized uniqueness and a conflicting restore
   } finally {
     await db.end();
   }
+  const recycled = await request(200, 'GET', '/records/recycle?limit=1');
+  assert.deepEqual(recycled.items.map(({ id, revision }) => ({ id, revision })), [{ id: first.id, revision: 2 }]);
   const conflict = await request(409, 'POST', item + '/restore', { revision: 2 });
   assert.equal(conflict.recordId, second.id);
   await request(404, 'GET', item);

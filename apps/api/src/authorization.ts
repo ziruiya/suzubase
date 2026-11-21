@@ -174,7 +174,7 @@ export class AuthorizationService {
     } as const;
     const [table, tenantColumn, idColumn] = identity[subject.kind];
     const [target] = await tx.select({ id: idColumn }).from(table)
-      .where(and(eq(tenantColumn, context.tenantId), eq(idColumn, subject.id)));
+      .where(and(eq(tenantColumn, context.tenantId), eq(idColumn, subject.id))).for('key share');
     if (!target) throw new BadRequestException('Unknown permission subject');
   }
 

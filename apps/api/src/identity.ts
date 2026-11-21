@@ -183,7 +183,7 @@ export class SessionProfileController {
     return withTenantTransaction(context, async (tx) => {
       const [profile] = await tx.select({
         displayName: users.displayName, email: users.email, isAdmin: tenantMembers.isAdmin,
-        canManageRecycleBin: tenantMembers.canManageRecycleBin, canCreateApps: tenantMembers.canCreateApps,
+        canManageRecycleBin: tenantMembers.canManageRecycleBin, canReadArchivedFields: tenantMembers.canReadArchivedFields, canCreateApps: tenantMembers.canCreateApps,
         allowAppCreation: tenants.allowAppCreation, timeZone: tenants.timeZone, localDrafts: tenants.localDrafts,
       }).from(tenantMembers).innerJoin(users, and(
         eq(users.tenantId, tenantMembers.tenantId), eq(users.id, tenantMembers.userId),

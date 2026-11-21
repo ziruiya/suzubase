@@ -4,7 +4,9 @@ import { createRoot } from 'react-dom/client';
 import { api, appPath, download, json, message, type App, type AppSummary, type Field, type Profile, type Session } from './api';
 import { removeDrafts } from './drafts';
 import { displayValue, RecordEditor, RecordValues } from './forms';
+import { RecycleBin } from './recycle-bin';
 import { Settings } from './settings';
+import { Directory } from './directory';
 import { AccountSecurity } from './account-security';
 import './style.css';
 
@@ -122,7 +124,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
   const [summary, setSummary] = useState<{ fieldId: string; sum: string | null; average: string | null }[]>([]);
   const [form, setForm] = useState<RecordForm>();
   const [history, setHistory] = useState<History>();
-  const [screen, setScreen] = useState<'list' | 'detail' | 'edit' | 'new' | 'settings'>('list');
+  const [screen, setScreen] = useState<'list' | 'detail' | 'edit' | 'new' | 'settings' | 'recycle'>('list');
   const [search, setSearch] = useState<Search>();
   const [searchField, setSearchField] = useState('');
   const [feedback, setFeedback] = useState('');
@@ -199,6 +201,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
       {screen !== 'list' && <button onClick={back}>{app.name}</button>}</nav>
     {feedback && <p className="banner" role="status">{feedback}</p>}
     {error && <p role="alert" className="error">{error}</p>}
+    {screen === 'recycle' && <RecycleBin path={root} session={session} back={back} />}
     {screen === 'settings' && app.can.manage && (!narrow || session.profile.isAdmin) &&
       <Settings app={app} session={session} narrow={narrow} onClose={back} reload={reload} />}
     {(screen === 'new' || screen === 'edit') && <RecordEditor key={form?.record.id ?? 'new'}
@@ -237,6 +240,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
         <div><h1>{app.name}</h1>{app.description && <p className="muted">{app.description}</p>}</div>
         <div className="inline">
           {app.can.manage && (!narrow || session.profile.isAdmin) && <button onClick={() => setScreen('settings')}>Settings</button>}
+          {session.profile.canManageRecycleBin && app.can.delete && <button onClick={() => setScreen('recycle')}>Record recycle bin</button>}
           {canCreate && <button className="primary" onClick={() => { setForm(undefined); setScreen('new'); setFeedback(''); }}>New record</button>}
         </div>
       </div>
@@ -272,7 +276,8 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
       {items.length > 0 ? <section aria-label="Records" className="record-grid">{items.map((record) =>
         <article className="record-card" key={record.id}>
           <button className="record-link" onClick={() => { setFeedback(''); void open(record.id); }}>Record {record.recordNo}</button>
-          <dl>{columns.map((field) => <div key={field.fieldId}>
+          <dl className={selectedView?.columns.length ? 'view-columns' : undefined}>{columns.map((field) => <div key={field.fieldId}
+            style={selectedView?.columns.length ? { flexBasis: selectedView.columns.find(({ fieldId }) => fieldId === field.fieldId)?.width } : undefined}>
             <dt>{field.name}</dt>
             <dd>{record.data[field.fieldId]
               ? displayValue(field, record.data[field.fieldId], session.profile.timeZone) : '—'}</dd>
@@ -294,24 +299,28 @@ function Root() {
   const [session, setSession] = useState<Session>();
   const [current, setCurrent] = useState<string>();
   const [security, setSecurity] = useState(false);
+  const [directory, setDirectory] = useState(false);
   const [notice, setNotice] = useState('');
   const narrow = useNarrow();
   async function logout() {
     if (!session) return;
     session.draftAllowed.current = false;
     const { tenantId, userId } = session.profile;
-    setSession(undefined); setCurrent(undefined); setSecurity(false);
+    setSession(undefined); setCurrent(undefined); setSecurity(false); setDirectory(false);
     await removeDrafts((draft) => draft.scope[0] === tenantId && draft.scope[1] === userId).catch(() => undefined);
   }
   return session ? <>
     <header className="top"><div className="top-inner inline spread">
-      <button className="brand" onClick={() => { setCurrent(undefined); setSecurity(false); }}><span aria-hidden="true">S</span> SuzuBase</button>
+      <button className="brand" onClick={() => { setCurrent(undefined); setSecurity(false); setDirectory(false); }}><span aria-hidden="true">S</span> SuzuBase</button>
       <div className="inline account"><span>{session.profile.displayName ?? session.profile.email}</span>
-        {session.profile.isAdmin && <button onClick={() => setSecurity(true)}>Account security</button>}
+        {session.profile.isAdmin && <>
+          <button onClick={() => { setDirectory(true); setSecurity(false); }}>Directory</button>
+          <button onClick={() => { setSecurity(true); setDirectory(false); }}>Account security</button>
+        </>}
         <button onClick={() => { setNotice(''); void logout(); }}>Sign out</button></div>
     </div></header>
     <main className="workspace">
-      {security ? <AccountSecurity token={session.token} close={() => setSecurity(false)} signInAgain={() => {
+      {directory ? <Directory session={session} back={() => setDirectory(false)} /> : security ? <AccountSecurity token={session.token} close={() => setSecurity(false)} signInAgain={() => {
         setNotice('Two-factor settings changed. Sign in again to continue.');
         void logout();
       }} /> : current ? <Records key={current} appId={current} session={session} narrow={narrow} leave={() => setCurrent(undefined)} />

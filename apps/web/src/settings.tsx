@@ -1,10 +1,11 @@
-import { autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, type FieldType, type FormLayout } from '@suzubase/shared-types';
+import { autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, type FieldType, type FormLayout, type ViewConfiguration } from '@suzubase/shared-types';
 import { useEffect, useState, type FormEvent } from 'react';
+import { ViewSettings } from './view-settings';
 import { IndexSettings } from './index-settings';
 import { LayoutDesigner } from './form-layout';
 import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
 
-type Draft = { version: number | null; status: string | null; fields: Field[]; formLayout: FormLayout };
+type Draft = ViewConfiguration & { version: number | null; status: string | null; fields: Field[]; publishedFields: Field[]; formLayout: FormLayout };
 const tabs = ['Form', 'Views', 'Workflow', 'Notifications', 'Permissions', 'General', 'Import / export', 'Indexes'] as const;
 
 export function Settings({ app, session, narrow, onClose, reload }: {
@@ -21,7 +22,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
   const [preflight, setPreflight] = useState<unknown>();
   const [migration, setMigration] = useState('');
   const [editing, setEditing] = useState<Field>();
-  const definitions = draft?.version ? draft.fields : app.fields;
+  const definitions = draft?.version ? draft.fields : draft?.publishedFields ?? app.fields;
   const layout = draft?.formLayout ?? app.formLayout;
   async function refreshDraft() {
     setDraft(await api<Draft>(path + '/draft', token));
@@ -105,7 +106,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
           <p id="formula-help">Enter a JSON list with operands before the operator. Example for 2 + 3</p>
           <pre>{JSON.stringify([{ kind: 'number', value: '2' }, { kind: 'number', value: '3' }, { kind: 'operator', operator: '+' }])}</pre>
           <p>Use a token with kind "field" and one of these field IDs. Use &amp; to join text.</p>
-          <ul>{(draft?.version ? draft.fields : app.fields)
+          <ul>{definitions
             .filter(({ type }) => !['layout', 'calculation', 'attachment', 'richText'].includes(type))
             .map((field) => <li key={field.fieldId}>{field.name} <code>{field.fieldId}</code></li>)}</ul>
         </>}
@@ -128,24 +129,8 @@ export function Settings({ app, session, narrow, onClose, reload }: {
       <details><summary>Field help</summary><p>Dropdowns do not replace categories. They have no parent-child hierarchy,
         cannot classify a record under multiple nodes, and cannot filter by hierarchy.</p></details>
     </>}
-    {active === 'Views' && <>
-      <p>Published views</p>
-      <ul className="plain">{app.views.map((view) => <li key={view.id}>{view.name}{view.id === app.defaultId && ' · default'}</li>)}</ul>
-      <form className="stack" onSubmit={(event) => {
-        event.preventDefault(); const data = new FormData(event.currentTarget);
-        void run(async () => {
-          await api(path + '/draft/views', token, json('POST', {
-            name: data.get('name'), conditions: [], columns: [...data.getAll('columns')].map((fieldId) => ({ fieldId, width: 160 })),
-          }));
-          await refreshDraft(); setNotice('View added to the draft.');
-        });
-      }}>
-        <label>View name <input name="name" required /></label>
-        <label>Columns <select name="columns" multiple>{app.fields.filter(({ type }) => type !== 'layout').map((field) =>
-          <option key={field.fieldId} value={field.fieldId}>{field.name}</option>)}</select></label>
-        <button type="submit" disabled={busy}>Add view to draft</button>
-      </form>
-    </>}
+    {active === 'Views' && <ViewSettings configuration={draft ?? app} fields={definitions} path={path}
+      session={session} refresh={refreshDraft} />}
     {active === 'Workflow' && <p>Workflow is not yet enabled.</p>}
     {active === 'Notifications' && <p>Notifications are not yet enabled.</p>}
     {active === 'Permissions' && <AclSettings app={app} session={session} refresh={refreshDraft} />}

@@ -4,10 +4,12 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
-  and, eq, groupMembers, isNull, loginCredentials, memberGroups, organizations, records,
+  and, apps, appVersions, eq, groupMembers, isNull, loginCredentials, memberGroups, organizations, records,
   sql, tenantMembers, tenants, users, type TenantContext, type TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
 import { z } from 'zod';
+import { AppSchemaService } from './app-schema';
+import { AuthorizationService } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
 import { identifier, parseInput, postgresErrorCode } from './validation';
 
@@ -34,6 +36,8 @@ const policy = z.strictObject({
 
 @Injectable()
 export class TenantAdminService {
+  constructor(private readonly schema: AppSchemaService, private readonly authorization: AuthorizationService) {}
+
   private run<T>(
     context: TenantContext,
     operation: (tx: TenantTransaction, settings: typeof tenants.$inferSelect) => Promise<T>,
@@ -179,12 +183,18 @@ export class TenantAdminService {
 
   deleteOrganization(context: TenantContext, id: string) {
     return this.run(context, async (tx) => {
+      const scope = and(eq(organizations.tenantId, context.tenantId), eq(organizations.id, id));
+      const [org] = await tx.select({ id: organizations.id }).from(organizations).where(scope).for('update');
+      if (!org) throw new NotFoundException();
       const members = await tx.select({ id: tenantMembers.userId }).from(tenantMembers).where(and(
         eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.organizationId, id),
       ));
       const children = await tx.select({ id: organizations.id, name: organizations.name }).from(organizations)
         .where(and(eq(organizations.tenantId, context.tenantId), eq(organizations.parentId, id)));
-      if (members.length || children.length) throw new ConflictException({ members, children });
+      const references = await this.directoryReferences(tx, context, 'organization', id);
+      if (members.length || children.length || references.length) {
+        throw new ConflictException({ message: 'Organization is still referenced', members, children, references });
+      }
       const [deleted] = await tx.delete(organizations).where(and(
         eq(organizations.tenantId, context.tenantId), eq(organizations.id, id),
       )).returning();
@@ -198,6 +208,73 @@ export class TenantAdminService {
       const [group] = await tx.insert(memberGroups).values({ tenantId: context.tenantId, name: label }).returning();
       return group;
     });
+  }
+
+  renameGroup(context: TenantContext, id: string, label: string) {
+    return this.run(context, async (tx) => {
+      const [group] = await tx.update(memberGroups).set({ name: label }).where(and(
+        eq(memberGroups.tenantId, context.tenantId), eq(memberGroups.id, id),
+      )).returning();
+      if (!group) throw new NotFoundException();
+      return group;
+    });
+  }
+
+  deleteGroup(context: TenantContext, id: string) {
+    return this.run(context, async (tx) => {
+      const scope = and(eq(memberGroups.tenantId, context.tenantId), eq(memberGroups.id, id));
+      const [group] = await tx.select({ id: memberGroups.id }).from(memberGroups).where(scope).for('update');
+      if (!group) throw new NotFoundException();
+      const members = await tx.select({ id: groupMembers.userId }).from(groupMembers).where(and(
+        eq(groupMembers.tenantId, context.tenantId), eq(groupMembers.groupId, id),
+      ));
+      const references = await this.directoryReferences(tx, context, 'group', id);
+      if (members.length || references.length) throw new ConflictException({ message: 'Group is still referenced', members, references });
+      await tx.delete(memberGroups).where(scope);
+      return { deleted: true };
+    });
+  }
+
+  private async directoryReferences(tx: TenantTransaction, context: TenantContext, type: 'organization' | 'group', id: string) {
+    const tenantApps = await tx.select().from(apps).where(eq(apps.tenantId, context.tenantId));
+    const references: { appId: string; config?: string; recordNo?: string; fieldId?: string; restricted?: boolean }[] = [];
+    for (const app of tenantApps) {
+      const byVersion = [app.publishedSchemaVersion, ...(app.draftSchemaVersion === null ? [] : [app.draftSchemaVersion])];
+      for (const version of byVersion) {
+        const [snapshot] = await tx.select().from(appVersions).where(and(
+          eq(appVersions.tenantId, context.tenantId), eq(appVersions.appId, app.id), eq(appVersions.version, version),
+        ));
+        const fields = (await this.schema.getFields(tx, context, app.id, version)).filter((field) => field.type === type);
+        const fieldIds = new Set(fields.map(({ fieldId }) => fieldId));
+        const acl = snapshot.aclConfiguration;
+        for (const rule of [...acl.app, ...acl.record, ...acl.field]) {
+          if (rule.subject.kind === type && rule.subject.id === id ||
+              'conditions' in rule && rule.conditions.some((condition) =>
+                fieldIds.has(condition.fieldId) && 'value' in condition && condition.value === id)) {
+            references.push({ appId: app.id, config: rule.id });
+          }
+        }
+        for (const view of snapshot.viewConfiguration.views) {
+          if (view.conditions.some((condition) => fieldIds.has(condition.fieldId) && 'value' in condition && condition.value === id)) {
+            references.push({ appId: app.id, config: view.id });
+          }
+        }
+        if (version !== app.publishedSchemaVersion || !fields.length) continue;
+        const { access } = !app.deletedAt ? await this.schema.access(tx, context, app.id, 'view') : { access: undefined };
+        for (const { fieldId } of fields) {
+          const showField = access && this.authorization.fieldDecision(access, fieldId, 'view').allowed;
+          const visibility = showField ? sql<boolean>`COALESCE(${this.authorization.recordScope(access, 'view') ?? sql`true`}, false)`
+            : sql<boolean>`false`;
+          const matches = await tx.select({ recordNo: records.recordNo, visible: visibility }).from(records).where(and(
+            eq(records.tenantId, context.tenantId), eq(records.appId, app.id),
+            sql`${records.data} ->> ${fieldId}::text = ${id}`,
+          ));
+          for (const row of matches.filter(({ visible }) => visible)) references.push({ appId: app.id, fieldId, recordNo: row.recordNo.toString() });
+          if (matches.some(({ visible }) => !visible)) references.push({ appId: app.id, fieldId, restricted: true });
+        }
+      }
+    }
+    return references;
   }
 
   setGroupMember(context: TenantContext, groupId: string, userId: string, included: boolean) {
@@ -277,6 +354,16 @@ export class TenantAdminController {
   @Post('groups')
   createGroup(@AuthenticatedTenant() context: TenantContext, @Body() body: unknown) {
     return this.admin.createGroup(context, parseInput(z.strictObject({ name }), body).name);
+  }
+
+  @Patch('groups/:id')
+  renameGroup(@AuthenticatedTenant() context: TenantContext, @Param('id') id: string, @Body() body: unknown) {
+    return this.admin.renameGroup(context, parseInput(identifier, id), parseInput(z.strictObject({ name }), body).name);
+  }
+
+  @Delete('groups/:id')
+  deleteGroup(@AuthenticatedTenant() context: TenantContext, @Param('id') id: string) {
+    return this.admin.deleteGroup(context, parseInput(identifier, id));
   }
 
   @Put('groups/:id/members/:userId')

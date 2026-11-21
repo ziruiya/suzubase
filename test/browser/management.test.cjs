@@ -1,0 +1,102 @@
+const assert = require('node:assert/strict');
+const { readFile } = require('node:fs/promises');
+const { test } = require('node:test');
+const { chromium } = require('playwright');
+const { managementFixture } = require('../../packages/db/test/management-fixture.cjs');
+
+const origin = process.env.TEST_WEB_URL ?? 'http://127.0.0.1:5173';
+
+test('Gate 1 browser directory, layout drag and undo, saved views, rich text, and record restore', async (t) => {
+  const { owner, token, app, fields } = process.env.GATE1_MANAGEMENT_FIXTURE
+    ? JSON.parse(await readFile(process.env.GATE1_MANAGEMENT_FIXTURE, 'utf8')) : await managementFixture();
+  const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 1800 } });
+    page.setDefaultTimeout(7000);
+    const button = (name) => page.getByRole('button', { name, exact: true });
+    await page.goto(origin);
+    await page.getByLabel('Email or login name').fill(owner.email);
+    await page.getByLabel('Password', { exact: true }).fill(owner.password);
+    await button('Sign in').click();
+
+    await button('Directory').click();
+    await button('Organizations').click();
+    await page.getByLabel('New organization').fill('Tokyo');
+    await button('Create organization').click();
+    await page.locator('summary').getByText('Tokyo', { exact: true }).waitFor();
+    await button('Groups').click();
+    await page.getByLabel('New group').fill('Sales');
+    await button('Create group').click();
+    await page.locator('summary').getByText('Sales', { exact: true }).click();
+    await page.getByLabel('Group name').fill('Sales Japan');
+    await button('Save group').click();
+    await page.locator('summary').getByText('Sales Japan', { exact: true }).waitFor();
+    await button('Back to applications').click();
+    await page.getByRole('button', { name: /Orders/ }).click();
+
+    await button('Settings').click();
+    const rows = page.locator('.layout-designer-row');
+    const width = (name) => page.locator('.layout-card').filter({ has: button('Drag ' + name) }).getByLabel('Width');
+    await width('Amount').selectOption('6');
+    await width('Title').selectOption('6');
+    const source = button('Drag Title');
+    const target = rows.filter({ has: button('Drag Amount') }).getByText('Drop at end of row');
+    const from = await source.boundingBox();
+    const to = await target.boundingBox();
+    await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 16 });
+    await page.mouse.up();
+    await rows.filter({ has: button('Drag Amount') }).getByRole('button', { name: 'Drag Title', exact: true }).waitFor();
+    // dnd-kit suppresses the click immediately following a pointer drop.
+    await page.waitForTimeout(100);
+    await button('Undo layout change').click();
+    await rows.filter({ has: button('Drag Amount') }).getByRole('button', { name: 'Drag Title', exact: true }).waitFor({ state: 'hidden' });
+    await page.locator('.layout-card').filter({ has: button('Drag Title') }).getByLabel('Move to').selectOption({ label: 'Row 1' });
+    await button('Mobile preview').click();
+    await page.getByLabel('mobile form preview').waitFor();
+    await button('Desktop preview').click();
+    await page.getByLabel('desktop form preview').waitFor();
+    await button('Save layout to draft').click();
+    await page.getByText('Layout saved to the schema draft.').waitFor();
+    const draft = await page.request.get(origin + '/api/apps/' + app.id + '/draft', { headers: { Authorization: 'Bearer ' + token } });
+    assert.ok((await draft.json()).formLayout.some(({ cells }) => cells.some(({ fieldId }) => fieldId === fields.title.fieldId)));
+
+    await button('Views').click();
+    await page.getByLabel('View name').fill('Amounts over zero');
+    await button('Add condition').click();
+    await page.getByLabel('Condition field', { exact: true }).selectOption(fields.amount.fieldId);
+    await page.getByLabel('Operator').selectOption('ne');
+    await page.getByLabel('Value', { exact: true }).fill('0');
+    await page.getByLabel('Sort field').selectOption(fields.amount.fieldId);
+    await page.getByLabel('Add column').selectOption(fields.title.fieldId);
+    await page.getByLabel('Width', { exact: true }).fill('220');
+    await button('Save view to draft').click();
+    await button('Set as default view').click();
+    await page.getByText('Default view updated in the draft.').waitFor();
+    await button('Preflight and publish').click();
+    await page.getByText('Draft preflight passed and the schema was published.').waitFor();
+    await button('Back to records').click();
+
+    await button('Record recycle bin').click();
+    await button('Restore record 2').click();
+    await button('Confirm restore of record 2').click();
+    await page.getByText('Record 2 was restored.').waitFor();
+    await button('Back to records').click();
+    await button('Record 2').waitFor();
+
+    await button('Record 1').click();
+    await button('Edit').click();
+    const rich = page.getByRole('textbox', { name: 'Notes' });
+    await rich.fill('Formatted note');
+    await rich.press('ControlOrMeta+a');
+    await button('Bold').click();
+    await button('Save to server').click();
+    const formatted = page.locator('.rich-text-value b, .rich-text-value strong');
+    await formatted.waitFor();
+    assert.equal(await formatted.innerText(), 'Formatted note');
+    t.diagnostic('Directory created Tokyo and renamed Sales Japan. Drag, undo, two previews, configured view, restore and rich-text formatting passed.');
+  } finally {
+    await browser.close();
+  }
+});

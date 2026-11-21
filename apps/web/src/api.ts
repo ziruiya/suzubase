@@ -6,6 +6,8 @@ export interface Profile {
   displayName: string | null;
   email: string;
   isAdmin: boolean;
+  canManageRecycleBin: boolean;
+  canReadArchivedFields: boolean;
   canCreateApps: boolean;
   allowAppCreation: boolean;
   localDrafts: boolean;

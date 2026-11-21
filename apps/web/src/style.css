@@ -118,3 +118,6 @@ dd { white-space: pre-wrap; }
   .layout-row { display: block; }
   .layout-cell + .layout-cell { margin-top: .65rem; }
 }
+
+.view-columns { display: flex; flex-wrap: wrap; gap: .6rem; }
+.view-columns > div { max-width: 100%; min-width: 0; }

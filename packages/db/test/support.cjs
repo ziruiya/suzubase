@@ -24,8 +24,8 @@ async function provision(options = {}) {
       await client.query('INSERT INTO tenants (id, name) VALUES ($1, $2)', [tenantId, 'Test tenant']);
     }
     await client.query('INSERT INTO users (tenant_id, id, email) VALUES ($1, $2, $3)', [tenantId, userId, email]);
-    await client.query('INSERT INTO tenant_members (tenant_id, user_id, can_create_apps) VALUES ($1, $2, $3)', [
-      tenantId, userId, options.canCreateApps ?? true,
+    await client.query('INSERT INTO tenant_members (tenant_id, user_id, can_create_apps, is_admin, can_manage_recycle_bin) VALUES ($1, $2, $3, $4, $5)', [
+      tenantId, userId, options.canCreateApps ?? true, options.isAdmin ?? false, options.canManageRecycleBin ?? false,
     ]);
     await client.query(`
       INSERT INTO authentication.login_credentials (tenant_id, user_id, email, password_hash)

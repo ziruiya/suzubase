@@ -1,5 +1,5 @@
 import { Fragment, useState, type CSSProperties, type ReactNode } from 'react';
-import { DndContext, useDraggable, useDroppable, type DragEndEvent } from '@dnd-kit/core';
+import { DndContext, closestCenter, pointerWithin, useDraggable, useDroppable, type CollisionDetection, type DragEndEvent } from '@dnd-kit/core';
 import { layoutWidths, type FormLayout, type LayoutCell } from '@suzubase/shared-types';
 import type { Field } from './api';
 
@@ -66,6 +66,9 @@ function LayoutCard({ field, cell, changeWidth, moveToRow, rows }: {
   </div>;
 }
 
+const layoutCollision: CollisionDetection = (args) =>
+  args.pointerCoordinates ? pointerWithin(args) : closestCenter(args);
+
 export function LayoutDesigner({ fields, saved, save }: {
   fields: Field[]; saved: FormLayout; save: (layout: FormLayout) => Promise<void>;
 }) {
@@ -116,7 +119,7 @@ export function LayoutDesigner({ fields, saved, save }: {
     {error && <p role="alert">{error}</p>}
     {preview ? <div className={preview === 'mobile' ? 'layout-preview phone' : 'layout-preview'} aria-label={preview + ' form preview'}>
       <FormGrid fields={fields} layout={current} render={(field) => <label>{field.name}<input disabled /></label>} />
-    </div> : <DndContext onDragEnd={onDragEnd}>
+    </div> : <DndContext collisionDetection={layoutCollision} onDragEnd={onDragEnd}>
       {current.map((row, index) => <section className="layout-designer-row stack" key={row.id} aria-label={'Row ' + (index + 1)}>
         <div className="inline">
           <label>Group <select value={row.groupFieldId ?? ''} onChange={(event) => {

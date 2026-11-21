@@ -112,13 +112,13 @@ export class RecordService {
       case 'organization': {
         const [organization] = await tx.select({ id: organizations.id }).from(organizations).where(and(
           eq(organizations.tenantId, context.tenantId), eq(organizations.id, id),
-        ));
+        )).for('key share');
         return Boolean(organization);
       }
       case 'group': {
         const [group] = await tx.select({ id: memberGroups.id }).from(memberGroups).where(and(
           eq(memberGroups.tenantId, context.tenantId), eq(memberGroups.id, id),
-        ));
+        )).for('key share');
         return Boolean(group);
       }
       default: return true;
@@ -363,6 +363,22 @@ export class RecordService {
     return { results };
   }
 
+  async recycleBin(context: TenantContext, appId: string, cursor: { after?: string; limit?: number }) {
+    return withTenantTransaction(context, async (tx) => {
+      if (!await this.authorization.requireRecycleAccess(tx, context)) throw new ForbiddenException('无权限');
+      await this.appSchema.access(tx, context, appId, 'delete');
+      const { access } = await this.appSchema.access(tx, context, appId, 'view');
+      const limit = cursor.limit ?? 50;
+      const rows = await tx.select({ id: records.id, recordNo: records.recordNo, revision: records.revision, deletedAt: records.deletedAt })
+        .from(records).where(and(eq(records.tenantId, context.tenantId), eq(records.appId, appId),
+          sql`${records.deletedAt} IS NOT NULL`, this.authorization.recordScope(access, 'view'),
+          this.authorization.recordScope(access, 'delete'), cursor.after ? sql`${records.recordNo} > ${cursor.after}::bigint` : undefined,
+        )).orderBy(records.recordNo).limit(limit + 1);
+      const items = rows.slice(0, limit).map((row) => ({ ...row, recordNo: row.recordNo.toString() }));
+      return { items, nextCursor: rows.length > limit ? items.at(-1)!.recordNo : null };
+    });
+  }
+
   async changeLifecycle(context: TenantContext, appId: string, id: string, revision: number, restore: boolean) {
     return withTenantTransaction(context, async (tx) => {
       if (restore && !await this.authorization.requireRecycleAccess(tx, context)) throw new ForbiddenException('无权限');
@@ -523,6 +539,11 @@ export class RecordsController {
         .pipe(z.array(identifier).max(10).refine((values) => new Set(values).size === values.length)).optional(),
     }), query);
     return this.queries.aggregate(context, parseInput(identifier, appId), view, fields ?? []);
+  }
+
+  @Get('recycle')
+  recycle(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
+    return this.service.recycleBin(context, parseInput(identifier, appId), parseInput(pageInput.omit({ view: true }), query));
   }
 
   @Post('batch')

@@ -368,6 +368,7 @@ export class AppSchemaService {
       const version = app.draftSchemaVersion;
       return {
         version, status: app.draftStatus, autoNumberHelp,
+        publishedFields: await this.getFields(tx, context, appId, app.publishedSchemaVersion),
         fields: version === null ? [] : await this.getFields(tx, context, appId, version),
         formLayout: (await this.getVersion(tx, context, appId, version ?? app.publishedSchemaVersion)).formLayout,
         ...await this.getViews(tx, context, appId, version ?? app.publishedSchemaVersion),
@@ -592,7 +593,8 @@ export class AppSchemaService {
         if (!columnsValid || (input.sort && (!sortField || !fieldContract[sortField.type].sort))) {
           throw new BadRequestException('Unsupported view column or sort');
         }
-        const conditions = input.conditions.map((condition) => {
+        const conditions = [];
+        for (const condition of input.conditions) {
           const field = definitions.get(condition.fieldId);
           if (!field || !fieldContract[field.type].filter ||
             (condition.operator === 'current-user' && field.type !== 'user') ||
@@ -602,10 +604,12 @@ export class AppSchemaService {
           if ('value' in condition) {
             const value = normalizeValue(field.type, condition.value, field.options);
             if (value === undefined) throw new BadRequestException('Invalid view condition value');
-            return { ...condition, value };
-          }
-          return condition;
-        });
+            if (field.type === 'organization' || field.type === 'group') {
+              await this.authorization.validateDirectorySubject(tx, context, { kind: field.type, id: value });
+            }
+            conditions.push({ ...condition, value });
+          } else conditions.push(condition);
+        }
         const saved: SavedView = { ...input, id: change.id ?? randomUUID(), conditions };
         if (view) Object.assign(view, saved);
         else configuration.views.push(saved);
@@ -636,6 +640,14 @@ export class AppSchemaService {
         }
       }
       if (input.field.some(({ fieldId }) => !definitions.has(fieldId))) throw new BadRequestException('Unknown permission field');
+      for (const rule of input.record) for (const condition of rule.conditions) {
+        const field = definitions.get(condition.fieldId);
+        if ('value' in condition && (field?.type === 'organization' || field?.type === 'group')) {
+          const value = normalizeValue(field.type, condition.value, field.options);
+          if (value === undefined) throw new BadRequestException('Invalid permission condition value');
+          await this.authorization.validateDirectorySubject(tx, context, { kind: field.type, id: value });
+        }
+      }
       const aclConfiguration: AclConfiguration = {
         app: input.app.map((rule) => ({ ...rule, id: randomUUID() })),
         field: input.field.map((rule) => ({ ...rule, id: randomUUID() })),
