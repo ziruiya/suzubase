@@ -1,3 +1,5 @@
+import type { SavedView, ViewCondition } from './views';
+
 const scalar = {
   filter: true, sort: true, aggregate: false, index: true, unique: true,
   csv: 'scalar', storage: 'string',
@@ -74,7 +76,13 @@ export function isRecordInput(type: FieldType | undefined) {
   return type !== undefined && type !== 'autoNumber' && type !== 'calculation' && type !== 'layout' && type !== 'lookup';
 }
 
-export interface LookupConfiguration {
+export interface ReferencePresentation {
+  displayFieldIds?: string[];
+  conditions?: ViewCondition[];
+  sort?: SavedView['sort'];
+}
+
+export interface LookupConfiguration extends ReferencePresentation {
   appId: string;
   keyFieldId: string;
   localKeyFieldId: string;

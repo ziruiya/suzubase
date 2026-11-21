@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
-import { isRecordInput, type LookupConfiguration, type RecordResponse } from '@suzubase/shared-types';
+import { useEffect, useRef, useState } from 'react';
+import { fieldContract, isRecordInput, type LookupConfiguration, type RecordData, type RecordResponse, type ReferencePresentation } from '@suzubase/shared-types';
+import { Conditions } from './conditions';
 import { api, appPath, json, message, type App, type AppSummary, type Field } from './api';
 
 export function LookupSettings({ token, fields, initial }: { token: string; fields: Field[]; initial?: LookupConfiguration | null }) {
@@ -9,6 +10,7 @@ export function LookupSettings({ token, fields, initial }: { token: string; fiel
   const [key, setKey] = useState(initial?.keyFieldId ?? '');
   const [localKey, setLocalKey] = useState(initial?.localKeyFieldId ?? '');
   const [copies, setCopies] = useState(initial?.copies ?? [{ sourceFieldId: '', targetFieldId: '' }]);
+  const [presentation, setPresentation] = useState<ReferencePresentation>(initial ?? {});
   const [error, setError] = useState('');
   useEffect(() => {
     void api<AppSummary[]>('/apps', token).then(setApps).catch((error) => setError(message(error)));
@@ -23,9 +25,9 @@ export function LookupSettings({ token, fields, initial }: { token: string; fiel
   const keyType = source.find(({ fieldId }) => fieldId === key)?.type;
   return <fieldset className="stack">
     <legend>Lookup</legend>
-    <input name="lookup" type="hidden" value={JSON.stringify({ appId, keyFieldId: key, localKeyFieldId: localKey, copies })} />
+    <input name="lookup" type="hidden" value={JSON.stringify({ ...presentation, appId, keyFieldId: key, localKeyFieldId: localKey, copies })} />
     <label>Reference application <select required value={appId} onChange={(event) => {
-      setAppId(event.target.value); setSource([]); setKey(''); setLocalKey('');
+      setAppId(event.target.value); setPresentation({}); setSource([]); setKey(''); setLocalKey('');
       setCopies([{ sourceFieldId: '', targetFieldId: '' }]); setError('');
     }}><option value="">Select application</option>{apps.map((app) => <option key={app.id} value={app.id}>{app.name}</option>)}</select></label>
     <label>Reference key <select required value={key} onChange={(event) => { setKey(event.target.value); setLocalKey(''); }}>
@@ -55,8 +57,80 @@ export function LookupSettings({ token, fields, initial }: { token: string; fiel
       </div>;
     })}
     <button type="button" onClick={() => setCopies([...copies, { sourceFieldId: '', targetFieldId: '' }])}>Add copy</button>
+    {source.length > 0 && <ReferenceSettings fields={source} value={presentation} onChange={setPresentation} />}
     {error && <p role="alert">{error}</p>}
   </fieldset>;
+}
+
+export function ReferenceSettings({ fields, value, onChange }: {
+  fields: Field[]; value: ReferencePresentation; onChange: (value: ReferencePresentation) => void;
+}) {
+  return <fieldset className="stack">
+    <legend>Reference results</legend>
+    <label>Display fields <select multiple value={value.displayFieldIds ?? []} onChange={(event) =>
+      onChange({ ...value, displayFieldIds: Array.from(event.target.selectedOptions, (option) => option.value) })}>
+      {fields.filter(({ type }) => !['layout', 'attachment', 'lookup'].includes(type)).map((field) =>
+        <option key={field.fieldId} value={field.fieldId}>{field.name}</option>)}
+    </select></label>
+    <div className="inline">
+      <label>Sort by <select value={value.sort?.fieldId ?? ''} onChange={(event) => onChange({
+        ...value, sort: event.target.value ? { fieldId: event.target.value, direction: 'asc' } : undefined,
+      })}>
+        <option value="">Record number</option>{fields.filter(({ type }) => fieldContract[type].sort).map((field) =>
+          <option key={field.fieldId} value={field.fieldId}>{field.name}</option>)}
+      </select></label>
+      {value.sort && <label>Order <select value={value.sort.direction} onChange={(event) => onChange({
+        ...value, sort: { fieldId: value.sort!.fieldId, direction: event.target.value === 'desc' ? 'desc' : 'asc' },
+      })}><option value="asc">Ascending</option><option value="desc">Descending</option></select></label>}
+    </div>
+    <Conditions conditions={value.conditions ?? []} fields={fields} onChange={(conditions) => onChange({ ...value, conditions })} />
+  </fieldset>;
+}
+
+type ReferencePage = { columns: { fieldId: string; name: string }[]; items: RecordData[]; next: string | null };
+
+export function ReferenceSelector({ path, token, fieldId, keyFieldId, recordId, select, close }: {
+  path: string; token: string; fieldId: string; keyFieldId: string; recordId?: string;
+  select: (value: string) => void; close: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [query, setQuery] = useState('');
+  const [search, setSearch] = useState({ query: '', after: undefined as string | undefined });
+  const [page, setPage] = useState<ReferencePage>();
+  const [error, setError] = useState('');
+  useEffect(() => { dialog.current?.showModal(); }, []);
+  useEffect(() => {
+    const abort = new AbortController();
+    const params = new URLSearchParams({ fieldId, query: search.query });
+    if (recordId) params.set('recordId', recordId);
+    if (search.after) params.set('after', search.after);
+    void api<ReferencePage>(path + '?' + params, token, { signal: abort.signal })
+      .then(setPage).catch((error) => { if (!abort.signal.aborted) setError(message(error)); });
+    return () => abort.abort();
+  }, [path, token, fieldId, recordId, search]);
+  function submit(after?: string) {
+    setPage(undefined); setError(''); setSearch({ query: after ? search.query : query, after });
+  }
+  return <dialog ref={dialog} className="reference-selector" aria-label="Select reference record" onCancel={close}>
+    <div className="stack">
+      <div className="inline spread"><h2>Select reference record</h2><button type="button" onClick={close}>Cancel</button></div>
+      <div className="inline">
+        <label>Search by reference key <input value={query} onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }} /></label>
+        <button type="button" onClick={() => submit()}>Search</button>
+      </div>
+      {error ? <p role="alert">{error}</p> : !page ? <p role="status">Loading…</p> : <>
+        {page.items.length === 0 && <p>No records found</p>}
+        <ul className="plain stack">{page.items.map((item) => <li key={item[keyFieldId]} className="panel stack">
+          <dl>{page.columns.map(({ fieldId, name }) => <div key={fieldId} className="value-row">
+            <dt>{name}</dt><dd>{item[fieldId] ?? '—'}</dd>
+          </div>)}</dl>
+          <button type="button" onClick={() => select(item[keyFieldId])}>Select {item[keyFieldId]}</button>
+        </li>)}</ul>
+        {page.next && <button type="button" onClick={() => submit(page.next!)}>Next page</button>}
+      </>}
+    </div>
+  </dialog>;
 }
 
 type Changes = { fieldId: string; name: string; current: string | null; incoming: string | null }[];

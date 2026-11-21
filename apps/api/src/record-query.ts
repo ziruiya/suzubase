@@ -1,8 +1,8 @@
 import { BadRequestException, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import {
-  and, eq, isNull, records, recordUniqueValues, sql, TenantContext, TenantTransaction, withTenantTransaction,
+  and, eq, gt, isNull, or, records, recordUniqueValues, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { fieldContract, AppAction, LookupConfiguration } from '@suzubase/shared-types';
+import { fieldContract, AppAction, LookupConfiguration, ReferencePresentation } from '@suzubase/shared-types';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
 import { uniqueKey } from './schema-preflight';
@@ -52,6 +52,58 @@ export class RecordQueryService {
         eq(recordUniqueValues.normalizedValue, uniqueKey(match.key)),
       )).where(scope);
     return row;
+  }
+
+  async referencePage(tx: TenantTransaction, context: TenantContext, appId: string, config: ReferencePresentation,
+    match: { fieldId: string; value: string; prefix?: boolean }, limit: number, after?: string,
+  ) {
+    const { fields, access } = await this.schema.access(tx, context, appId, 'view');
+    const visible = (id: string) => access.types.has(id) && this.authorization.fieldDecision(access, id, 'view').allowed;
+    const predicates = [match.fieldId, ...config.conditions?.map(({ fieldId }) => fieldId) ?? []];
+    if (config.sort) predicates.push(config.sort.fieldId);
+    if (predicates.some((id) => !visible(id))) throw new NotFoundException('无权限');
+
+    const display = [...new Set([...config.displayFieldIds ?? [], ...(match.prefix ? [match.fieldId] : [])])];
+    const columns = fields.filter(({ fieldId }) => display.includes(fieldId) && visible(fieldId))
+      .map(({ fieldId, name }) => ({ fieldId, name }));
+    const raw = sql<string>`${records.data} ->> ${match.fieldId}::text`;
+    const scope = and(eq(records.tenantId, context.tenantId), eq(records.appId, appId), isNull(records.deletedAt),
+      this.authorization.recordScope(access, 'view'),
+      match.prefix
+        ? sql`length(${raw}) > 0 AND starts_with(lower(${raw}), lower(${match.value}))`
+        : this.authorization.condition(context, { fieldId: match.fieldId, operator: 'eq', value: match.value }, access.types.get(match.fieldId)),
+      ...config.conditions?.map((condition) => this.authorization.condition(context, condition, access.types.get(condition.fieldId))) ?? [],
+    );
+    const sortField = config.sort?.fieldId;
+    const direction = config.sort?.direction === 'desc' ? sql`DESC` : sql`ASC`;
+    const afterOperator = config.sort?.direction === 'desc' ? sql`<` : sql`>`;
+    const sortText = sortField ? sql<string | null>`NULLIF(${records.data} ->> ${sortField}::text, '')` : undefined;
+    const numericSort = sortField && access.types.get(sortField) === 'number';
+    const sort = sortText && (numericSort ? sql`(${sortText})::numeric` : sortText);
+
+    const afterNumber = after === undefined ? undefined : BigInt(after);
+    let cursor = afterNumber === undefined ? undefined : gt(records.recordNo, afterNumber);
+    if (cursor && sortText) {
+      const [anchor] = await tx.select({ value: sortText }).from(records)
+        .where(and(scope, eq(records.recordNo, afterNumber!)));
+      if (!anchor) throw new BadRequestException('The reference page changed. Restart the search.');
+      if (anchor.value === null) cursor = and(isNull(sort!), cursor);
+      else {
+        const value = numericSort ? sql`${anchor.value}::numeric` : sql`${anchor.value}`;
+        cursor = or(isNull(sort!), sql`${sort} ${afterOperator} ${value}`, and(sql`${sort} = ${value}`, cursor));
+      }
+    }
+    const projection = columns.length
+      ? sql<Record<string, string>>`COALESCE((SELECT jsonb_object_agg(key, value) FROM jsonb_each(${records.data})
+          WHERE key IN (${sql.join(columns.map(({ fieldId }) => sql`${fieldId}`), sql`,`)})), '{}'::jsonb)`
+      : sql<Record<string, string>>`'{}'::jsonb`;
+    const rows = await tx.select({ recordNo: records.recordNo, data: projection })
+      .from(records).where(and(scope, cursor))
+      .orderBy(...sort ? [sql`${sort} ${direction} NULLS LAST`] : [], records.recordNo).limit(limit + 1);
+    return {
+      columns, items: rows.slice(0, limit).map(({ data }) => data),
+      next: rows.length > limit ? rows[limit - 1].recordNo.toString() : null,
+    };
   }
 
   async aggregate(context: TenantContext, appId: string, viewId: string | undefined, fieldIds: string[]) {

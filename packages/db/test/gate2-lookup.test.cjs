@@ -57,3 +57,62 @@ test('G2-01 lookup keeps typed snapshots until a revision-bound refresh is confi
   assert.equal((await get(refresh, 404)).message, '无权限');
   assert.equal((await get(recordPath)).data[copy.fieldId], '9');
 });
+
+test('G2-02 reference search paginates configured numeric order and projects only visible configured columns', async (t) => {
+  const owner = await provision();
+  const member = await provision({ tenantId: owner.tenantId });
+  const token = await login(owner);
+  const reader = await login(member);
+  const source = await createApp(token, 'sources');
+  const dest = await createApp(token, 'dest');
+  const sourcePath = '/apps/' + source.id;
+  const destPath = '/apps/' + dest.id;
+  const write = (path, body, method = 'POST', status = 201, bearer = token) =>
+    expectRequest(status, path, { method, body, token: bearer });
+  const key = await write(sourcePath + '/fields', { code: 'key', name: 'Key', type: 'text', uniqueValue: true });
+  const rank = await addField(token, source.id, 'rank', 'number');
+  const confidential = await addField(token, source.id, 'confidential', 'text');
+  const group = await addField(token, source.id, 'group', 'text');
+  const local = await addField(token, dest.id, 'reference', 'text');
+  const snapshot = await addField(token, dest.id, 'snapshot', 'number');
+  const readerSubject = { kind: 'user', id: member.userId };
+  const ownerSubject = { kind: 'user', id: owner.userId };
+  await write(sourcePath + '/draft/acl', {
+    app: [{ action: 'view', subject: readerSubject }],
+    record: [
+      { action: 'view', subject: readerSubject, conditions: [{ fieldId: group.fieldId, operator: 'eq', value: 'allowed' }] },
+      { action: 'view', subject: ownerSubject, conditions: [] },
+    ],
+    field: [{ action: 'view', subject: ownerSubject, fieldId: confidential.fieldId }],
+  }, 'PUT', 200);
+  await publish(token, source.id);
+  const lookup = await write(destPath + '/fields', { code: 'lookup', name: 'Lookup', type: 'lookup',
+    lookup: { appId: source.id, keyFieldId: key.fieldId, localKeyFieldId: local.fieldId,
+      copies: [{ sourceFieldId: rank.fieldId, targetFieldId: snapshot.fieldId }],
+      displayFieldIds: [rank.fieldId, confidential.fieldId],
+      sort: { fieldId: rank.fieldId, direction: 'desc' },
+      conditions: [{ fieldId: rank.fieldId, operator: 'ne', value: '99' }],
+    } });
+  await write(destPath + '/draft/acl', {
+    app: [{ action: 'view', subject: readerSubject }, { action: 'create', subject: readerSubject }], record: [], field: [],
+  }, 'PUT', 200);
+  await publish(token, dest.id);
+  const data = (n, visibility = 'allowed') => ({
+    [key.fieldId]: 'REF-' + n, [rank.fieldId]: String(n), [group.fieldId]: visibility, [confidential.fieldId]: 'hidden',
+  });
+  await write(sourcePath + '/records/batch', { items: [
+    ...Array.from({ length: 21 }, (_, i) => ({ data: data(i + 1) })),
+    { data: data(99) }, { data: data(100, 'denied') },
+  ] });
+  const url = destPath + '/records/reference-search?fieldId=' + lookup.fieldId + '&query=ref-';
+  const first = await expectRequest(200, url, { token: reader });
+  assert.deepEqual(first.columns.map(({ fieldId }) => fieldId).sort(), [key.fieldId, rank.fieldId].sort());
+  assert.deepEqual(first.items.map((row) => row[rank.fieldId]), Array.from({ length: 20 }, (_, i) => String(21 - i)));
+  assert.ok(first.items.every((row) => Object.keys(row).length === 2));
+  const next = await expectRequest(200, url + '&after=' + first.next, { token: reader });
+  assert.deepEqual(next.items, [{ [key.fieldId]: 'REF-1', [rank.fieldId]: '1' }]);
+  assert.equal(next.next, null);
+  const saved = await write(destPath + '/records', { data: { [local.fieldId]: next.items[0][key.fieldId] } }, 'POST', 201, reader);
+  assert.equal(saved.data[snapshot.fieldId], '1');
+  t.diagnostic('Reader saw 20 + 1 rows in descending numeric order. Record ACL, configured filter and field ACL hid excluded data.');
+});

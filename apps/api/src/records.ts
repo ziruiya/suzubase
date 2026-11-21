@@ -29,6 +29,11 @@ const createInput = z.strictObject({ data: dataInput });
 const updateInput = z.strictObject({ data: dataInput, revision: z.int().min(1).max(2147483647) });
 const revisionInput = updateInput.pick({ revision: true });
 const lookupPreviewInput = z.strictObject({ fieldId: identifier, key: z.string().min(1).max(4000) });
+const lookupSearchInput = z.strictObject({
+  fieldId: identifier, query: z.string().max(200).regex(/^[^\x00\p{Surrogate}]*$/u).default(''),
+  recordId: identifier.optional(),
+  after: z.string().regex(/^[0-9]{1,19}$/).refine((value) => BigInt(value) <= 9223372036854775807n).optional(),
+});
 const lookupRefreshInput = revisionInput.extend({ confirmation: z.string().regex(/^[a-f0-9]{64}$/) });
 const batchUpdateInput = z.strictObject({
   fieldId: identifier, value: z.string().nullable(),
@@ -50,7 +55,7 @@ const recycleQuery = pageInput.omit({ view: true });
 const batchCreateInput = z.strictObject({ items: z.array(createInput).min(1).max(100) });
 const historyExportQuery = z.strictObject({ includeArchived: z.enum(['true', 'false']).optional() });
 export const recordHttp = { createInput, updateInput, revisionInput, batchUpdateInput, batchCreateInput,
-  pageInput, searchInput, aggregateQuery, recycleQuery, historyExportQuery };
+  pageInput, searchInput, aggregateQuery, recycleQuery, historyExportQuery, lookupPreviewInput, lookupRefreshInput, lookupSearchInput };
 
 const keyPattern = /^[!-~]{1,128}$/;
 const createKey = z.string().regex(keyPattern).optional();
@@ -391,6 +396,18 @@ export class RecordService {
     });
   }
 
+  async referenceSearch(context: TenantContext, appId: string, input: z.infer<typeof lookupSearchInput>) {
+    return withTenantTransaction(context, async (tx) => {
+      await tx.execute(sql`SET LOCAL statement_timeout = '1500ms'`);
+      const { app, access } = await this.appSchema.writable(tx, context, appId, input.recordId ? 'edit' : 'create');
+      const record = input.recordId ? await this.findRecord(tx, context, appId, input.recordId, 'edit') : undefined;
+      const fields = await this.appSchema.getFields(tx, context, appId, record?.schemaVersion ?? app.publishedSchemaVersion);
+      const { lookup } = this.lookupField(fields, access, input.fieldId);
+      return this.query.referencePage(tx, context, lookup.appId, lookup,
+        { fieldId: lookup.keyFieldId, value: input.query, prefix: true }, 20, input.after);
+    });
+  }
+
   private async refreshValues(tx: TenantTransaction, context: TenantContext, record: RecordResponse,
     definitions: FieldDefinition[], access: RecordAccess, fieldId: string,
   ) {
@@ -707,6 +724,11 @@ export class RecordsController {
   @AllowApiToken('view')
   list(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
     return this.service.list(context, parseInput(identifier, appId), parseInput(pageInput, query));
+  }
+
+  @Get('reference-search')
+  referenceSearch(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
+    return this.service.referenceSearch(context, parseInput(identifier, appId), parseInput(lookupSearchInput, query));
   }
 
   @Post('lookup-preview')

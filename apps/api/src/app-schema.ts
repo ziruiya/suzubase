@@ -19,6 +19,7 @@ import { dataPreflight, formLayoutInput, isDestructive, migrationInput, referenc
 import { retireChangedIndexes } from './runtime-index-state';
 import { fieldChanges, serializeRecord, writeRecordEvent } from './record-events';
 import { projectSearchValues } from './search-projection';
+import { normalizeReferencePresentation, referencePresentation } from './reference-config';
 import { conditions, viewInput } from './view-input';
 import { identifier, parseInput, postgresErrorCode } from './validation';
 
@@ -54,6 +55,7 @@ const numbering = z.strictObject({
 });
 const layoutInput = z.strictObject({ kind: z.enum(layoutKinds), text: metadata.name.optional().default('') });
 const lookupInput = z.strictObject({
+  ...referencePresentation,
   appId: identifier, keyFieldId: identifier, localKeyFieldId: identifier,
   copies: z.array(z.strictObject({ sourceFieldId: identifier, targetFieldId: identifier })).min(1).max(50),
 }).refine(({ copies }) => new Set(copies.map(({ targetFieldId }) => targetFieldId)).size === copies.length,
@@ -82,7 +84,7 @@ const publishInput = z.strictObject({ migration: migrationInput.optional() });
 const binQuery = z.enum(['true', 'false']).optional();
 
 export const appHttp = {
-  createAppInput, appInput, settingsInput, lifecycleInput, fieldInput, fieldPatch, layoutInput, option, numbering,
+  createAppInput, appInput, settingsInput, lifecycleInput, fieldInput, fieldPatch, layoutInput, option, numbering, lookupInput,
   formLayoutInput, viewInput, defaultViewInput, aclInput, previewInput, publishInput, binQuery,
 };
 
@@ -413,6 +415,7 @@ export class AppSchemaService {
     const local = new Map(localFields.map((field) => [field.fieldId, field]));
     const usedTargets = lookupTargets(localFields);
     const { fields: sourceFields } = await this.access(tx, context, config.appId, 'view');
+    config.conditions = normalizeReferencePresentation(config, sourceFields);
     const source = new Map(sourceFields.map((field) => [field.fieldId, field]));
     const key = source.get(config.keyFieldId);
     const localKey = local.get(config.localKeyFieldId);

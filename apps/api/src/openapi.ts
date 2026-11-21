@@ -26,6 +26,7 @@ const result = (name: string) => z.object({ [name]: z.literal(true) });
 const field = z.object({
   fieldId: id, code: text, name: text, type: z.enum(fieldTypes), required: flag, uniqueValue: flag,
   options: z.array(appHttp.option), formula: formulaInput.nullable(), layoutElement: appHttp.layoutInput.nullable(),
+  lookup: appHttp.lookupInput.nullable().optional(),
   autoNumber: appHttp.numbering.nullable(), searchMode: z.enum(textSearchModes).nullable(),
 });
 const formField = field.extend({ editable: flag });
@@ -204,6 +205,16 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/publish']: { post: { body: appHttp.publishInput, optionalBody: true,
     reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text) }), conflict: publishConflict } },
   [records]: { get: { query: recordHttp.pageInput, reply: page(record) }, post: { body: recordHttp.createInput, reply: record, conflict: errorSchema } },
+  [records + '/reference-search']: { get: { query: recordHttp.lookupSearchInput, reply: z.object({
+    columns: z.array(z.object({ fieldId: id, name: text })), items: z.array(data), next: recordNo.nullable(),
+  }) } },
+  [records + '/lookup-preview']: { post: { body: recordHttp.lookupPreviewInput.extend({ recordId: id.optional() }),
+    reply: z.object({ changes: z.array(z.object({ fieldId: id, name: text, current: text.nullable(), incoming: text.nullable() })) }) } },
+  [entry + '/lookups/{fieldId}/refresh']: {
+    get: { reply: z.object({ revision: integer, confirmation: text,
+      changes: z.array(z.object({ fieldId: id, name: text, current: text.nullable(), incoming: text.nullable() })) }) },
+    post: { body: recordHttp.lookupRefreshInput, reply: record, conflict: z.union([revisionConflict, errorSchema]) },
+  },
   [records + '/search']: { get: { query: recordHttp.searchInput, reply: search } },
   [records + '/aggregates']: { get: { query: recordHttp.aggregateQuery, reply: aggregates } },
   [records + '/recycle']: { get: { query: recordHttp.recycleQuery, reply: page(recycle) } },

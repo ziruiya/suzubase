@@ -5,7 +5,7 @@ import { Controller, useForm, useWatch } from 'react-hook-form';
 import { z } from 'zod';
 import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
 import { directoryType, type SelectorOptions } from './selector-options';
-import { LookupPreview, LookupRefresh } from './lookup';
+import { LookupPreview, LookupRefresh, ReferenceSelector } from './lookup';
 import { FormGrid } from './form-layout';
 import { RichTextEditor, RichTextValue, richTextSummary } from './rich-text';
 import { draftKey, recoverDraft, removeDrafts, writeDraft, type Draft, type DraftScope } from './drafts';
@@ -217,6 +217,7 @@ export function RecordEditor({
     void recoverDraft(scope).then(setRecovery).catch(() => undefined);
   }, [allowDraft, app.id, app.schemaVersion, record?.id, profile.tenantId, profile.userId]);
 
+  const [selecting, setSelecting] = useState<Field>();
   const watchedValues = useWatch({ control: form.control });
   function editableValues(values: RecordData): RecordData {
     return Object.fromEntries(fields.filter(({ editable, fieldId }) => editable && Object.hasOwn(values, fieldId))
@@ -343,9 +344,13 @@ export function RecordEditor({
     </section>}
     <FormGrid fields={fields} layout={layout} render={(field) => <div className="form-field">
       <label htmlFor={'field-' + field.fieldId} id={'field-' + field.fieldId + '-label'}>{field.name}{field.required ? ' *' : ''}</label>
-      {field.lookup ? <LookupPreview token={token} fieldId={field.fieldId} recordId={record?.id}
+      {field.lookup ? <>
+      <LookupPreview token={token} fieldId={field.fieldId} recordId={record?.id}
         path={appPath(app.id) + '/records/lookup-preview'} disabled={busy}
-        value={watchedValues[field.lookup.localKeyFieldId] ?? ''} /> :
+        value={watchedValues[field.lookup.localKeyFieldId] ?? ''} />
+      {fields.some((key) => key.fieldId === field.lookup!.localKeyFieldId && key.editable) &&
+        <button type="button" disabled={busy} onClick={() => setSelecting(field)}>Select reference record</button>}
+      </> :
       <Controller name={field.fieldId} control={form.control} defaultValue="" render={({ field: input, fieldState }) => <>
         <RuntimeField field={field} value={input.value ?? ''} session={session} app={app} disabled={busy} directory={directory}
           onChange={(value) => { input.onChange(value); if (!latest) setState('editing'); }}
@@ -353,6 +358,13 @@ export function RecordEditor({
         {fieldState.error && <p role="alert" className="error">{fieldState.error.message}</p>}
       </>} />}
     </div>} />
+    {selecting?.lookup && <ReferenceSelector token={token} fieldId={selecting.fieldId} recordId={record?.id}
+      keyFieldId={selecting.lookup.keyFieldId} path={appPath(app.id) + '/records/reference-search'}
+      close={() => setSelecting(undefined)} select={(key) => {
+        form.setValue(selecting.lookup!.localKeyFieldId, key, { shouldDirty: true });
+        setState('editing');
+        setSelecting(undefined);
+      }} />}
     <p className="muted">Date and time use {profile.timeZone}.</p>
     {allowDraft ? <details><summary>About local drafts</summary>
       <p>Drafts stay in this browser and expire after {profile.draftExpiryHours / 24} days. Signing out clears your drafts.
