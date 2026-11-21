@@ -7,6 +7,8 @@ import { AuthorizationService } from './authorization';
 import { AppSchemaController, AppSchemaService } from './app-schema';
 import { FileController, FileService, maxAttachmentBytes } from './files';
 import { ApiTokenController, ApiTokenService } from './api-tokens';
+import { NotificationController, NotificationService } from './notifications';
+import { NotificationPlanner } from './notification-planner';
 import { CommentController, CommentService } from './comments';
 import { CsvController, CsvService } from './csv';
 import { RuntimeIndexController, RuntimeIndexService } from './runtime-indexes';
@@ -43,8 +45,8 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, WorkflowDefinitionController, WorkflowRuntimeController, TenantAdminController, FileController, CommentController, CsvController, ApiTokenController, RuntimeIndexController],
-  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, WorkflowDefinitionService, WorkflowRuntimeService, TenantAdminService, FileService, SearchService, CommentService, CsvService, ApiTokenService, RuntimeIndexService],
+  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, WorkflowDefinitionController, WorkflowRuntimeController, TenantAdminController, FileController, NotificationController, CommentController, CsvController, ApiTokenController, RuntimeIndexController],
+  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, WorkflowDefinitionService, WorkflowRuntimeService, TenantAdminService, FileService, SearchService, NotificationService, NotificationPlanner, CommentService, CsvService, ApiTokenService, RuntimeIndexService],
 })
 class AppModule {}
 

@@ -3,6 +3,7 @@ import { apiTokenActions, fieldTypes, indexPurposes, textSearchModes } from '@su
 import { z } from 'zod';
 import { appHttp } from './app-schema';
 import { authHttp } from './identity';
+import { notificationHttp } from './notifications';
 import { commentHttp } from './comments';
 import { csvHttp } from './csv';
 import { fileHttp } from './files';
@@ -209,6 +210,16 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/draft/acl']: { get: { reply: acl }, put: { body: appHttp.aclInput, reply: acl } },
   [applications + '/permissions/preview']: { post: { body: appHttp.previewInput, reply: preview,
     description: 'Evaluate a published record, a bounded set of matching records, or application permissions. Preview calls are audited.' } },
+  [applications + '/notification-rules']: {
+    get: { reply: z.object({ published: z.array(notificationHttp.ruleInput), draft: z.array(notificationHttp.ruleInput).nullable(),
+      actions: z.array(choice), states: z.array(z.object({ code: text, name: text })), directory: selectors }) },
+    put: { body: notificationHttp.rulesInput, reply: notificationHttp.rulesInput },
+  },
+  '/notifications': { get: { query: notificationHttp.centerFilter, reply: notificationHttp.centerReply } },
+  '/notifications/unread': { get: { query: notificationHttp.appFilter, reply: z.object({ count: recordNo }) } },
+  '/notifications/read-all': { post: { query: notificationHttp.appFilter, reply: result('read') } },
+  '/notifications/{id}/read': { post: { reply: result('read') } },
+  '/notifications/{id}/open': { post: { reply: z.object({ appId: id, recordId: id }) } },
   [applications + '/workflow/directory']: { get: { reply: selectors } },
   [applications + '/workflow']: { get: { reply: workflowHttp.settings } },
   [applications + '/workflow/versions/{version}']: { get: { reply: workflowHttp.definition } },

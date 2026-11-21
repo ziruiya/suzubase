@@ -1,7 +1,7 @@
 import { and, eq, fileReferences, memberGroups, organizations, records, tenantMembers,
   type TenantContext, type TenantTransaction } from '@suzubase/db';
-import { fieldContract, isRecordInput, multiOptionFieldTypes, optionFieldTypes, type AclConfiguration,
-  type FieldDefinition, type FormLayout, type RecordData, type ViewCondition, type ViewConfiguration } from '@suzubase/shared-types';
+import { fieldContract, isRecordInput, multiOptionFieldTypes, notificationPlaceholders, optionFieldTypes, type AclConfiguration,
+  type NotificationRule, type FieldDefinition, type FormLayout, type RecordData, type ViewCondition, type ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { normalizeValue } from './field-values';
 import { calculateFields, formulaProblems } from './formula';
@@ -27,7 +27,7 @@ export function isDestructive(current: FieldDefinition[], next: FieldDefinition[
 }
 
 export function referencesPreflight(published: FieldDefinition[], draft: FieldDefinition[], views: ViewConfiguration,
-  acl: AclConfiguration, titleFieldId: string | null) {
+  acl: AclConfiguration, titleFieldId: string | null, notificationRules: NotificationRule[] = []) {
   const old = new Map(published.map((field) => [field.fieldId, field]));
   const next = new Map(draft.map((field) => [field.fieldId, field]));
   const changed = (id: string) => !next.has(id) || (old.has(id) && old.get(id)!.type !== next.get(id)!.type);
@@ -61,6 +61,19 @@ export function referencesPreflight(published: FieldDefinition[], draft: FieldDe
     if (rule.subject.kind.endsWith('-field') && changed(rule.subject.id)) add(rule.subject.id, 'record-acl-subject', rule.id);
     for (const condition of rule.conditions) {
       if (invalidCondition(condition)) add(condition.fieldId, 'record-acl-condition', rule.id);
+    }
+  }
+  for (const rule of notificationRules) {
+    for (const condition of rule.conditions) {
+      if (invalidCondition(condition)) add(condition.fieldId, 'notification-condition', rule.id);
+    }
+    for (const recipient of rule.recipients) {
+      if (recipient.kind === 'user-field' && (changed(recipient.id) || next.get(recipient.id)?.type !== 'user')) {
+        add(recipient.id, 'notification-recipient', rule.id);
+      }
+    }
+    for (const [, fieldId] of (rule.title + '\n' + rule.body).matchAll(notificationPlaceholders)) {
+      if (changed(fieldId.toLowerCase())) add(fieldId.toLowerCase(), 'notification-template', rule.id);
     }
   }
   if (titleFieldId && changed(titleFieldId)) add(titleFieldId, 'title', 'App title');

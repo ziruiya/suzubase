@@ -14,6 +14,7 @@ import { assignAutoNumber, numberScope } from './auto-number';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService, formulaReferences, RecordAccess } from './authorization';
 import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
+import { NotificationPlanner } from './notification-planner';
 import { RecordQueryService } from './record-query';
 import { fieldChanges, serializeRecord, writeRecordEvent } from './record-events';
 import { FileService, fileIds } from './files';
@@ -70,6 +71,7 @@ export class RecordService {
     private readonly authorization: AuthorizationService,
     private readonly query: RecordQueryService,
     private readonly files: FileService,
+    private readonly notifications: NotificationPlanner,
   ) {}
 
   private async normalizeData(
@@ -217,6 +219,8 @@ export class RecordService {
     await projectSearchValues(tx, context, record, fields);
     const eventId = await writeRecordEvent(tx, context, record, 'created', [...fieldChanges({}, data), ...tables.changes], source);
     if (initial) await attachInitialWorkflow(tx, context.tenantId, record, initial, eventId);
+    await this.notifications.recordEvent(tx, context, record, eventId, { source, trigger: 'created', schemaVersion,
+      stateCode: initial?.state.code });
     if (key !== undefined) {
       await tx.insert(recordCreateKeys).values({
         ...identity, userId: context.userId, key, recordId: record.id,
@@ -301,7 +305,7 @@ export class RecordService {
 
   async update(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof updateInput> | SingleFieldUpdate | { revision: number; lookupFieldId: string; confirmation: string }) {
     return withTenantTransaction(context, async (tx) => {
-      const { access, fields } = await this.appSchema.writable(tx, context, appId, 'edit');
+      const { app, access, fields } = await this.appSchema.writable(tx, context, appId, 'edit');
       const current = await this.findRecord(tx, context, appId, recordId, 'edit', false, true);
       if (current.revision !== input.revision) this.rejectRevision(this.visibleRecord(access, current));
       const definitions = await this.appSchema.getFields(tx, context, appId, current.schemaVersion);
@@ -354,7 +358,11 @@ export class RecordService {
       await this.reserveUniqueValues(tx, context, updated);
       await this.reconcileFiles(tx, context, updated);
       await projectSearchValues(tx, context, updated, definitions);
-      await writeRecordEvent(tx, context, updated, refresh ? 'lookup-refetched' : 'updated', [...fieldChanges(current.data, data), ...tables.changes]);
+      const eventId = await writeRecordEvent(tx, context, updated, refresh ? 'lookup-refetched' : 'updated',
+        [...fieldChanges(current.data, data), ...tables.changes]);
+      await this.notifications.recordEvent(tx, context, updated, eventId, {
+        source: 'api', trigger: 'updated', schemaVersion: app.publishedSchemaVersion,
+      });
       return this.findRecord(tx, context, appId, recordId);
     });
   }

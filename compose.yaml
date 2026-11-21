@@ -56,6 +56,11 @@ services:
       INDEX_DATABASE_URL: postgres://suzubase_migration:suzubase-migration-dev@postgres:5432/suzubase
       ATTACHMENT_RETENTION_HOURS: ${ATTACHMENT_RETENTION_HOURS:-720}
       ATTACHMENT_TEMPORARY_EXPIRY_HOURS: ${ATTACHMENT_TEMPORARY_EXPIRY_HOURS:-24}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       MAINTENANCE_INTERVAL_SECONDS: ${MAINTENANCE_INTERVAL_SECONDS:-60}
     volumes:
       - attachment-data:/workspace/attachments

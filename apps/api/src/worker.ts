@@ -1,6 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { maintenanceTenants, withIndexDdl } from '@suzubase/db';
 import { runIndexJob } from './runtime-index-worker';
+import { deliverNotificationEmail, deliverNotifications, smtpSender } from './notification-worker';
 import { cleanupFiles } from './file-maintenance';
 
 function configuredInteger(name: string, fallback: number) {
@@ -15,6 +16,10 @@ async function main() {
     deletedHours: configuredInteger('ATTACHMENT_RETENTION_HOURS', 720),
     temporaryHours: configuredInteger('ATTACHMENT_TEMPORARY_EXPIRY_HOURS', 24),
   };
+  let send: ReturnType<typeof smtpSender>;
+  try { send = smtpSender(); } catch (error) {
+    console.error('SMTP configuration rejected', error instanceof Error ? error.message : String(error));
+  }
   const once = process.argv.includes('--once');
   let stopping = false;
   const stop = new AbortController();
@@ -27,6 +32,18 @@ async function main() {
       const tenants = await maintenanceTenants();
       for (const context of tenants) {
         if (stopping) break;
+        try {
+          const notifications = await deliverNotifications(context, Boolean(send));
+          if (notifications.inserted) console.info('Notification delivery', { tenantId: context.tenantId, ...notifications });
+          if (send) {
+            for (let i = 0; i < 20 && !stopping; i++) {
+              if (!await deliverNotificationEmail(context, send)) break;
+            }
+          }
+        } catch (error) {
+          console.error('Notification worker failed', { tenantId: context.tenantId, error });
+          if (once) process.exitCode = 1;
+        }
         try {
           const result = await cleanupFiles(context, retention);
           if (result.expiredTemporary || result.purgedDeleted || result.failed) {

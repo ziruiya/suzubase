@@ -4,6 +4,7 @@ import { LookupSettings } from './lookup';
 import { RelatedSettings } from './related';
 import { TableSettings, tableSettings } from './table-settings';
 import { PermissionsSettings } from './permissions-settings';
+import { NotificationSettings } from './notification-settings';
 import { WorkflowSettings } from './workflow-settings';
 import { ViewSettings } from './view-settings';
 import { IndexSettings } from './index-settings';
@@ -143,7 +144,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
     {active === 'Views' && <ViewSettings workflowStates={app.workflowStates} configuration={draft ?? app} fields={definitions} path={path}
       session={session} refresh={refreshDraft} />}
     {active === 'Workflow' && <WorkflowSettings app={app} token={token} fields={definitions} />}
-    {active === 'Notifications' && <p>Notifications are not yet enabled.</p>}
+    {active === 'Notifications' && <NotificationSettings appId={app.id} token={token} fields={definitions} onSaved={refreshDraft} />}
     {active === 'Permissions' && <PermissionsSettings app={app} fields={definitions} session={session} refresh={refreshDraft} />}
     {active === 'General' && <form className="stack" onSubmit={(event) => {
       event.preventDefault(); const data = new FormData(event.currentTarget);
@@ -163,7 +164,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
     </form>}
     {active === 'Indexes' && <IndexSettings app={app} session={session} />}
     {active === 'Import / export' && <CsvSettings app={app} session={session} />}
-    {(active === 'Form' || active === 'Views' || active === 'Permissions') && draft?.version && <div className="inline">
+    {(active === 'Form' || active === 'Views' || active === 'Permissions' || active === 'Notifications') && draft?.version && <div className="inline">
       <button className="primary" disabled={busy} onClick={() => void run(async () => {
         setPreflight(undefined);
         try {

@@ -1,4 +1,4 @@
-import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type LookupConfiguration, type RelatedConfiguration, type TableConfiguration, type WorkflowCondition, type AssigneeSource, type ViewCondition } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type LookupConfiguration, type RelatedConfiguration, type TableConfiguration, type NotificationRule, type NotificationDelivery, type WorkflowCondition, type AssigneeSource, type ViewCondition } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey, uniqueIndex,
@@ -116,6 +116,7 @@ export const appVersions = pgTable('app_versions', {
   aclConfiguration: jsonb('acl_configuration').$type<AclConfiguration>().notNull().default(sql`'{"app":[],"record":[],"field":[]}'::jsonb`),
   fieldEdits: jsonb('field_edits').$type<Record<string, FieldDefinition | null>>().notNull().default(sql`'{}'::jsonb`),
   formLayout: jsonb('form_layout').$type<FormLayout>().notNull().default(sql`'[]'::jsonb`),
+  notificationRules: jsonb('notification_rules').$type<NotificationRule[]>().notNull().default(sql`'[]'::jsonb`),
   migrationReport: jsonb('migration_report').$type<unknown>(),
   viewConfiguration: jsonb('view_configuration').$type<ViewConfiguration>().notNull().default(sql`'{"views":[],"defaultId":null}'::jsonb`),
 }, (t) => [
@@ -461,6 +462,7 @@ export const outbox = pgTable('outbox', {
   eventId: uuid('event_id').notNull(),
   topic: text().notNull(),
   createdAt: time('created_at').notNull().defaultNow(),
+  notifications: jsonb().$type<NotificationDelivery[]>().notNull().default(sql`'[]'::jsonb`),
   processedAt: time('processed_at'),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.eventId] }),
@@ -468,6 +470,43 @@ export const outbox = pgTable('outbox', {
     columns: [t.tenantId, t.appId, t.eventId],
     foreignColumns: [recordEvents.tenantId, recordEvents.appId, recordEvents.eventId],
   }),
+]);
+
+export const notifications = pgTable('notifications', {
+  tenantId: tenantId(),
+  id: uuid().notNull().defaultRandom(),
+  appId: uuid('app_id').notNull(),
+  recordId: uuid('record_id').notNull(),
+  eventId: uuid('event_id').notNull(),
+  userId: uuid('user_id').notNull(),
+  ruleKey: text('rule_key').notNull(),
+  title: text().notNull(),
+  body: text().notNull(),
+  createdAt: time('created_at').notNull().defaultNow(),
+  readAt: time('read_at'),
+  emailState: text('email_state').$type<'pending' | 'sent' | 'skipped' | 'failed'>().notNull(),
+  emailAttempts: integer('email_attempts').notNull().default(0),
+  emailNextAt: time('email_next_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.id] }),
+  unique().on(t.tenantId, t.appId, t.eventId, t.userId, t.ruleKey),
+  foreignKey({
+    name: 'notification_outbox_fk',
+    columns: [t.tenantId, t.appId, t.eventId],
+    foreignColumns: [outbox.tenantId, outbox.appId, outbox.eventId],
+  }),
+  foreignKey({
+    name: 'notification_record_fk',
+    columns: [t.tenantId, t.appId, t.recordId],
+    foreignColumns: [records.tenantId, records.appId, records.id],
+  }),
+  foreignKey({
+    name: 'notification_user_fk',
+    columns: [t.tenantId, t.userId],
+    foreignColumns: [tenantMembers.tenantId, tenantMembers.userId],
+  }),
+  index('notifications_center_idx').on(t.tenantId, t.userId, t.createdAt.desc(), t.id.desc()),
+  index('notifications_email_idx').on(t.tenantId, t.emailNextAt).where(sql`${t.emailState} = 'pending'`),
 ]);
 
 export const recordCreateKeys = pgTable('record_create_keys', {

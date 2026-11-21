@@ -11,6 +11,7 @@ import { z } from 'zod';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService, type RecordAccess } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
+import { NotificationPlanner } from './notification-planner';
 import { serializeRecord, writeRecordEvent } from './record-events';
 import { assignmentScope, resolveAssignees, setAssignees, workStateScope } from './workflow-data';
 import { identifier, parseInput } from './validation';
@@ -68,7 +69,8 @@ function workCondition(authorization: AuthorizationService, access: RecordAccess
 
 @Injectable()
 export class WorkflowRuntimeService {
-  constructor(private readonly schema: AppSchemaService, private readonly authorization: AuthorizationService) {}
+  constructor(private readonly schema: AppSchemaService, private readonly authorization: AuthorizationService,
+    private readonly notifications: NotificationPlanner) {}
 
   private async load(tx: TenantTransaction, context: TenantContext, appId: string, recordId: string, lock = false) {
     const { app, access } = await this.schema.access(tx, context, appId, 'view', lock);
@@ -222,10 +224,15 @@ export class WorkflowRuntimeService {
     if (!updated) throw new ConflictException('Workflow state changed. Refresh the record.');
     await tx.update(recordWorkflowState).set({ stateId: target.id, revision: updated.revision }).where(workStateScope(scope));
     await setAssignees(tx, scope, ids, kind);
-    const eventId = await writeRecordEvent(tx, context, serializeRecord(updated), kind, []);
+    const record = serializeRecord(updated);
+    const eventId = await writeRecordEvent(tx, context, record, kind, []);
     await tx.insert(workflowEvents).values({
       tenantId: scope.tenantId, appId: scope.appId, eventId, workflowId: workflow!.workflowId,
       actionId, reason, fromStateId: workflow!.stateId, toStateId: target.id, assigneeIds: ids,
+    });
+    if (kind === 'workflow-action') await this.notifications.recordEvent(tx, context, record, eventId, {
+      source: 'api', trigger: 'workflow-action', schemaVersion: loaded.app.publishedSchemaVersion,
+      workflowActionId: actionId, stateCode: target.code,
     });
     return { eventId, revision: updated.revision, version: workflow!.workflowVersion, state: target, assigneeIds: ids };
   }

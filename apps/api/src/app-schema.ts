@@ -408,18 +408,18 @@ export class AppSchemaService {
     return Object.fromEntries(definitions);
   }
 
-  private async getVersion(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
+  async getVersion(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
     const [snapshot] = await tx.select().from(appVersions).where(this.versionScope(context, appId, version));
     if (!snapshot) throw new NotFoundException();
     return snapshot;
   }
 
-  private async beginDraft(tx: TenantTransaction, context: TenantContext, app: typeof apps.$inferSelect) {
+  async beginDraft(tx: TenantTransaction, context: TenantContext, app: typeof apps.$inferSelect) {
     const appId = app.id;
     const version = app.draftSchemaVersion ?? app.publishedSchemaVersion + 1;
     if (app.draftSchemaVersion === null) {
-      const { aclConfiguration, viewConfiguration, fieldEdits, formLayout } = await this.getVersion(tx, context, appId, app.publishedSchemaVersion);
-      await tx.insert(appVersions).values({ tenantId: context.tenantId, appId, version, aclConfiguration, viewConfiguration, fieldEdits, formLayout });
+      const { aclConfiguration, viewConfiguration, fieldEdits, formLayout, notificationRules } = await this.getVersion(tx, context, appId, app.publishedSchemaVersion);
+      await tx.insert(appVersions).values({ tenantId: context.tenantId, appId, version, aclConfiguration, viewConfiguration, fieldEdits, formLayout, notificationRules });
     }
     await tx.update(apps).set({ draftSchemaVersion: version, draftStatus: 'editing' })
       .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
@@ -582,19 +582,20 @@ export class AppSchemaService {
       const previous = await this.getVersion(tx, context, appId, app.publishedSchemaVersion - 1);
       const current = await this.getVersion(tx, context, appId, app.publishedSchemaVersion);
       if (JSON.stringify(previous.formLayout) === JSON.stringify(current.formLayout) &&
-          JSON.stringify(previous.viewConfiguration) === JSON.stringify(current.viewConfiguration)) {
-        throw new ConflictException('There are no previous layout or view changes to restore');
+          JSON.stringify(previous.viewConfiguration) === JSON.stringify(current.viewConfiguration) &&
+          JSON.stringify(previous.notificationRules) === JSON.stringify(current.notificationRules)) {
+        throw new ConflictException('There are no previous layout, view or notification changes to restore');
       }
       const fields = await this.getFields(tx, context, appId, current.version);
       const earlierFields = await this.getFields(tx, context, appId, previous.version);
-      const problems = referencesPreflight(earlierFields, fields, previous.viewConfiguration, current.aclConfiguration, app.titleFieldId);
+      const problems = referencesPreflight(earlierFields, fields, previous.viewConfiguration, current.aclConfiguration, app.titleFieldId, previous.notificationRules);
       if (problems.length || !validLayout(previous.formLayout, fields)) {
         throw new ConflictException({ message: 'Previous display configuration is incompatible', problems });
       }
       const version = current.version + 1;
       await tx.insert(appVersions).values({
         tenantId: context.tenantId, appId, version, fieldEdits: current.fieldEdits, aclConfiguration: current.aclConfiguration,
-        formLayout: previous.formLayout, viewConfiguration: previous.viewConfiguration,
+        formLayout: previous.formLayout, viewConfiguration: previous.viewConfiguration, notificationRules: previous.notificationRules,
       });
       const [published] = await tx.update(apps).set({ publishedSchemaVersion: version }).where(and(
         eq(apps.tenantId, context.tenantId), eq(apps.id, appId),
@@ -613,7 +614,7 @@ export class AppSchemaService {
       const draft = await this.getVersion(tx, context, appId, version);
       const currentFields = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
       const draftFields = await this.getFields(tx, context, appId, version);
-      const dependencyProblems = referencesPreflight(currentFields, draftFields, draft.viewConfiguration, draft.aclConfiguration, app.titleFieldId);
+      const dependencyProblems = referencesPreflight(currentFields, draftFields, draft.viewConfiguration, draft.aclConfiguration, app.titleFieldId, draft.notificationRules);
       if (!validLayout(draft.formLayout, draftFields)) {
         dependencyProblems.push({ fieldId: '', dependency: 'layout', reason: 'Update invalid layout references' });
       }
@@ -641,8 +642,8 @@ export class AppSchemaService {
       };
       const disclosedIssues = await disclose(issues);
       const disclosedRepairs = await disclose(repaired);
-      const changes = JSON.stringify([draftFields, draft.formLayout, draft.viewConfiguration, draft.aclConfiguration]) !==
-        JSON.stringify([currentFields, previous.formLayout, previous.viewConfiguration, previous.aclConfiguration]);
+      const changes = JSON.stringify([draftFields, draft.formLayout, draft.viewConfiguration, draft.aclConfiguration, draft.notificationRules]) !==
+        JSON.stringify([currentFields, previous.formLayout, previous.viewConfiguration, previous.aclConfiguration, previous.notificationRules]);
       const scope = and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId));
       const needsMigration = destructive && plan.length > 0 && !migration;
       if (version !== app.publishedSchemaVersion + 1 || !changes || issues.length || dependencyProblems.length || needsMigration) {

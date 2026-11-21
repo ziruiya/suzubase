@@ -33,3 +33,4 @@ export * from './views';
 export * from './acl';
 
 export * from './workflow';
+export * from './notifications';

@@ -9,6 +9,7 @@ import { useSelectorOptions } from './selector-options';
 import { RecycleBin } from './recycle-bin';
 import { Settings } from './settings';
 import { Directory } from './directory';
+import { NotificationCenter, useUnread } from './notification-center';
 import { Comments } from './comments';
 import { Tasks, WorkflowDetail } from './workflow-runtime';
 import { AccountSecurity } from './account-security';
@@ -123,7 +124,7 @@ function Portal({ session, navigate, narrow }: { session: Session; navigate: (id
   </div>;
 }
 
-function Records({ appId, initialRecord, session, narrow, leave }: { appId: string; initialRecord?: string; session: Session; narrow: boolean; leave: () => void }) {
+function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }: { appId: string; initialRecord?: string; refreshUnread: () => void; session: Session; narrow: boolean; leave: () => void }) {
   const [app, setApp] = useState<App>();
   const selectors = useSelectorOptions(app, session);
   const [view, setView] = useState<string>();
@@ -134,7 +135,7 @@ function Records({ appId, initialRecord, session, narrow, leave }: { appId: stri
   const [form, setForm] = useState<RecordForm>();
   const [history, setHistory] = useState<History>();
   const [archive, setArchive] = useState<Archive>();
-  const [screen, setScreen] = useState<'list' | 'detail' | 'edit' | 'new' | 'settings' | 'recycle' | 'tasks' | 'unassigned'>('list');
+  const [screen, setScreen] = useState<'list' | 'detail' | 'edit' | 'new' | 'settings' | 'recycle' | 'tasks' | 'unassigned' | 'notifications'>('list');
   const [search, setSearch] = useState<Search>();
   const [searchField, setSearchField] = useState('');
   const [feedback, setFeedback] = useState('');
@@ -215,6 +216,8 @@ function Records({ appId, initialRecord, session, narrow, leave }: { appId: stri
       {screen !== 'list' && <button onClick={back}>{app.name}</button>}</nav>
     {feedback && <p className="banner" role="status">{feedback}</p>}
     {error && <p role="alert" className="error">{error}</p>}
+    {screen === 'notifications' && <NotificationCenter session={session} appId={appId}
+      onOpen={(_, recordId) => void open(recordId)} onRead={refreshUnread} />}
     {(screen === 'tasks' || screen === 'unassigned') && <Tasks token={token} appId={app.id} unassigned={screen === 'unassigned'}
       open={(_, recordId) => void open(recordId)} />}
     {screen === 'recycle' && <RecycleBin path={root} session={session} back={back} />}
@@ -280,6 +283,7 @@ function Records({ appId, initialRecord, session, narrow, leave }: { appId: stri
       </section>}
     </section>}
     {screen === 'list' && <>
+      <button type="button" onClick={() => setScreen('notifications')}>App notifications</button>
       {app.workflowStates.length > 0 && <div className="inline">
         <button type="button" onClick={() => setScreen('tasks')}>My tasks</button>
         {app.can.manage && <button type="button" onClick={() => setScreen('unassigned')}>Records without active assignees</button>}
@@ -357,33 +361,42 @@ function Records({ appId, initialRecord, session, narrow, leave }: { appId: stri
 
 function Root() {
   const [session, setSession] = useState<Session>();
+  const [notificationOpen, setNotificationOpen] = useState(false);
   const [current, setCurrent] = useState<{ appId: string; recordId?: string }>();
   const [security, setSecurity] = useState(false);
   const [directory, setDirectory] = useState(false);
   const [notice, setNotice] = useState('');
   const narrow = useNarrow();
+  const unread = useUnread(session?.token);
   async function logout() {
     if (!session) return;
     session.draftAllowed.current = false;
     const { tenantId, userId } = session.profile;
-    setSession(undefined); setCurrent(undefined); setSecurity(false); setDirectory(false);
+    setSession(undefined); setNotificationOpen(false); setCurrent(undefined); setSecurity(false); setDirectory(false);
     await removeDrafts((draft) => draft.scope[0] === tenantId && draft.scope[1] === userId).catch(() => undefined);
   }
   return session ? <>
     <header className="top"><div className="top-inner inline spread">
-      <button className="brand" onClick={() => { setCurrent(undefined); setSecurity(false); setDirectory(false); }}><span aria-hidden="true">S</span> SuzuBase</button>
+      <button className="brand" onClick={() => { setCurrent(undefined); setNotificationOpen(false); setSecurity(false); setDirectory(false); }}><span aria-hidden="true">S</span> SuzuBase</button>
       <div className="inline account"><span>{session.profile.displayName ?? session.profile.email}</span>
+        <button type="button" aria-label={'Notifications, ' + unread.count + ' unread'} aria-expanded={notificationOpen}
+          onClick={() => { setNotificationOpen(!notificationOpen); setSecurity(false); setDirectory(false); }}>
+          <span aria-hidden="true">🔔</span> {unread.count}
+        </button>
         {session.profile.isAdmin && <>
-          <button onClick={() => { setDirectory(true); setSecurity(false); }}>Directory</button>
-          <button onClick={() => { setSecurity(true); setDirectory(false); }}>Account security</button>
+          <button onClick={() => { setDirectory(true); setSecurity(false); setNotificationOpen(false); }}>Directory</button>
+          <button onClick={() => { setSecurity(true); setDirectory(false); setNotificationOpen(false); }}>Account security</button>
         </>}
         <button onClick={() => { setNotice(''); void logout(); }}>Sign out</button></div>
     </div></header>
     <main className="workspace">
-      {directory ? <Directory session={session} back={() => setDirectory(false)} /> : security ? <AccountSecurity token={session.token} close={() => setSecurity(false)} signInAgain={() => {
+      {notificationOpen ? <NotificationCenter session={session} onRead={unread.reload} onOpen={(appId, recordId) => {
+        setCurrent({ appId, recordId });
+        setNotificationOpen(false);
+      }} /> : directory ? <Directory session={session} back={() => setDirectory(false)} /> : security ? <AccountSecurity token={session.token} close={() => setSecurity(false)} signInAgain={() => {
         setNotice('Two-factor settings changed. Sign in again to continue.');
         void logout();
-      }} /> : current ? <Records key={current.appId + (current.recordId ?? '')} appId={current.appId} initialRecord={current.recordId} session={session} narrow={narrow} leave={() => setCurrent(undefined)} />
+      }} /> : current ? <Records key={current.appId + (current.recordId ?? '')} appId={current.appId} initialRecord={current.recordId} refreshUnread={unread.reload} session={session} narrow={narrow} leave={() => setCurrent(undefined)} />
         : <Portal session={session} narrow={narrow} navigate={(appId, recordId) => setCurrent({ appId, recordId })} />}
     </main>
   </> : <Login notice={notice} onLogin={(value) => { setSession(value); setNotice(''); }} />;

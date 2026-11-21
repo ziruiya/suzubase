@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
+import { NotificationPlanner } from './notification-planner';
 import { serializeRecord, writeRecordEvent } from './record-events';
 import { identifier, parseInput } from './validation';
 
@@ -38,7 +39,8 @@ const name = sql<string>`COALESCE(${users.displayName}, ${users.loginName}, ${us
 
 @Injectable()
 export class CommentService {
-  constructor(private readonly schema: AppSchemaService, private readonly auth: AuthorizationService) {}
+  constructor(private readonly schema: AppSchemaService, private readonly auth: AuthorizationService,
+    private readonly notifications: NotificationPlanner) {}
 
   private async access(tx: TenantTransaction, context: TenantContext, appId: string, recordId: string, write = false) {
     const { app, access } = await this.schema.access(tx, context, appId, 'view', write);
@@ -50,7 +52,7 @@ export class CommentService {
     if (!app.commentsEnabled || write && app.archivedAt) throw new ForbiddenException('Comments are unavailable for this application');
     const [role] = await tx.select({ manage: sql<boolean>`COALESCE(${this.auth.appManagementScope(context)}, false)` })
       .from(apps).where(and(eq(apps.tenantId, scope.tenantId), eq(apps.id, appId)));
-    return { scope, where, manage: role.manage, archived: Boolean(app.archivedAt) };
+    return { scope, where, schemaVersion: app.publishedSchemaVersion, manage: role.manage, archived: Boolean(app.archivedAt) };
   }
 
   list(context: TenantContext, appId: string, recordId: string, after?: string) {
@@ -105,7 +107,7 @@ export class CommentService {
 
   create(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof createInput>) {
     return withTenantTransaction(context, async (tx) => {
-      const { scope, where } = await this.access(tx, context, appId, recordId, true);
+      const { scope, where, schemaVersion } = await this.access(tx, context, appId, recordId, true);
       const ids = [...new Set(input.parts.flatMap((part) => part.kind === 'mention' ? [part.userId] : []))];
       const candidates = ids.length ? await tx.select({ id: users.id, name }).from(users)
         .innerJoin(tenantMembers, and(eq(tenantMembers.tenantId, users.tenantId), eq(tenantMembers.userId, users.id)))
@@ -123,8 +125,11 @@ export class CommentService {
       if (body.length > 4000) throw new BadRequestException('Comments can contain up to 4,000 characters');
       const [comment] = await tx.insert(recordComments).values({ ...scope, body, authorId: context.userId }).returning();
       if (mentions.length) await tx.insert(commentMentions).values(mentions.map((mention) => ({ ...mention, commentId: comment.id })));
-      const event = await this.writeEvent(tx, context, where, 'comment-created', comment.id);
-      return { id: comment.id, createdAt: comment.createdAt, ...event };
+      const { eventId, record } = await this.writeEvent(tx, context, where, 'comment-created', comment.id);
+      await this.notifications.recordEvent(tx, context, record, eventId, {
+        source: 'api', trigger: 'comment-created', schemaVersion, mentions: ids, commentAuthor: context.userId,
+      });
+      return { id: comment.id, createdAt: comment.createdAt, eventId, revision: record.revision };
     });
   }
 
@@ -136,7 +141,8 @@ export class CommentService {
         manage ? undefined : eq(recordComments.authorId, context.userId),
       )).returning({ id: recordComments.id });
       if (!comment) throw new NotFoundException('无权限');
-      return { deleted: true as const, ...await this.writeEvent(tx, context, where, 'comment-deleted', commentId) };
+      const { eventId, record } = await this.writeEvent(tx, context, where, 'comment-deleted', commentId);
+      return { deleted: true as const, eventId, revision: record.revision };
     });
   }
 
@@ -146,8 +152,9 @@ export class CommentService {
     const [updated] = await tx.update(records).set({ revision: sql`${records.revision} + 1`,
       updatedBy: context.userId, updatedAt: sql`clock_timestamp()` }).where(where).returning();
     if (!updated) throw new NotFoundException('无权限');
-    const eventId = await writeRecordEvent(tx, context, serializeRecord(updated), kind, [], 'api', { type: 'comment', id: commentId });
-    return { eventId, revision: updated.revision };
+    const record = serializeRecord(updated);
+    const eventId = await writeRecordEvent(tx, context, record, kind, [], 'api', { type: 'comment', id: commentId });
+    return { eventId, record };
   }
 }
 

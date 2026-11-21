@@ -211,6 +211,13 @@
       "when": 1795283077952,
       "tag": "0029_gate2_comments",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1795283286723,
+      "tag": "0030_gate2_notifications",
+      "breakpoints": true
     }
   ]
 }
