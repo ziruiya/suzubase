@@ -35,6 +35,7 @@ export function normalizeValue(type: FieldType, value: string, options: FieldOpt
   }
   if (optionFieldTypes.has(type)) return active.has(value) ? value : undefined;
   switch (type) {
+    case 'autoNumber': return /^[A-Za-z0-9_-]{1,64}$/.test(value) ? value : undefined;
     case 'date': return localDate.safeParse(value).success ? value : undefined;
     case 'time': {
       const seconds = value.length === 5 ? value + ':00' : value;

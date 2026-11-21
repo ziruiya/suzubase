@@ -9,6 +9,7 @@ import {
 } from '@suzubase/db';
 import { FieldChange, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse } from '@suzubase/shared-types';
 import { z } from 'zod';
+import { assignAutoNumber, numberScope } from './auto-number';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService, RecordAccess } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
@@ -74,6 +75,10 @@ export class RecordService {
         continue;
       }
       let normalized: string | undefined;
+      if (field.type === 'autoNumber') {
+        errors.push({ field: fieldId, message: 'Automatic numbers cannot be edited' });
+        continue;
+      }
       if (field.type === 'attachment') {
         try {
           const parsed = fileIds.safeParse(JSON.parse(value || '[]'));
@@ -146,6 +151,13 @@ export class RecordService {
       }
 
       const data = await this.normalizeData(tx, context, appId, schemaVersion, input.data);
+      for (const field of await this.appSchema.getFields(tx, context, appId, schemaVersion)) {
+        const config = field.autoNumber;
+        if (!config?.enabled) continue;
+        const scope = numberScope(config, data);
+        const number = await assignAutoNumber(tx, context, appId, field.fieldId, config, scope);
+        if (number) data[field.fieldId] = number;
+      }
       const [counter] = await tx.update(appCounters).set({ lastValue: sql`${appCounters.lastValue} + 1` })
         .where(counterScope).returning({ recordNo: appCounters.lastValue });
       const [row] = await tx.insert(records).values({
@@ -210,8 +222,12 @@ export class RecordService {
       const current = await this.findRecord(tx, context, appId, recordId, 'edit', false, true);
       if (current.revision !== input.revision) this.rejectRevision(this.visibleRecord(access, current));
       this.assertEditable(access, input.data);
-      const retained = Object.fromEntries(Object.entries(current.data).filter(([id]) => !this.authorization.editable(access, id)));
+      const retained = Object.fromEntries(Object.entries(current.data).filter(([id]) =>
+        !this.authorization.editable(access, id) && access.types.get(id) !== 'autoNumber'));
       const data = await this.normalizeData(tx, context, appId, current.schemaVersion, { ...retained, ...input.data });
+      for (const [id, value] of Object.entries(current.data)) {
+        if (access.types.get(id) === 'autoNumber') data[id] = value;
+      }
       const [row] = await tx.update(records).set({
         data, revision: sql`${records.revision} + 1`, updatedBy: context.userId, updatedAt: sql`clock_timestamp()`,
       }).where(and(

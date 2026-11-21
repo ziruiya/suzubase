@@ -19,6 +19,7 @@ export const fieldContract = {
   url: { ...scalar, storage: 'HTTP or HTTPS URL' },
   phone: { ...scalar, storage: 'phone display string' },
   email: { ...scalar, storage: 'email display string' },
+  autoNumber: { ...scalar, unique: false, storage: 'fixed prefix plus scoped sequence digits' },
   attachment: { ...multiple, filter: false, storage: 'JSON array of file UUIDs', csv: 'attachment manifest' },
   user: { ...scalar, unique: false, storage: 'tenant user UUID' },
   organization: { ...scalar, unique: false, storage: 'tenant organization UUID' },
@@ -36,3 +37,13 @@ export interface FieldOption {
 
 export const optionFieldTypes: ReadonlySet<FieldType> = new Set(['radio', 'checkbox', 'select', 'multiselect']);
 export const multiOptionFieldTypes: ReadonlySet<FieldType> = new Set(['checkbox', 'multiselect']);
+
+export interface AutoNumberConfiguration {
+  prefix: string;
+  scopeFieldId: string | null;
+  nextValue: string;
+  padding: number;
+  enabled: boolean;
+}
+
+export const autoNumberHelp = '自動採番は同じ採番範囲で重複しません。欠番のない連番は保証しません。';

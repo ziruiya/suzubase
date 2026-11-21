@@ -7,7 +7,7 @@ import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, recordReferences, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { AclConfiguration, AppAction, fieldContract, fieldTypes, optionFieldTypes, SavedView, ViewConfiguration } from '@suzubase/shared-types';
+import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, optionFieldTypes, SavedView, ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AuthorizationService, RecordAccess } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
@@ -37,11 +37,20 @@ const settingsInput = z.strictObject({
 }).refine((settings) => Object.keys(settings).length > 0 &&
   [settings.description, settings.icon, settings.adminMemo].every((value) => !value || !/[\x00\p{Surrogate}]/u.test(value)));
 const option = z.strictObject({ value: z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,63}$/i), label: metadata.name, disabled: z.boolean().default(false) });
+const numbering = z.strictObject({
+  prefix: z.string().max(32).regex(/^[A-Za-z0-9_-]*$/),
+  scopeFieldId: identifier.nullable(),
+  nextValue: z.string().regex(/^[1-9][0-9]{0,17}$/),
+  padding: z.int().min(0).max(32),
+  enabled: z.boolean(),
+});
 const fieldInput = z.strictObject({
-  ...metadata, type: z.enum(fieldTypes), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
+  ...metadata, type: z.enum(fieldTypes), autoNumber: numbering.optional(), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
 }).refine(({ options, type }) => optionFieldTypes.has(type) === (options.length > 0)
   && new Set(options.map(({ value }) => value)).size === options.length, { path: ['options'] })
-  .refine(({ type, uniqueValue }) => !uniqueValue || fieldContract[type].unique, { path: ['uniqueValue'] });
+  .refine(({ type, uniqueValue }) => !uniqueValue || fieldContract[type].unique, { path: ['uniqueValue'] })
+  .refine(({ type, autoNumber, required }) => (type === 'autoNumber') === Boolean(autoNumber) &&
+    !(type === 'autoNumber' && required), { path: ['autoNumber'] });
 const metadataProperties = {
   code: { type: 'string', pattern: codePattern.source },
   name: { type: 'string', minLength: 1, maxLength: 120 },
@@ -150,11 +159,16 @@ export class AppSchemaService {
         await tx.insert(appVersions).values({ ...identity, version: 1 });
         await tx.insert(appCounters).values(identity);
         const definitions = await this.getFields(tx, context, appId, source.publishedSchemaVersion);
-        const fieldMapping = new Map<string, string>();
-        for (const { fieldId, code, name, type, required, uniqueValue, options } of definitions) {
-          const [field] = await tx.insert(fields).values({ ...identity, code, name, type, required, uniqueValue, options, introducedIn: 1 }).returning();
-          fieldMapping.set(fieldId, field.fieldId);
-          if (source.titleFieldId === fieldId) copy.titleFieldId = field.fieldId;
+        const fieldMapping = new Map(definitions.map(({ fieldId }) => [fieldId, randomUUID()]));
+        for (const { fieldId, code, name, type, required, uniqueValue, options, autoNumber } of definitions) {
+          const copiedId = fieldMapping.get(fieldId)!;
+          await tx.insert(fields).values({
+            ...identity, fieldId: copiedId, code, name, type, required, uniqueValue, options, introducedIn: 1,
+            autoNumber: autoNumber && {
+              ...autoNumber, scopeFieldId: autoNumber.scopeFieldId && fieldMapping.get(autoNumber.scopeFieldId)!,
+            },
+          });
+          if (source.titleFieldId === fieldId) copy.titleFieldId = copiedId;
         }
         if (copy.titleFieldId) await tx.update(apps).set({ titleFieldId: copy.titleFieldId })
           .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, copy.id)));
@@ -215,7 +229,7 @@ export class AppSchemaService {
   }
 
   getFields(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
-    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required, uniqueValue: fields.uniqueValue, options: fields.options })
+    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required, uniqueValue: fields.uniqueValue, autoNumber: fields.autoNumber, options: fields.options })
       .from(fields).where(and(
         eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), lte(fields.introducedIn, version),
       )).orderBy(fields.introducedIn, fields.code);
@@ -234,6 +248,13 @@ export class AppSchemaService {
         }
         await tx.update(apps).set({ draftSchemaVersion: version, draftStatus: 'editing' })
           .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
+        if (input.autoNumber?.scopeFieldId) {
+          const definitions = await this.getFields(tx, context, appId, version);
+          const scope = definitions.find(({ fieldId }) => fieldId === input.autoNumber!.scopeFieldId);
+          if (!scope || !fieldContract[scope.type].sort || scope.type === 'autoNumber') {
+            throw new BadRequestException('Automatic numbering requires a scalar scope field');
+          }
+        }
         const [field] = await tx.insert(fields).values({ ...identity, ...input, introducedIn: version }).returning();
         return field;
       });
@@ -248,7 +269,7 @@ export class AppSchemaService {
       const app = await this.managedApp(tx, context, appId);
       const version = app.draftSchemaVersion;
       return {
-        version, status: app.draftStatus,
+        version, status: app.draftStatus, autoNumberHelp,
         fields: version === null ? [] : await this.getFields(tx, context, appId, version),
         ...await this.getViews(tx, context, appId, version ?? app.publishedSchemaVersion),
       };

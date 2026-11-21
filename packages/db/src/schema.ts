@@ -1,4 +1,4 @@
-import { fieldTypes, type AclConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -120,6 +120,7 @@ export const fields = pgTable('fields', {
   type: fieldType().notNull(),
   required: boolean().notNull().default(false),
   uniqueValue: boolean('unique_value').notNull().default(false),
+  autoNumber: jsonb('auto_number').$type<AutoNumberConfiguration>(),
   options: jsonb().$type<FieldOption[]>().notNull().default(sql`'[]'::jsonb`),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.fieldId] }),
@@ -326,4 +327,29 @@ export const permissionAudit = pgTable('permission_audit', {
   foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
   foreignKey({ columns: [t.tenantId, t.actorId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
   foreignKey({ columns: [t.tenantId, t.targetUserId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
+export const autoNumberCounters = pgTable('auto_number_counters', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  fieldId: uuid('field_id').notNull(),
+  scope: text().notNull(),
+  nextValue: bigint('next_value', { mode: 'bigint' }).notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.fieldId, t.scope] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.fieldId], foreignColumns: [fields.tenantId, fields.appId, fields.fieldId] }),
+]);
+
+export const issuedAutoNumbers = pgTable('issued_auto_numbers', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  fieldId: uuid('field_id').notNull(),
+  scope: text().notNull(),
+  number: bigint({ mode: 'bigint' }).notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.fieldId, t.scope, t.number] }),
+  foreignKey({
+    columns: [t.tenantId, t.appId, t.fieldId, t.scope],
+    foreignColumns: [autoNumberCounters.tenantId, autoNumberCounters.appId, autoNumberCounters.fieldId, autoNumberCounters.scope],
+  }),
 ]);
