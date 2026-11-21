@@ -28,6 +28,7 @@ export const fieldContract = {
   group: { ...scalar, unique: false, storage: 'tenant group UUID' },
   richText: { ...displayOnly, storage: 'sanitized HTML fragment', csv: 'plain text' },
   calculation: { ...displayOnly, storage: 'computed decimal or string snapshot', csv: 'computed result, export only' },
+  lookup: { ...displayOnly, storage: 'typed snapshots in mapped fields plus record_references', csv: 'local key input, typed snapshots export only' },
   layout: { ...displayOnly, storage: 'schema only', csv: 'omitted' },
 } as const;
 
@@ -70,10 +71,22 @@ export interface LayoutElement {
 }
 
 export function isRecordInput(type: FieldType | undefined) {
-  return type !== undefined && type !== 'autoNumber' && type !== 'calculation' && type !== 'layout';
+  return type !== undefined && type !== 'autoNumber' && type !== 'calculation' && type !== 'layout' && type !== 'lookup';
+}
+
+export interface LookupConfiguration {
+  appId: string;
+  keyFieldId: string;
+  localKeyFieldId: string;
+  copies: { sourceFieldId: string; targetFieldId: string }[];
+}
+
+export function lookupTargets(fields: FieldDefinition[]) {
+  return new Set(fields.flatMap((field) => field.lookup?.copies.map(({ targetFieldId }) => targetFieldId) ?? []));
 }
 
 export interface FieldDefinition {
+  lookup?: LookupConfiguration | null;
   fieldId: string;
   code: string;
   name: string;

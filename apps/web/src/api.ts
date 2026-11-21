@@ -1,4 +1,4 @@
-import type { AutoNumberConfiguration, FieldOption, FieldType, FormLayout, Formula, LayoutElement, TextSearchMode, ViewConfiguration } from '@suzubase/shared-types';
+import type { AutoNumberConfiguration, FieldOption, FieldType, FormLayout, Formula, LayoutElement, LookupConfiguration, TextSearchMode, ViewConfiguration } from '@suzubase/shared-types';
 
 export interface Profile {
   tenantId: string;
@@ -36,6 +36,7 @@ export interface Field {
   autoNumber: AutoNumberConfiguration | null;
   searchMode: TextSearchMode | null;
   editable: boolean;
+  lookup?: LookupConfiguration | null;
 }
 
 export interface App extends AppSummary, ViewConfiguration {

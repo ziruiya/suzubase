@@ -1,10 +1,11 @@
-import { BadRequestException, Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import {
-  and, eq, isNull, records, sql, TenantContext, TenantTransaction, withTenantTransaction,
+  and, eq, isNull, records, recordUniqueValues, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { fieldContract, AppAction } from '@suzubase/shared-types';
+import { fieldContract, AppAction, LookupConfiguration } from '@suzubase/shared-types';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
+import { uniqueKey } from './schema-preflight';
 import { postgresErrorCode } from './validation';
 
 @Injectable()
@@ -31,6 +32,28 @@ export class RecordQueryService {
     );
     return { where, sort, sortValue, numericSort, descending, view, fields, data: this.authorization.projection(access), access };
   }
+  async lookupSource(tx: TenantTransaction, context: TenantContext, config: LookupConfiguration,
+    match: { key: string } | { recordId: string },
+  ) {
+    const { fields, access } = await this.schema.access(tx, context, config.appId, 'view');
+    const key = fields.find(({ fieldId }) => fieldId === config.keyFieldId);
+    const ids = [config.keyFieldId, ...config.copies.map(({ sourceFieldId }) => sourceFieldId)];
+    if (!key?.uniqueValue || ids.some((id) => !this.authorization.fieldDecision(access, id, 'view').allowed)) {
+      throw new NotFoundException('无权限');
+    }
+    const scope = and(eq(records.tenantId, context.tenantId), eq(records.appId, config.appId),
+      isNull(records.deletedAt), this.authorization.recordScope(access, 'view'));
+    const query = tx.select({ id: records.id, revision: records.revision, data: this.authorization.projection(access) }).from(records);
+    const [row] = 'recordId' in match
+      ? await query.where(and(scope, eq(records.id, match.recordId)))
+      : await query.innerJoin(recordUniqueValues, and(
+        eq(recordUniqueValues.tenantId, records.tenantId), eq(recordUniqueValues.appId, records.appId),
+        eq(recordUniqueValues.recordId, records.id), eq(recordUniqueValues.fieldId, config.keyFieldId),
+        eq(recordUniqueValues.normalizedValue, uniqueKey(match.key)),
+      )).where(scope);
+    return row;
+  }
+
   async aggregate(context: TenantContext, appId: string, viewId: string | undefined, fieldIds: string[]) {
     try {
       return await withTenantTransaction(context, async (tx) => {

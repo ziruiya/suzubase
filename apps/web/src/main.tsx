@@ -232,7 +232,8 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
             json('DELETE', { revision: form.record.revision })).then(() => { back(); setFeedback('Record moved to the recycle bin'); })
             .catch((error) => setError(message(error))); }}>Confirm move</button></div>
       </section>}
-      <RecordValues fields={form.fields} layout={form.formLayout} record={form.record} session={session} app={app} directory={selectors.options} />
+      <RecordValues fields={form.fields} layout={form.formLayout} record={form.record} session={session} app={app} directory={selectors.options}
+        onRefresh={!app.archivedAt && app.can.edit && form.can.edit ? (record) => void open(record.id) : undefined} />
       <div className="inline">
         <button onClick={() => void api<History>(root + '/' + form.record.id + '/history', token)
           .then(setHistory).catch((error) => setError(message(error)))}>Show history</button>
@@ -315,7 +316,8 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
             style={selectedView?.columns.length ? { flexBasis: selectedView.columns.find(({ fieldId }) => fieldId === field.fieldId)?.width } : undefined}>
             <dt>{field.name}</dt>
             <dd>{record.data[field.fieldId]
-              ? displayValue(field, record.data[field.fieldId], session.profile.timeZone, selectors.options) : '—'}</dd>
+              ? displayValue(field, record.data[field.fieldId], session.profile.timeZone, selectors.options)
+              : field.lookup ? record.data[field.lookup.localKeyFieldId] ?? '—' : '—'}</dd>
           </div>)}</dl>
         </article>)}</section> : !busy && <section className="panel stack">
           <h2>No records found</h2>

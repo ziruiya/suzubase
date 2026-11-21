@@ -5,7 +5,7 @@ export async function writeRecordEvent(
   tx: TenantTransaction,
   context: TenantContext,
   record: RecordResponse,
-  kind: 'created' | 'updated' | 'deleted' | 'restored' | 'schema-migrated',
+  kind: 'created' | 'updated' | 'lookup-refetched' | 'deleted' | 'restored' | 'schema-migrated',
   changes: FieldChange[],
   source: 'api' | 'import' | 'migration' = 'api',
 ): Promise<void> {

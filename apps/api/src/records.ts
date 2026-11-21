@@ -1,13 +1,14 @@
+import { createHash } from 'node:crypto';
 import {
   BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Injectable,
   NotFoundException, Param, Patch, Post, Put, Query, StreamableFile, UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiHeader, ApiProduces, ApiTags } from '@nestjs/swagger';
 import {
-  and, appCounters, eq, gt, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordUniqueValues, records, sql, TenantContext,
+  and, appCounters, eq, gt, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordReferences, recordUniqueValues, records, sql, TenantContext,
   TenantTransaction, users, withTenantTransaction,
 } from '@suzubase/db';
-import { FieldChange, isRecordInput, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse } from '@suzubase/shared-types';
+import { FieldChange, FieldDefinition, isRecordInput, lookupTargets, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { assignAutoNumber, numberScope } from './auto-number';
 import { AppSchemaService } from './app-schema';
@@ -27,6 +28,8 @@ const dataInput = z.record(identifier, z.string());
 const createInput = z.strictObject({ data: dataInput });
 const updateInput = z.strictObject({ data: dataInput, revision: z.int().min(1).max(2147483647) });
 const revisionInput = updateInput.pick({ revision: true });
+const lookupPreviewInput = z.strictObject({ fieldId: identifier, key: z.string().min(1).max(4000) });
+const lookupRefreshInput = revisionInput.extend({ confirmation: z.string().regex(/^[a-f0-9]{64}$/) });
 const batchUpdateInput = z.strictObject({
   fieldId: identifier, value: z.string().nullable(),
   items: z.array(revisionInput.extend({ id: identifier })).min(1).max(100)
@@ -76,7 +79,7 @@ export class RecordService {
         continue;
       }
       let normalized: string | undefined;
-      if (field.type === 'autoNumber' || field.type === 'calculation' || field.type === 'layout') {
+      if (!isRecordInput(field.type)) {
         errors.push({ field: fieldId, message: 'This field is read-only' });
         continue;
       }
@@ -151,7 +154,7 @@ export class RecordService {
     source: 'api' | 'import', key?: string,
   ) {
     const schemaVersion = app.publishedSchemaVersion;
-    this.assertEditable(access, input);
+    this.assertEditable(access, input, fields);
     const identity = { tenantId: context.tenantId, appId };
     const counterScope = and(eq(appCounters.tenantId, context.tenantId), eq(appCounters.appId, appId));
     if (key !== undefined) {
@@ -187,6 +190,7 @@ export class RecordService {
       const number = await assignAutoNumber(tx, context, appId, field.fieldId, config, scope, supplied);
       if (number) data[field.fieldId] = number;
     }
+    const references = await this.resolveLookups(tx, context, fields, data);
     calculateFields(fields, data);
     const [counter] = await tx.update(appCounters).set({ lastValue: sql`${appCounters.lastValue} + 1` })
       .where(counterScope).returning({ recordNo: appCounters.lastValue });
@@ -195,6 +199,7 @@ export class RecordService {
       createdBy: context.userId, updatedBy: context.userId,
     }).returning();
     const record = serializeRecord(row);
+    await this.saveLookupReferences(tx, context, record, references);
     await this.reserveUniqueValues(tx, context, record);
     await this.reconcileFiles(tx, context, record);
     await projectSearchValues(tx, context, record, fields);
@@ -247,13 +252,15 @@ export class RecordService {
       access.types.has(id) && this.authorization.fieldDecision(access, id, 'view').allowed)) };
   }
 
-  private assertEditable(access: RecordAccess, data: RecordData) {
+  private assertEditable(access: RecordAccess, data: RecordData, definitions: FieldDefinition[]) {
+    const targets = lookupTargets(definitions);
     for (const id of Object.keys(data)) {
+      if (targets.has(id)) throw new BadRequestException([{ field: id, message: 'Lookup snapshot fields are read-only' }]);
       if (!this.authorization.editable(access, id)) throw new ForbiddenException('无权限');
     }
   }
 
-  async update(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof updateInput> | SingleFieldUpdate) {
+  async update(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof updateInput> | SingleFieldUpdate | { revision: number; lookupFieldId: string; confirmation: string }) {
     return withTenantTransaction(context, async (tx) => {
       const { access, fields } = await this.appSchema.writable(tx, context, appId, 'edit');
       const current = await this.findRecord(tx, context, appId, recordId, 'edit', false, true);
@@ -261,20 +268,31 @@ export class RecordService {
       const definitions = await this.appSchema.getFields(tx, context, appId, current.schemaVersion);
       const inputTypes = new Map(definitions.map(({ fieldId, type }) => [fieldId, type]));
       let candidate: RecordData;
-      if ('fieldId' in input) {
+      if ('lookupFieldId' in input) {
+        candidate = { ...current.data };
+      } else if ('fieldId' in input) {
         const type = inputTypes.get(input.fieldId);
         if (!type || !isRecordInput(type)) throw new BadRequestException([{ field: input.fieldId, message: 'Field is not writable in this record version' }]);
-        this.assertEditable(access, { [input.fieldId]: input.value ?? '' });
+        this.assertEditable(access, { [input.fieldId]: input.value ?? '' }, definitions);
         candidate = Object.fromEntries(Object.entries(current.data).filter(([id]) => isRecordInput(inputTypes.get(id))));
         if (input.value === null) delete candidate[input.fieldId];
         else candidate[input.fieldId] = input.value;
       } else {
-        this.assertEditable(access, input.data);
+        this.assertEditable(access, input.data, definitions);
         const retained = Object.fromEntries(Object.entries(current.data).filter(([id]) =>
           !this.authorization.editable(access, id) && isRecordInput(inputTypes.get(id))));
         candidate = { ...retained, ...input.data };
       }
-      const data = await this.normalizeData(tx, context, appId, current.schemaVersion, candidate, { data: current.data, fields });
+      const targets = lookupTargets(definitions);
+      for (const id of targets) delete candidate[id];
+      const refresh = 'lookupFieldId' in input ? await this.refreshValues(tx, context, current, definitions, access, input.lookupFieldId) : undefined;
+      if (refresh && 'lookupFieldId' in input && input.confirmation !== refresh.confirmation) {
+        throw new ConflictException('Lookup values changed. Preview again before confirming.');
+      }
+      const data = refresh ? { ...current.data } :
+        await this.normalizeData(tx, context, appId, current.schemaVersion, candidate, { data: current.data, fields });
+      const references = refresh ? [] : await this.resolveLookups(tx, context, definitions, data, current.data);
+      if (refresh) this.copyLookupValues(refresh.field, refresh.source.data, data);
       for (const [id, value] of Object.entries(current.data)) {
         if (inputTypes.get(id) === 'autoNumber') data[id] = value;
       }
@@ -287,12 +305,117 @@ export class RecordService {
       )).returning();
       if (!row) this.rejectRevision(await this.findRecord(tx, context, appId, recordId));
       const updated = serializeRecord(row);
+      await this.saveLookupReferences(tx, context, updated, references);
       await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, recordId));
       await this.reserveUniqueValues(tx, context, updated);
       await this.reconcileFiles(tx, context, updated);
       await projectSearchValues(tx, context, updated, definitions);
-      await writeRecordEvent(tx, context, updated, 'updated', fieldChanges(current.data, data));
+      await writeRecordEvent(tx, context, updated, refresh ? 'lookup-refetched' : 'updated', fieldChanges(current.data, data));
       return this.findRecord(tx, context, appId, recordId);
+    });
+  }
+
+  private copyLookupValues(field: FieldDefinition, source: RecordData, data: RecordData) {
+    for (const { sourceFieldId, targetFieldId } of field.lookup!.copies) {
+      const value = source[sourceFieldId];
+      if (value === undefined) delete data[targetFieldId];
+      else data[targetFieldId] = value;
+    }
+  }
+
+  private async resolveLookups(tx: TenantTransaction, context: TenantContext, fields: FieldDefinition[],
+    data: RecordData, previous?: RecordData,
+  ) {
+    const references: { fieldId: string; targetAppId: string; targetRecordId: string }[] = [];
+    for (const field of fields) {
+      const config = field.lookup;
+      if (!config) continue;
+      const key = data[config.localKeyFieldId];
+      if (previous?.[config.localKeyFieldId] === key && previous) {
+        for (const { targetFieldId } of config.copies) {
+          if (previous[targetFieldId] !== undefined) data[targetFieldId] = previous[targetFieldId];
+        }
+        continue;
+      }
+      const source = key && await this.query.lookupSource(tx, context, config, { key });
+      if (!source && (key || previous?.[config.localKeyFieldId])) {
+        throw new BadRequestException([{ field: config.localKeyFieldId, message: 'No visible record matches this lookup key' }]);
+      }
+      if (!source) continue;
+      this.copyLookupValues(field, source.data, data);
+      references.push({ fieldId: field.fieldId, targetAppId: config.appId, targetRecordId: source.id });
+    }
+    return references;
+  }
+
+  private async saveLookupReferences(tx: TenantTransaction, context: TenantContext, record: RecordResponse,
+    references: { fieldId: string; targetAppId: string; targetRecordId: string }[],
+  ) {
+    if (!references.length) return;
+    const identity = { tenantId: context.tenantId, appId: record.appId, recordId: record.id };
+    for (const reference of references) {
+      await tx.insert(recordReferences).values({ ...identity, ...reference }).onConflictDoUpdate({
+        target: [recordReferences.tenantId, recordReferences.appId, recordReferences.recordId, recordReferences.fieldId],
+        set: { targetAppId: reference.targetAppId, targetRecordId: reference.targetRecordId },
+      });
+    }
+  }
+
+  private lookupField(definitions: FieldDefinition[], access: RecordAccess, fieldId: string) {
+    const field = definitions.find((field) => field.fieldId === fieldId);
+    if (!field?.lookup || !this.authorization.fieldDecision(access, fieldId, 'view').allowed ||
+        !this.authorization.editable(access, field.lookup.localKeyFieldId)) throw new NotFoundException('无权限');
+    return { ...field, lookup: field.lookup };
+  }
+
+  private lookupChanges(definitions: FieldDefinition[], access: RecordAccess, field: FieldDefinition, before: RecordData, source: RecordData) {
+    return field.lookup!.copies.filter(({ targetFieldId }) =>
+      access.types.has(targetFieldId) && this.authorization.fieldDecision(access, targetFieldId, 'view').allowed)
+      .map(({ sourceFieldId, targetFieldId }) => ({
+        fieldId: targetFieldId, name: definitions.find(({ fieldId }) => fieldId === targetFieldId)?.name,
+        current: before[targetFieldId] ?? null, incoming: source[sourceFieldId] ?? null,
+      }));
+  }
+
+  async previewLookup(context: TenantContext, appId: string, fieldId: string, rawKey: string, recordId?: string) {
+    return withTenantTransaction(context, async (tx) => {
+      const { app, access } = await this.appSchema.writable(tx, context, appId, recordId ? 'edit' : 'create');
+      const record = recordId ? await this.findRecord(tx, context, appId, recordId, 'edit') : undefined;
+      const definitions = await this.appSchema.getFields(tx, context, appId, record?.schemaVersion ?? app.publishedSchemaVersion);
+      const field = this.lookupField(definitions, access, fieldId);
+      const local = definitions.find(({ fieldId }) => fieldId === field.lookup.localKeyFieldId)!;
+      const key = normalizeValue(local.type, rawKey, local.options);
+      const source = key && await this.query.lookupSource(tx, context, field.lookup, { key });
+      if (!source) throw new BadRequestException('No visible record matches this lookup key');
+      return { changes: this.lookupChanges(definitions, access, field, record?.data ?? {}, source.data) };
+    });
+  }
+
+  private async refreshValues(tx: TenantTransaction, context: TenantContext, record: RecordResponse,
+    definitions: FieldDefinition[], access: RecordAccess, fieldId: string,
+  ) {
+    const field = this.lookupField(definitions, access, fieldId);
+    const [reference] = await tx.select().from(recordReferences).where(and(
+      eq(recordReferences.tenantId, context.tenantId), eq(recordReferences.appId, record.appId),
+      eq(recordReferences.recordId, record.id), eq(recordReferences.fieldId, fieldId),
+    ));
+    const source = reference && reference.targetAppId === field.lookup.appId &&
+      await this.query.lookupSource(tx, context, field.lookup, { recordId: reference.targetRecordId });
+    if (!source) throw new NotFoundException('无权限');
+    const changes = this.lookupChanges(definitions, access, field, record.data, source.data);
+    const confirmation = createHash('sha256').update(JSON.stringify([
+      context.tenantId, context.userId, record.appId, record.id, record.revision, fieldId, source.id, source.revision, changes,
+    ])).digest('hex');
+    return { field, source, changes, confirmation };
+  }
+
+  async previewRefresh(context: TenantContext, appId: string, recordId: string, fieldId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      const { access } = await this.appSchema.writable(tx, context, appId, 'edit');
+      const record = await this.findRecord(tx, context, appId, recordId, 'edit', false, true);
+      const definitions = await this.appSchema.getFields(tx, context, appId, record.schemaVersion);
+      const { changes, confirmation } = await this.refreshValues(tx, context, record, definitions, access, fieldId);
+      return { changes, confirmation, revision: record.revision };
     });
   }
 
@@ -584,6 +707,26 @@ export class RecordsController {
   @AllowApiToken('view')
   list(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
     return this.service.list(context, parseInput(identifier, appId), parseInput(pageInput, query));
+  }
+
+  @Post('lookup-preview')
+  lookupPreview(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown) {
+    const input = parseInput(lookupPreviewInput.extend({ recordId: identifier.optional() }), body);
+    return this.service.previewLookup(context, parseInput(identifier, appId), input.fieldId, input.key, input.recordId);
+  }
+
+  @Get(':recordId/lookups/:fieldId/refresh')
+  lookupRefreshPreview(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('recordId') recordId: string, @Param('fieldId') fieldId: string) {
+    return this.service.previewRefresh(context, parseInput(identifier, appId), parseInput(identifier, recordId), parseInput(identifier, fieldId));
+  }
+
+  @Post(':recordId/lookups/:fieldId/refresh')
+  lookupRefresh(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('recordId') recordId: string, @Param('fieldId') fieldId: string, @Body() body: unknown) {
+    return this.service.update(context, parseInput(identifier, appId), parseInput(identifier, recordId), {
+      ...parseInput(lookupRefreshInput, body), lookupFieldId: parseInput(identifier, fieldId),
+    });
   }
 
   @Get('search')

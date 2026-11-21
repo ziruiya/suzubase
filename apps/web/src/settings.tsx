@@ -1,5 +1,6 @@
 import { autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, type FieldType, type FormLayout, type ViewConfiguration } from '@suzubase/shared-types';
 import { useEffect, useState, type FormEvent } from 'react';
+import { LookupSettings } from './lookup';
 import { PermissionsSettings } from './permissions-settings';
 import { ViewSettings } from './view-settings';
 import { IndexSettings } from './index-settings';
@@ -47,6 +48,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
       }) : [];
       await api(path + '/fields', token, json('POST', {
         name: input.get('name'), code: input.get('code'), type, required: input.has('required'), options,
+        ...(type === 'lookup' && { lookup: JSON.parse(String(input.get('lookup'))) }),
         ...(type === 'calculation' && { formula: JSON.parse(String(input.get('formula'))) }),
         ...(type === 'layout' && { layoutElement: {
           kind: input.get('layoutKind'), text: String(input.get('layoutText')).trim() || undefined,
@@ -77,7 +79,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
         <li className="inline" key={field.fieldId}>{field.name} <span className="muted">· {field.type}</span>
           {!narrow && <button type="button" disabled={busy} onClick={() => setEditing(field)}>Edit {field.name}</button>}
         </li>)}</ul>
-      {editing && !narrow && <FieldEditor key={editing.fieldId} field={editing} busy={busy} close={() => setEditing(undefined)}
+      {editing && !narrow && <FieldEditor key={editing.fieldId} field={editing} token={token} fields={definitions} busy={busy} close={() => setEditing(undefined)}
         save={(patch) => void run(async () => {
           await api(path + '/draft/fields/' + editing.fieldId, token, patch ? json('PATCH', patch) : json('DELETE'));
           setEditing(undefined); await refreshDraft();
@@ -98,6 +100,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
           {fieldTypes.map((type) => <option key={type}>{type}</option>)}
         </select></label>
         {isRecordInput(type) && <label className="option"><input type="checkbox" name="required" /> Required</label>}
+        {type === 'lookup' && <LookupSettings token={token} fields={definitions} />}
         {optionFieldTypes.has(type) && <label>Options, one value=label per line <textarea name="options" required /></label>}
         {type === 'text' && <label>Search use <select name="search"><option value="">None</option>
           <option value="name">Name</option><option value="kana">Name kana</option><option value="customer-id">Customer ID</option>
@@ -179,8 +182,8 @@ export function Settings({ app, session, narrow, onClose, reload }: {
   </section>;
 }
 
-function FieldEditor({ field, busy, close, save }: {
-  field: Field; busy: boolean; close: () => void; save: (patch: Record<string, unknown> | null) => void;
+function FieldEditor({ field, fields, token, busy, close, save }: {
+  field: Field; fields: Field[]; token: string; busy: boolean; close: () => void; save: (patch: Record<string, unknown> | null) => void;
 }) {
   const [type, setType] = useState(field.type);
   const [confirm, setConfirm] = useState(false);
@@ -201,6 +204,7 @@ function FieldEditor({ field, busy, close, save }: {
       }
       save({ name: values.get('name'), code: values.get('code'), type, required: values.has('required'), options,
         uniqueValue: values.has('unique'),
+        ...(type === 'lookup' && { lookup: JSON.parse(String(values.get('lookup'))) }),
         ...(type === 'calculation' && { formula: JSON.parse(String(values.get('formula'))) }),
         ...(type === 'layout' && { layoutElement: { kind: values.get('kind'), ...(values.get('layoutText') && { text: values.get('layoutText') }) } }),
       });
@@ -217,6 +221,7 @@ function FieldEditor({ field, busy, close, save }: {
     </select></label>
     {isRecordInput(type) && <label className="option"><input type="checkbox" name="required" defaultChecked={field.required} /> Required</label>}
     {fieldContract[type].unique && <label className="option"><input type="checkbox" name="unique" defaultChecked={field.uniqueValue} /> Unique</label>}
+    {type === 'lookup' && <LookupSettings token={token} fields={fields} initial={field.lookup} />}
     {type === 'calculation' && <label>Formula tokens <textarea name="formula" defaultValue={JSON.stringify(field.formula, null, 2)} required /></label>}
     {type === 'layout' && field.layoutElement && <>
       <label>Element <select name="kind" defaultValue={field.layoutElement.kind}>

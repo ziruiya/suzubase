@@ -169,6 +169,13 @@
       "when": 1795276540253,
       "tag": "0023_condition_permission_preview",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1795278518229,
+      "tag": "0024_gate2_lookup",
+      "breakpoints": true
     }
   ]
 }
