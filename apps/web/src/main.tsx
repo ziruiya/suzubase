@@ -187,7 +187,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
   const selectedView = app.views.find(({ id }) => id === (view ?? app.defaultId));
   const columns = selectedView?.columns.length
     ? selectedView.columns.map(({ fieldId }) => app.fields.find((field) => field.fieldId === fieldId)!).filter(Boolean)
-    : app.fields;
+    : app.fields.filter(({ type }) => type !== 'layout');
   const searchable = app.fields.filter(({ searchMode, type }) => searchMode || ['phone', 'email'].includes(type));
   const currentSearchField = searchable.find(({ fieldId }) => fieldId === searchField) ?? searchable[0];
 

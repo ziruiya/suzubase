@@ -63,3 +63,45 @@ test('G1-03 published scalar and choice types validate and round-trip by field U
   });
   t.diagnostic(JSON.stringify({ fieldIds, actual: read.data }));
 });
+
+test('GF-02 rich text, calculated results and layout definitions round-trip with read-only enforcement', async (t) => {
+  const token = await login(await provision());
+  const { id } = await createApp(token);
+  const base = '/apps/' + id;
+  const request = (status, method, path, body) => expectRequest(status, base + path, { method, token, body });
+  const add = (type, code, config) => request(201, 'POST', '/fields', { type, code, name: code, ...config });
+  const rich = await add('richText', 'description');
+  const quantity = await add('number', 'quantity');
+  const formula = [
+    { kind: 'field', fieldId: quantity.fieldId }, { kind: 'number', value: '2' }, { kind: 'operator', operator: '*' },
+    { kind: 'text', value: ' items' }, { kind: 'operator', operator: '&' },
+  ];
+  const calculation = await add('calculation', 'total', { formula });
+  const elements = [];
+  for (const kind of ['label', 'separator', 'blank', 'group']) {
+    elements.push(await add('layout', kind, { layoutElement: { kind, text: kind } }));
+  }
+  await request(201, 'POST', '/publish');
+  const html = '<p>First <b>paragraph</b></p><ul><li><a href="https://example.test">Item</a></li></ul>';
+  const input = { [rich.fieldId]: html, [quantity.fieldId]: '3.25' };
+  const record = await request(201, 'POST', '/records', { data: input });
+  const read = await request(200, 'GET', '/records/' + record.id + '/form');
+  assert.deepEqual(read.record.data, { ...input, [calculation.fieldId]: '6.5 items' });
+  for (const element of elements) {
+    assert.deepEqual(read.fields.find(({ fieldId }) => fieldId === element.fieldId)?.layoutElement, element.layoutElement);
+    assert.equal(Object.hasOwn(read.record.data, element.fieldId), false);
+  }
+  await request(400, 'POST', '/records', { data: { [calculation.fieldId]: 'forged' } });
+  await request(400, 'POST', '/records', { data: { [elements[0].fieldId]: 'forged' } });
+  const updated = await request(200, 'PUT', '/records/' + record.id, { revision: record.revision, data: { ...input, [quantity.fieldId]: '7' } });
+  assert.equal(updated.data[calculation.fieldId], '14 items');
+  const exportResponse = await fetch(new URL(base + '/csv/export', process.env.TEST_API_URL ?? 'http://api:3000'), {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  assert.equal(exportResponse.status, 200);
+  assert.match(exportResponse.headers.get('content-disposition'), /plain-text/);
+  const csv = await exportResponse.text();
+  assert.match(csv, /First paragraph\nItem/);
+  assert.doesNotMatch(csv, /<p>|separator/);
+  t.diagnostic(JSON.stringify({ layout: elements.map(({ fieldId, layoutElement }) => ({ fieldId, layoutElement })), values: read.record.data }));
+});

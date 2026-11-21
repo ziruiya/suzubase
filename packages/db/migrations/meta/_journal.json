@@ -134,6 +134,13 @@
       "when": 1795274542761,
       "tag": "0018_administrator_totp",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1795274762298,
+      "tag": "0019_rich_text_calculation_layout",
+      "breakpoints": true
     }
   ]
 }

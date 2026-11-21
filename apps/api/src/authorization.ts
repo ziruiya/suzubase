@@ -141,6 +141,9 @@ export class AuthorizationService {
   }
 
   fieldDecision(access: RecordAccess, fieldId: string, action: FieldAction): PermissionDecision {
+    if (action === 'view' && access.formulaRefs?.get(fieldId)?.some((id) => !this.fieldDecision(access, id, 'view').allowed)) {
+      return { allowed: false, matched: [] };
+    }
     const rules = access.acl.field.filter((rule) => rule.fieldId === fieldId && rule.action === action);
     const matched = rules.filter((rule) => this.matches(access.principal, rule.subject) === true).map(({ id }) => id);
     return rules.length ? { allowed: matched.length > 0, matched } : { allowed: true, matched: ['default-field-access'] };
@@ -223,4 +226,5 @@ export interface RecordAccess {
   principal: Principal;
   acl: AclConfiguration;
   types: ReadonlyMap<string, FieldType>;
+  formulaRefs?: ReadonlyMap<string, string[]>;
 }

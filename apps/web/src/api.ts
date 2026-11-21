@@ -1,4 +1,4 @@
-import type { AutoNumberConfiguration, FieldOption, FieldType, TextSearchMode, ViewConfiguration } from '@suzubase/shared-types';
+import type { AutoNumberConfiguration, FieldOption, FieldType, Formula, LayoutElement, TextSearchMode, ViewConfiguration } from '@suzubase/shared-types';
 
 export interface Profile {
   tenantId: string;
@@ -27,6 +27,8 @@ export interface Field {
   code: string;
   type: FieldType;
   required: boolean;
+  formula: Formula | null;
+  layoutElement: LayoutElement | null;
   options: FieldOption[];
   autoNumber: AutoNumberConfiguration | null;
   searchMode: TextSearchMode | null;
@@ -79,7 +81,8 @@ export async function download(path: string, token: string, filename: string) {
   const url = URL.createObjectURL(await result.blob());
   const link = document.createElement('a');
   link.href = url;
-  link.download = filename;
+  const disposition = result.headers.get('Content-Disposition');
+  link.download = /^attachment; filename="([^"\/]+)"$/.exec(disposition ?? '')?.[1] ?? filename;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }

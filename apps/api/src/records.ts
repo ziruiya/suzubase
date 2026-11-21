@@ -17,6 +17,7 @@ import { RecordQueryService } from './record-query';
 import { writeRecordEvent } from './record-events';
 import { FileService, fileIds } from './files';
 import { SearchService, searchInput } from './search';
+import { calculateFields } from './formula';
 import { normalizeValue } from './field-values';
 import { identifier, parseInput } from './validation';
 
@@ -77,8 +78,8 @@ export class RecordService {
         continue;
       }
       let normalized: string | undefined;
-      if (field.type === 'autoNumber') {
-        errors.push({ field: fieldId, message: 'Automatic numbers cannot be edited' });
+      if (field.type === 'autoNumber' || field.type === 'calculation' || field.type === 'layout') {
+        errors.push({ field: fieldId, message: 'This field is read-only' });
         continue;
       }
       if (field.type === 'attachment') {
@@ -180,6 +181,7 @@ export class RecordService {
       const number = await assignAutoNumber(tx, context, appId, field.fieldId, config, scope, supplied);
       if (number) data[field.fieldId] = number;
     }
+    calculateFields(fields, data);
     const [counter] = await tx.update(appCounters).set({ lastValue: sql`${appCounters.lastValue} + 1` })
       .where(counterScope).returning({ recordNo: appCounters.lastValue });
     const [row] = await tx.insert(records).values({
@@ -252,11 +254,13 @@ export class RecordService {
       if (current.revision !== input.revision) this.rejectRevision(this.visibleRecord(access, current));
       this.assertEditable(access, input.data);
       const retained = Object.fromEntries(Object.entries(current.data).filter(([id]) =>
-        !this.authorization.editable(access, id) && access.types.get(id) !== 'autoNumber'));
+        !this.authorization.editable(access, id) && access.types.get(id) !== 'autoNumber' && access.types.get(id) !== 'calculation'));
       const data = await this.normalizeData(tx, context, appId, current.schemaVersion, { ...retained, ...input.data });
       for (const [id, value] of Object.entries(current.data)) {
         if (access.types.get(id) === 'autoNumber') data[id] = value;
       }
+      const definitions = await this.appSchema.getFields(tx, context, appId, current.schemaVersion);
+      calculateFields(definitions, data);
       const [row] = await tx.update(records).set({
         data, revision: sql`${records.revision} + 1`, updatedBy: context.userId, updatedAt: sql`clock_timestamp()`,
       }).where(and(
@@ -268,7 +272,7 @@ export class RecordService {
       await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, recordId));
       await this.reserveUniqueValues(tx, context, updated);
       await this.reconcileFiles(tx, context, updated);
-      await this.search.project(tx, context, updated, await this.appSchema.getFields(tx, context, appId, current.schemaVersion));
+      await this.search.project(tx, context, updated, definitions);
       await writeRecordEvent(tx, context, updated, 'updated', fieldChanges(current.data, data));
       return this.findRecord(tx, context, appId, recordId);
     });

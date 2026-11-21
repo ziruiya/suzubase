@@ -1,5 +1,6 @@
 import { FieldOption, FieldType, multiOptionFieldTypes, optionFieldTypes } from '@suzubase/shared-types';
 import { z } from 'zod';
+import { sanitizeRichText } from './rich-text';
 import { identifier } from './validation';
 
 const localDate = z.iso.date();
@@ -20,6 +21,7 @@ export function normalizeDecimal(value: string): string | undefined {
 
 export function normalizeValue(type: FieldType, value: string, options: FieldOption[]) {
   if (/[\x00\p{Surrogate}]/u.test(value)) return undefined;
+  if (type === 'richText') return sanitizeRichText(value);
   if (type !== 'multiline' && /[\r\n\u2028\u2029]/u.test(value)) return undefined;
   if (type === 'text' || type === 'multiline') return value;
   if (type === 'number') return normalizeDecimal(value);

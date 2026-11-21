@@ -7,11 +7,12 @@ import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, recordReferences, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, optionFieldTypes, SavedView, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
+import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, SavedView, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AuthorizationService, RecordAccess } from './authorization';
 import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
 import { aclInput } from './acl-input';
+import { formulaInput, formulaProblems } from './formula';
 import { normalizeValue } from './field-values';
 import { viewInput } from './view-input';
 import { identifier, parseInput, postgresErrorCode } from './validation';
@@ -45,13 +46,16 @@ const numbering = z.strictObject({
   padding: z.int().min(0).max(32),
   enabled: z.boolean(),
 });
+const layoutInput = z.strictObject({ kind: z.enum(layoutKinds), text: metadata.name.optional().default('') });
 const fieldInput = z.strictObject({
-  ...metadata, type: z.enum(fieldTypes), autoNumber: numbering.optional(), searchMode: z.enum(textSearchModes).optional(), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
+  ...metadata, type: z.enum(fieldTypes), formula: formulaInput.optional(), layoutElement: layoutInput.optional(), autoNumber: numbering.optional(), searchMode: z.enum(textSearchModes).optional(), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
 }).refine(({ options, type }) => optionFieldTypes.has(type) === (options.length > 0)
   && new Set(options.map(({ value }) => value)).size === options.length, { path: ['options'] })
   .refine(({ type, uniqueValue }) => !uniqueValue || fieldContract[type].unique, { path: ['uniqueValue'] })
   .refine(({ type, autoNumber, required }) => (type === 'autoNumber') === Boolean(autoNumber) &&
     !(type === 'autoNumber' && required), { path: ['autoNumber'] })
+  .refine(({ type, formula, layoutElement, required }) => (type === 'calculation') === Boolean(formula) &&
+    (type === 'layout') === Boolean(layoutElement) && (!required || isRecordInput(type)), { path: ['type'] })
   .refine(({ type, searchMode }) => !searchMode || type === 'text', { path: ['searchMode'] });
 const metadataProperties = {
   code: { type: 'string', pattern: codePattern.source },
@@ -162,10 +166,11 @@ export class AppSchemaService {
         await tx.insert(appCounters).values(identity);
         const definitions = await this.getFields(tx, context, appId, source.publishedSchemaVersion);
         const fieldMapping = new Map(definitions.map(({ fieldId }) => [fieldId, randomUUID()]));
-        for (const { fieldId, code, name, type, required, uniqueValue, options, autoNumber, searchMode } of definitions) {
+        for (const { fieldId, code, name, type, required, uniqueValue, options, autoNumber, searchMode, formula, layoutElement } of definitions) {
           const copiedId = fieldMapping.get(fieldId)!;
           await tx.insert(fields).values({
-            ...identity, fieldId: copiedId, code, name, type, required, uniqueValue, options, searchMode, introducedIn: 1,
+            ...identity, fieldId: copiedId, code, name, type, required, uniqueValue, options, searchMode, layoutElement, introducedIn: 1,
+            formula: formula?.map((token) => token.kind === 'field' ? { ...token, fieldId: fieldMapping.get(token.fieldId)! } : token),
             autoNumber: autoNumber && {
               ...autoNumber, scopeFieldId: autoNumber.scopeFieldId && fieldMapping.get(autoNumber.scopeFieldId)!,
             },
@@ -205,7 +210,11 @@ export class AppSchemaService {
     const acl = await this.authorization.configuration(tx, context, appId, app.publishedSchemaVersion);
     const fields = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
     const principal = await this.authorization.principal(tx, context);
-    const access: RecordAccess = { acl, principal, types: new Map(fields.map(({ fieldId, type }) => [fieldId, type])) };
+    const access: RecordAccess = {
+      acl, principal, types: new Map(fields.map(({ fieldId, type }) => [fieldId, type])),
+      formulaRefs: new Map(fields.filter(({ formula }) => formula).map(({ fieldId, formula }) =>
+        [fieldId, formula!.flatMap((token) => token.kind === 'field' ? [token.fieldId] : [])])),
+    };
     return { app, fields, access };
   }
 
@@ -225,7 +234,7 @@ export class AppSchemaService {
 
   formFields(fields: Awaited<ReturnType<AppSchemaService['getFields']>>, access: RecordAccess) {
     return fields.filter(({ fieldId }) => this.authorization.fieldDecision(access, fieldId, 'view').allowed)
-      .map((field) => ({ ...field, editable: field.type !== 'autoNumber' && this.authorization.editable(access, field.fieldId) }));
+      .map((field) => ({ ...field, editable: isRecordInput(field.type) && this.authorization.editable(access, field.fieldId) }));
   }
 
   async formActions(tx: TenantTransaction, context: TenantContext, appId: string) {
@@ -248,7 +257,7 @@ export class AppSchemaService {
   }
 
   getFields(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
-    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required, uniqueValue: fields.uniqueValue, autoNumber: fields.autoNumber, searchMode: fields.searchMode, options: fields.options })
+    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required, uniqueValue: fields.uniqueValue, autoNumber: fields.autoNumber, searchMode: fields.searchMode, options: fields.options, formula: fields.formula, layoutElement: fields.layoutElement })
       .from(fields).where(and(
         eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), lte(fields.introducedIn, version),
       )).orderBy(fields.introducedIn, fields.code);
@@ -321,6 +330,10 @@ export class AppSchemaService {
       const publishedViews = await this.getViews(tx, context, appId, app.publishedSchemaVersion);
       const draftAcl = await this.authorization.configuration(tx, context, appId, version);
       const publishedAcl = await this.authorization.configuration(tx, context, appId, app.publishedSchemaVersion);
+      const dependencyProblems = formulaProblems(
+        await this.getFields(tx, context, appId, version),
+        await this.getFields(tx, context, appId, app.publishedSchemaVersion),
+      );
       const changedAcl = JSON.stringify(draftAcl) !== JSON.stringify(publishedAcl);
       const changedViews = JSON.stringify(draftViews) !== JSON.stringify(publishedViews);
       const requireFields = await tx.select({ fieldId: fields.fieldId, name: fields.name }).from(fields).where(and(
@@ -334,12 +347,12 @@ export class AppSchemaService {
         eq(fields.introducedIn, version), eq(fields.required, true),
       )).where(and(eq(records.tenantId, context.tenantId), eq(records.appId, appId),
         sql`COALESCE(${records.data} ->> ${fields.fieldId}::text, '') IN ('', '[]')`)) : [];
-      if (version !== app.publishedSchemaVersion + 1 || (!addition && !changedViews && !changedAcl) || missing.length) {
+      if (version !== app.publishedSchemaVersion + 1 || (!addition && !changedViews && !changedAcl) || missing.length || dependencyProblems.length) {
         await tx.update(apps).set({ draftStatus: 'validation-failed' })
           .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
         return { failure: {
-          appId, version, message: missing.length ? 'Existing records are missing required values' : 'Draft has no changes',
-          problems: missing.map((problem) => ({ ...problem, value: null, reason: 'required' })),
+          appId, version, message: missing.length ? 'Existing records are missing required values' : dependencyProblems.length ? 'Formula dependency check failed' : 'Draft has no changes',
+          problems: [...missing.map((problem) => ({ ...problem, value: null, reason: 'required' })), ...dependencyProblems],
           skippedDependencies: ['workflow', 'lookup'],
         } };
       }
@@ -379,7 +392,7 @@ export class AppSchemaService {
         const fields = await this.getFields(tx, context, appId, current);
         const input = change.value;
         const definitions = new Map(fields.map((field) => [field.fieldId, field]));
-        const columnsValid = input.columns.every(({ fieldId }) => definitions.has(fieldId));
+        const columnsValid = input.columns.every(({ fieldId }) => definitions.has(fieldId) && definitions.get(fieldId)!.type !== 'layout');
         const sortField = input.sort && definitions.get(input.sort.fieldId);
         if (!columnsValid || (input.sort && (!sortField || !fieldContract[sortField.type].sort))) {
           throw new BadRequestException('Unsupported view column or sort');

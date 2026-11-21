@@ -1,4 +1,4 @@
-import { autoNumberHelp, fieldTypes, optionFieldTypes, type FieldType } from '@suzubase/shared-types';
+import { autoNumberHelp, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, type FieldType } from '@suzubase/shared-types';
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, appPath, download, json, message, type App, type Field, type Session } from './api';
 
@@ -38,6 +38,10 @@ export function Settings({ app, session, narrow, onClose, reload }: {
       }) : [];
       await api(path + '/fields', token, json('POST', {
         name: input.get('name'), code: input.get('code'), type, required: input.has('required'), options,
+        ...(type === 'calculation' && { formula: JSON.parse(String(input.get('formula'))) }),
+        ...(type === 'layout' && { layoutElement: {
+          kind: input.get('layoutKind'), text: String(input.get('layoutText')).trim() || undefined,
+        } }),
         ...(type === 'autoNumber' && { autoNumber: {
           prefix: input.get('prefix'), scopeFieldId: input.get('scope') || null, nextValue: input.get('next'),
           padding: Number(input.get('padding')), enabled: input.has('enabled'),
@@ -68,11 +72,24 @@ export function Settings({ app, session, narrow, onClose, reload }: {
         <label>Field type <select value={type} onChange={(event) => setType(event.target.value as FieldType)}>
           {fieldTypes.map((type) => <option key={type}>{type}</option>)}
         </select></label>
-        {type !== 'autoNumber' && <label className="option"><input type="checkbox" name="required" /> Required</label>}
+        {isRecordInput(type) && <label className="option"><input type="checkbox" name="required" /> Required</label>}
         {optionFieldTypes.has(type) && <label>Options, one value=label per line <textarea name="options" required /></label>}
         {type === 'text' && <label>Search use <select name="search"><option value="">None</option>
           <option value="name">Name</option><option value="kana">Name kana</option><option value="customer-id">Customer ID</option>
         </select></label>}
+        {type === 'calculation' && <>
+          <label>Formula tokens <textarea name="formula" required aria-describedby="formula-help" /></label>
+          <p id="formula-help">Enter a JSON list with operands before the operator. Example for 2 + 3</p>
+          <pre>{JSON.stringify([{ kind: 'number', value: '2' }, { kind: 'number', value: '3' }, { kind: 'operator', operator: '+' }])}</pre>
+          <p>Use a token with kind "field" and one of these field IDs. Use &amp; to join text.</p>
+          <ul>{(draft?.version ? draft.fields : app.fields)
+            .filter(({ type }) => !['layout', 'calculation', 'attachment', 'richText'].includes(type))
+            .map((field) => <li key={field.fieldId}>{field.name} <code>{field.fieldId}</code></li>)}</ul>
+        </>}
+        {type === 'layout' && <>
+          <label>Element <select name="layoutKind">{layoutKinds.map((kind) => <option key={kind}>{kind}</option>)}</select></label>
+          <label>Display text <input name="layoutText" maxLength={120} /></label>
+        </>}
         {type === 'autoNumber' && <>
           <p>{autoNumberHelp}</p>
           <label>Prefix <input name="prefix" /></label>
@@ -101,7 +118,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
         });
       }}>
         <label>View name <input name="name" required /></label>
-        <label>Columns <select name="columns" multiple>{app.fields.map((field) =>
+        <label>Columns <select name="columns" multiple>{app.fields.filter(({ type }) => type !== 'layout').map((field) =>
           <option key={field.fieldId} value={field.fieldId}>{field.name}</option>)}</select></label>
         <button type="submit" disabled={busy}>Add view to draft</button>
       </form>

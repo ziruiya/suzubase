@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Controller, useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
+import { RichTextEditor, RichTextValue, richTextSummary } from './rich-text';
 import { draftKey, recoverDraft, removeDrafts, writeDraft, type Draft, type DraftScope } from './drafts';
 
 type SaveState = 'editing' | 'local draft saved' | 'submitting' | 'success' | 'failed-retryable' | 'version conflict';
@@ -22,7 +23,7 @@ function parseArray(value: string) {
 }
 
 function normalizeInForm(field: Field, value: string, timeZone: string) {
-  if (field.required && (!value || value === '[]' && (multiOptionFieldTypes.has(field.type) || field.type === 'attachment'))) {
+  if (field.required && (!value || (field.type === 'richText' && !richTextSummary(value)) || value === '[]' && (multiOptionFieldTypes.has(field.type) || field.type === 'attachment'))) {
     throw new Error('Required');
   }
   if (field.type === 'datetime' && value && !value.endsWith('Z')) {
@@ -39,6 +40,7 @@ function inputValue(field: Field, value: string, timeZone: string) {
 }
 
 export function displayValue(field: Field, value: string, timeZone: string) {
+  if (field.type === 'richText') return richTextSummary(value);
   if (optionFieldTypes.has(field.type)) {
     const values = multiOptionFieldTypes.has(field.type) ? parseArray(value) : [value];
     return values.map((id) => {
@@ -84,6 +86,7 @@ function RuntimeField({
   }
   const id = 'field-' + field.fieldId;
   if (!field.editable) return <output id={id}>{value ? displayValue(field, value, session.profile.timeZone) : '—'}</output>;
+  if (field.type === 'richText') return <RichTextEditor id={id} html={value} disabled={disabled} onChange={onChange} />;
   if (field.type === 'multiline') return <textarea id={id} rows={5} value={value} onChange={(event) => onChange(event.target.value)} disabled={disabled} />;
   if (multiOptionFieldTypes.has(field.type)) {
     return <div id={id} role="group" aria-labelledby={id + '-label'}>{field.options.map((option) =>
@@ -138,16 +141,31 @@ function RuntimeField({
     onChange={(event) => onChange(event.target.value)} />;
 }
 
+export function LayoutField({ field }: { field: Field }) {
+  const element = field.layoutElement;
+  if (!element) return null;
+  switch (element.kind) {
+    case 'label': return <p>{element.text || field.name}</p>;
+    case 'separator': return <hr />;
+    case 'blank': return <div className="layout-blank" aria-hidden="true" />;
+    case 'group': return <h3>{element.text || field.name}</h3>;
+  }
+}
+
 export function RecordValues({ fields, record, session, app }: { fields: Field[]; record: RecordResponse; session: Session; app: App }) {
   const [error, setError] = useState('');
   return <dl className="record-values">
-    {fields.map((field) => <div className="value-row" key={field.fieldId}>
+    {fields.map((field) => field.type === 'layout'
+      ? <div key={field.fieldId}><LayoutField field={field} /></div>
+      : <div className="value-row" key={field.fieldId}>
       <dt>{field.name}</dt>
       <dd>{field.type === 'attachment'
         ? parseArray(record.data[field.fieldId]).map((id, index) => <button key={id} type="button"
           onClick={() => void download(appPath(app.id) + '/files/' + id, session.token, 'attachment-' + (index + 1))
             .catch((error) => setError(message(error)))}>Download attachment {index + 1}</button>)
-        : (record.data[field.fieldId] ? displayValue(field, record.data[field.fieldId], session.profile.timeZone) : '—')}</dd>
+        : field.type === 'richText' && record.data[field.fieldId]
+          ? <RichTextValue html={record.data[field.fieldId]} />
+          : (record.data[field.fieldId] ? displayValue(field, record.data[field.fieldId], session.profile.timeZone) : '—')}</dd>
     </div>)}
     {error && <div role="alert">{error}</div>}
   </dl>;
@@ -313,7 +331,8 @@ export function RecordEditor({
         setState('editing');
       }}>Copy my changes onto the latest version</button>
     </section>}
-    {fields.map((field) => <div className="form-field" key={field.fieldId}>
+    {fields.map((field) => field.type === 'layout' ? <LayoutField field={field} key={field.fieldId} />
+      : <div className="form-field" key={field.fieldId}>
       <label htmlFor={'field-' + field.fieldId} id={'field-' + field.fieldId + '-label'}>{field.name}{field.required ? ' *' : ''}</label>
       <Controller name={field.fieldId} control={form.control} defaultValue="" render={({ field: input, fieldState }) => <>
         <RuntimeField field={field} value={input.value ?? ''} session={session} app={app} disabled={busy}

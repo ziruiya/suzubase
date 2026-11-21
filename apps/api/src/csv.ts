@@ -1,3 +1,4 @@
+import { richTextPlain } from './rich-text';
 import {
   BadRequestException, Body, ConflictException, Controller, Get, HttpException, Injectable,
   NotFoundException, Param, Post, Query, StreamableFile, UseGuards,
@@ -74,7 +75,7 @@ export class CsvService {
       const lookupColumns = headers.filter((header) => target(header) === 'lookup' || /^lookup:/i.test(header));
       const mapping = headers.map((header) => lookupColumns.includes(header) ? null : target(header));
       const targets = mapping.filter((id): id is string => id !== null);
-      if (targets.some((id) => !fields.some(({ fieldId }) => fieldId === id)) || new Set(targets).size !== targets.length) {
+      if (targets.some((id) => !fields.some(({ fieldId, type }) => fieldId === id && type !== 'layout' && type !== 'calculation')) || new Set(targets).size !== targets.length) {
         throw new BadRequestException('Map each column to a distinct published field');
       }
       if (!targets.length && !lookupColumns.length) throw new BadRequestException('Map at least one column');
@@ -88,7 +89,12 @@ export class CsvService {
             const line = index + 2;
             const values: RecordData = {};
             for (const [i, fieldId] of mapping.entries()) {
-              if (fieldId && cells[i] !== '') values[fieldId] = cells[i];
+              if (fieldId && cells[i] !== '') {
+                const field = fields.find((entry) => entry.fieldId === fieldId)!;
+                values[fieldId] = field.type === 'richText'
+                  ? '<p>' + cells[i].replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replace(/\r?\n/g, '<br>') + '</p>'
+                  : cells[i];
+              }
             }
             const issues: unknown[] = lookupColumns.filter((name) => cells[headers.indexOf(name)] !== '')
               .map((column) => ({ column, message: 'Lookup columns are unavailable in Gate 1' }));
@@ -166,24 +172,27 @@ export class CsvService {
   }
 
   async export(context: TenantContext, appId: string, viewId: string | undefined, bundle: boolean) {
-    const { csv, attachmentIds } = await withTenantTransaction(context, async (tx) => {
+    const { csv, attachmentIds, richText } = await withTenantTransaction(context, async (tx) => {
       const { where, fields, data, view, sort, descending } = await this.query.scope(tx, context, appId, viewId, 'export');
-      const selected = view?.columns.length
+      const selected = (view?.columns.length
         ? view.columns.map(({ fieldId }) => fields.find((field) => field.fieldId === fieldId)!)
-        : fields;
+        : fields).filter(({ type }) => type !== 'layout');
       const rows = await tx.select({ data }).from(records).where(where)
         .orderBy(...(sort ? [sql`${sort} ${descending ? sql`DESC` : sql`ASC`} NULLS LAST`, records.recordNo] : [records.recordNo]))
         .limit(10001);
       if (rows.length > 10000) throw new BadRequestException('Export exceeds 10,000 rows. Narrow the view filters.');
       return {
-        csv: [[...selected.map(({ code }) => code)], ...rows.map(({ data }) => selected.map(({ fieldId }) => data[fieldId] ?? ''))],
+        csv: [selected.map(({ code }) => code), ...rows.map(({ data }) => selected.map(({ fieldId, type }) =>
+          type === 'richText' ? richTextPlain(data[fieldId] ?? '') : data[fieldId] ?? ''))],
+        richText: selected.some(({ type }) => type === 'richText'),
         attachmentIds: bundle ? [...new Set(rows.flatMap(({ data }) => selected
           .filter(({ type }) => type === 'attachment').flatMap(({ fieldId }) => JSON.parse(data[fieldId] || '[]') as string[])))] : [],
       };
     });
-    if (!bundle) return csvFile(csv, 'records.csv');
+    if (!bundle) return csvFile(csv, richText ? 'records-rich-text-exported-as-plain-text.csv' : 'records.csv');
     if (attachmentIds.length > 256) throw new BadRequestException('Attachment bundle exceeds 256 files. Narrow the view filters.');
     const bytes: Record<string, Uint8Array> = { 'records.csv': Buffer.from(stringify(csv, { escape_formulas: true })) };
+    if (richText) bytes['export-notes.txt'] = Buffer.from('Rich text fields were exported as plain text.\n');
     const manifest = [['id', 'name', 'sha256', 'bytes', 'path']];
     let total = 0;
     for (const id of attachmentIds) {

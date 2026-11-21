@@ -17,13 +17,18 @@
     "@suzubase/shared-types": "workspace:*",
     "csv-parse": "^7.0.3",
     "csv-stringify": "^6.9.0",
+    "decimal.js": "^10.6.0",
     "fflate": "^0.8.3",
+    "he": "^2.0.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
+    "sanitize-html": "^2.18.2",
     "zod": "^4.1.0"
   },
   "devDependencies": {
+    "@types/he": "^1.2.3",
     "@types/node": "^24.0.0",
+    "@types/sanitize-html": "^2.16.2",
     "typescript": "^5.9.3"
   }
 }

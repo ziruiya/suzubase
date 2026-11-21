@@ -101,3 +101,7 @@ dd { white-space: pre-wrap; }
   .save-bar { justify-content: stretch; }
   .save-bar button { flex: 1 1 120px; }
 }
+
+.rich-text-editor { min-height: 6rem; padding: .6rem; border: 1px solid currentColor; border-radius: .25rem; }
+.rich-text-editor, .rich-text-value { overflow-wrap: anywhere; }
+.layout-blank { min-height: 1.5rem; }
