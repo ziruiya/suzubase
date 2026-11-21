@@ -368,3 +368,20 @@ export const recordSearchValues = pgTable('record_search_values', {
   foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.fieldId], foreignColumns: [fields.tenantId, fields.appId, fields.fieldId] }),
 ]);
+
+export const csvJobs = pgTable('csv_jobs', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  userId: uuid('user_id').notNull(),
+  schemaVersion: integer('schema_version').notNull(),
+  rows: jsonb().$type<{ line: number; data: RecordData }[]>().notNull(),
+  headers: jsonb().$type<string[]>().notNull(),
+  errors: jsonb().$type<{ line: number; cells: string[]; issues: unknown[] }[]>().notNull(),
+  lookupColumns: jsonb('lookup_columns').$type<string[]>().notNull(),
+  imported: integer().notNull().default(0),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.userId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.schemaVersion], foreignColumns: [appVersions.tenantId, appVersions.appId, appVersions.version] }),
+]);

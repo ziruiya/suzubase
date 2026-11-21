@@ -7,11 +7,12 @@ export async function writeRecordEvent(
   record: RecordResponse,
   kind: 'created' | 'updated' | 'deleted' | 'restored',
   changes: FieldChange[],
+  source: 'api' | 'import' = 'api',
 ): Promise<void> {
   const scope = { tenantId: context.tenantId, appId: record.appId };
   const [{ eventId }] = await tx.insert(recordEvents).values({
     ...scope, recordId: record.id, recordRevision: record.revision, schemaVersion: record.schemaVersion,
-    actorId: context.userId, source: 'api', kind, changes,
+    actorId: context.userId, source, kind, changes,
   }).returning({ eventId: recordEvents.eventId });
   await tx.insert(outbox).values({ ...scope, eventId, topic: `record.${kind}` });
 }

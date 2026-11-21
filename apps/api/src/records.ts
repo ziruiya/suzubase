@@ -134,53 +134,73 @@ export class RecordService {
 
   async create(context: TenantContext, appId: string, input: z.infer<typeof createInput>, key?: string) {
     return withTenantTransaction(context, async (tx) => {
-      const { app, access } = await this.appSchema.writable(tx, context, appId, 'create');
-      const schemaVersion = app.publishedSchemaVersion;
-      this.assertEditable(access, input.data);
-      const identity = { tenantId: context.tenantId, appId };
-      const counterScope = and(eq(appCounters.tenantId, context.tenantId), eq(appCounters.appId, appId));
-      if (key !== undefined) {
-        // Serialize key lookup and insertion on the same per-app row used for number allocation.
-        await tx.select({ appId: appCounters.appId }).from(appCounters).where(counterScope).for('update');
-        const [previous] = await tx.select({ response: recordCreateKeys.response }).from(recordCreateKeys).where(and(
-          eq(recordCreateKeys.tenantId, context.tenantId), eq(recordCreateKeys.appId, appId),
-          eq(recordCreateKeys.userId, context.userId), eq(recordCreateKeys.key, key),
-        ));
-        if (previous) {
-          await this.findRecord(tx, context, appId, previous.response.id);
-          return this.visibleRecord(access, previous.response);
+      const grant = await this.appSchema.writable(tx, context, appId, 'create');
+      return this.persistCreate(tx, context, appId, input.data, grant, 'api', key);
+    });
+  }
+
+  async persistCreate(
+    tx: TenantTransaction, context: TenantContext, appId: string, input: RecordData,
+    { app, access, fields }: Awaited<ReturnType<AppSchemaService['writable']>>,
+    source: 'api' | 'import', key?: string,
+  ) {
+    const schemaVersion = app.publishedSchemaVersion;
+    this.assertEditable(access, input);
+    const identity = { tenantId: context.tenantId, appId };
+    const counterScope = and(eq(appCounters.tenantId, context.tenantId), eq(appCounters.appId, appId));
+    if (key !== undefined) {
+      // Serialize key lookup and insertion on the same per-app row used for number allocation.
+      await tx.select({ appId: appCounters.appId }).from(appCounters).where(counterScope).for('update');
+      const [previous] = await tx.select({ response: recordCreateKeys.response }).from(recordCreateKeys).where(and(
+        eq(recordCreateKeys.tenantId, context.tenantId), eq(recordCreateKeys.appId, appId),
+        eq(recordCreateKeys.userId, context.userId), eq(recordCreateKeys.key, key),
+      ));
+      if (previous) {
+        await this.findRecord(tx, context, appId, previous.response.id);
+        return this.visibleRecord(access, previous.response);
+      }
+    }
+
+    const preserved = new Map<string, string>();
+    const fieldData: RecordData = { ...input };
+    if (source === 'import') {
+      for (const field of fields) {
+        if (field.autoNumber && Object.hasOwn(fieldData, field.fieldId)) {
+          if (fieldData[field.fieldId]) preserved.set(field.fieldId, fieldData[field.fieldId]);
+          delete fieldData[field.fieldId];
         }
       }
-
-      const data = await this.normalizeData(tx, context, appId, schemaVersion, input.data);
-      for (const field of await this.appSchema.getFields(tx, context, appId, schemaVersion)) {
-        const config = field.autoNumber;
-        if (!config?.enabled) continue;
-        const scope = numberScope(config, data);
-        const number = await assignAutoNumber(tx, context, appId, field.fieldId, config, scope);
-        if (number) data[field.fieldId] = number;
-      }
-      const [counter] = await tx.update(appCounters).set({ lastValue: sql`${appCounters.lastValue} + 1` })
-        .where(counterScope).returning({ recordNo: appCounters.lastValue });
-      const [row] = await tx.insert(records).values({
-        ...identity, recordNo: counter.recordNo, schemaVersion, data,
-        createdBy: context.userId, updatedBy: context.userId,
-      }).returning();
-      const record = serializeRecord(row);
-      await this.reserveUniqueValues(tx, context, record);
-      await this.reconcileFiles(tx, context, record);
-      await this.search.project(tx, context, record, await this.appSchema.getFields(tx, context, appId, schemaVersion));
-      await writeRecordEvent(tx, context, record, 'created', fieldChanges({}, data));
-      if (key !== undefined) {
-        await tx.insert(recordCreateKeys).values({
-          ...identity, userId: context.userId, key, recordId: record.id, response: record,
-        });
-      }
-      if (access.acl.record.some(({ action }) => action === 'view')) {
-        return this.findRecord(tx, context, appId, record.id);
-      }
-      return this.visibleRecord(access, record);
-    });
+    }
+    const data = await this.normalizeData(tx, context, appId, schemaVersion, fieldData);
+    for (const field of fields) {
+      const config = field.autoNumber;
+      const supplied = preserved.get(field.fieldId);
+      if (!config || (!config.enabled && supplied === undefined)) continue;
+      const scope = numberScope(config, data);
+      const number = await assignAutoNumber(tx, context, appId, field.fieldId, config, scope, supplied);
+      if (number) data[field.fieldId] = number;
+    }
+    const [counter] = await tx.update(appCounters).set({ lastValue: sql`${appCounters.lastValue} + 1` })
+      .where(counterScope).returning({ recordNo: appCounters.lastValue });
+    const [row] = await tx.insert(records).values({
+      ...identity, recordNo: counter.recordNo, schemaVersion, data,
+      createdBy: context.userId, updatedBy: context.userId,
+    }).returning();
+    const record = serializeRecord(row);
+    await this.reserveUniqueValues(tx, context, record);
+    await this.reconcileFiles(tx, context, record);
+    await this.search.project(tx, context, record, fields);
+    await writeRecordEvent(tx, context, record, 'created', fieldChanges({}, data), source);
+    if (key !== undefined) {
+      await tx.insert(recordCreateKeys).values({
+        ...identity, userId: context.userId, key, recordId: record.id, response: record,
+      });
+    }
+    if (source === 'import') return this.visibleRecord(access, record);
+    if (access.acl.record.some(({ action }) => action === 'view')) {
+      return this.findRecord(tx, context, appId, record.id);
+    }
+    return this.visibleRecord(access, record);
   }
 
   async get(context: TenantContext, appId: string, recordId: string) {

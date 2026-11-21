@@ -6,6 +6,7 @@ import { TenantAdminController, TenantAdminService } from './tenant-admin';
 import { AuthorizationService } from './authorization';
 import { AppSchemaController, AppSchemaService } from './app-schema';
 import { FileController, FileService, maxAttachmentBytes } from './files';
+import { CsvController, CsvService } from './csv';
 import { SearchService } from './search';
 import { RecordQueryService } from './record-query';
 import { RecordService, RecordsController } from './records';
@@ -36,8 +37,8 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController, AppSchemaController, RecordsController, TenantAdminController, FileController],
-  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, TenantAdminService, FileService, SearchService],
+  controllers: [HealthController, SessionController, AppSchemaController, RecordsController, TenantAdminController, FileController, CsvController],
+  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, TenantAdminService, FileService, SearchService, CsvService],
 })
 class AppModule {}
 

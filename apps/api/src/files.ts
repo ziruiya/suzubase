@@ -116,7 +116,7 @@ export class FileService {
     }
   }
 
-  async download(context: TenantContext, appId: string, id: string) {
+  async readAuthorized(context: TenantContext, appId: string, id: string) {
     const file = await withTenantTransaction(context, async (tx) => {
       const { access, fields } = await this.schema.access(tx, context, appId, 'view');
       const fieldIds = fields.filter(({ fieldId, type }) => type === 'attachment' &&
@@ -134,6 +134,11 @@ export class FileService {
       return found.file;
     });
     const data = await this.storage.read(this.storageKey(context.tenantId, appId, id), file.sha256!);
+    return { file, data };
+  }
+
+  async download(context: TenantContext, appId: string, id: string) {
+    const { file, data } = await this.readAuthorized(context, appId, id);
     return new StreamableFile(data, {
       type: 'application/octet-stream',
       disposition: "attachment; filename*=UTF-8''" + encodeURIComponent(file.name).replace(/[!'()*]/g,
