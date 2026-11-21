@@ -6,7 +6,7 @@ import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, recordReferences, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { fieldTypes, optionFieldTypes } from '@suzubase/shared-types';
+import { fieldContract, fieldTypes, optionFieldTypes } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AuthorizationService } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
@@ -31,9 +31,10 @@ const settingsInput = z.strictObject({
   [settings.description, settings.icon, settings.adminMemo].every((value) => !value || !/[\x00\p{Surrogate}]/u.test(value)));
 const option = z.strictObject({ value: z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,63}$/i), label: metadata.name, disabled: z.boolean().default(false) });
 const fieldInput = z.strictObject({
-  ...metadata, type: z.enum(fieldTypes), required: z.boolean().default(false), options: z.array(option).max(200).default([]),
+  ...metadata, type: z.enum(fieldTypes), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
 }).refine(({ options, type }) => optionFieldTypes.has(type) === (options.length > 0)
-  && new Set(options.map(({ value }) => value)).size === options.length, { path: ['options'] });
+  && new Set(options.map(({ value }) => value)).size === options.length, { path: ['options'] })
+  .refine(({ type, uniqueValue }) => !uniqueValue || fieldContract[type].unique, { path: ['uniqueValue'] });
 const metadataProperties = {
   code: { type: 'string', pattern: codePattern.source },
   name: { type: 'string', minLength: 1, maxLength: 120 },
@@ -142,8 +143,8 @@ export class AppSchemaService {
         await tx.insert(appVersions).values({ ...identity, version: 1 });
         await tx.insert(appCounters).values(identity);
         const definitions = await this.getFields(tx, context, appId, source.publishedSchemaVersion);
-        for (const { fieldId, code, name, type, required, options } of definitions) {
-          const [field] = await tx.insert(fields).values({ ...identity, code, name, type, required, options, introducedIn: 1 }).returning();
+        for (const { fieldId, code, name, type, required, uniqueValue, options } of definitions) {
+          const [field] = await tx.insert(fields).values({ ...identity, code, name, type, required, uniqueValue, options, introducedIn: 1 }).returning();
           if (source.titleFieldId === fieldId) copy.titleFieldId = field.fieldId;
         }
         if (copy.titleFieldId) await tx.update(apps).set({ titleFieldId: copy.titleFieldId })
@@ -173,7 +174,7 @@ export class AppSchemaService {
   }
 
   getFields(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
-    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required, options: fields.options })
+    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required, uniqueValue: fields.uniqueValue, options: fields.options })
       .from(fields).where(and(
         eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), lte(fields.introducedIn, version),
       )).orderBy(fields.introducedIn, fields.code);

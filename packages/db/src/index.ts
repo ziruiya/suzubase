@@ -2,9 +2,9 @@ import { sql } from 'drizzle-orm';
 import { drizzle, NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
 
-export { and, eq, isNull, lte, sql } from 'drizzle-orm';
+export { and, eq, isNull, lte, gt, sql } from 'drizzle-orm';
 export {
-  apps, appCounters, appVersions, fields, outbox, recordCreateKeys, recordEvents, records, recordReferences,
+  apps, appCounters, appVersions, fields, outbox, recordCreateKeys, recordEvents, recordUniqueValues, records, recordReferences,
   groupMembers, loginCredentials, memberGroups, organizations, tenantMembers, tenants, users,
 } from './schema';
 

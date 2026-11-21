@@ -5,7 +5,7 @@ export async function writeRecordEvent(
   tx: TenantTransaction,
   context: TenantContext,
   record: RecordResponse,
-  kind: 'created' | 'updated',
+  kind: 'created' | 'updated' | 'deleted' | 'restored',
   changes: FieldChange[],
 ): Promise<void> {
   const scope = { tenantId: context.tenantId, appId: record.appId };

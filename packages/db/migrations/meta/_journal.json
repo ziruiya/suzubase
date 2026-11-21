@@ -57,6 +57,13 @@
       "when": 1795265332118,
       "tag": "0007_gate1_field_contract",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1795265332119,
+      "tag": "0008_gate1_record_lifecycle",
+      "breakpoints": true
     }
   ]
 }

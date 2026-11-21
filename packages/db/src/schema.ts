@@ -114,6 +114,7 @@ export const fields = pgTable('fields', {
   name: text().notNull(),
   type: fieldType().notNull(),
   required: boolean().notNull().default(false),
+  uniqueValue: boolean('unique_value').notNull().default(false),
   options: jsonb().$type<FieldOption[]>().notNull().default(sql`'[]'::jsonb`),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.fieldId] }),
@@ -256,4 +257,17 @@ export const groupMembers = pgTable('group_members', {
   primaryKey({ columns: [t.tenantId, t.groupId, t.userId] }),
   foreignKey({ columns: [t.tenantId, t.groupId], foreignColumns: [memberGroups.tenantId, memberGroups.id] }),
   foreignKey({ columns: [t.tenantId, t.userId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
+export const recordUniqueValues = pgTable('record_unique_values', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  fieldId: uuid('field_id').notNull(),
+  normalizedValue: text('normalized_value').notNull(),
+  recordId: uuid('record_id').notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.fieldId, t.normalizedValue] }),
+  index().on(t.tenantId, t.appId, t.recordId),
+  foreignKey({ columns: [t.tenantId, t.appId, t.fieldId], foreignColumns: [fields.tenantId, fields.appId, fields.fieldId] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
 ]);

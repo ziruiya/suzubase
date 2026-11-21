@@ -1,13 +1,13 @@
 import {
-  BadRequestException, Body, ConflictException, Controller, Get, Headers, Injectable,
-  NotFoundException, Param, Post, Put, UseGuards,
+  BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Injectable,
+  NotFoundException, Param, Post, Put, Query, UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiConflictResponse, ApiHeader, ApiTags } from '@nestjs/swagger';
 import {
-  and, appCounters, apps, eq, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, records, sql, TenantContext,
-  TenantTransaction, withTenantTransaction,
+  and, appCounters, apps, eq, gt, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordUniqueValues, records, sql, TenantContext,
+  TenantTransaction, users, withTenantTransaction,
 } from '@suzubase/db';
-import { FieldChange, RecordData, RecordResponse } from '@suzubase/shared-types';
+import { FieldChange, multiOptionFieldTypes, RecordData, RecordResponse } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
@@ -19,6 +19,11 @@ import { identifier, parseInput } from './validation';
 const dataInput = z.record(identifier, z.string());
 const createInput = z.strictObject({ data: dataInput });
 const updateInput = z.strictObject({ data: dataInput, revision: z.int().min(1).max(2147483647) });
+const revisionInput = updateInput.pick({ revision: true });
+const pageInput = z.strictObject({
+  after: z.string().regex(/^[0-9]{1,19}$/).refine((value) => BigInt(value) <= 9223372036854775807n).optional(),
+  limit: z.string().regex(/^[1-9][0-9]{0,2}$/).transform(Number).pipe(z.number().max(100)).optional(),
+});
 const keyPattern = /^[!-~]{1,128}$/;
 const createKey = z.string().regex(keyPattern).optional();
 const dataSchema = {
@@ -71,7 +76,8 @@ export class RecordService {
       }
     }
     for (const field of definitions) {
-      if (field.required && ['', '[]', undefined].includes(normalizedData[field.fieldId])) {
+      const value = normalizedData[field.fieldId];
+      if (field.required && (!value || (multiOptionFieldTypes.has(field.type) && value === '[]'))) {
         errors.push({ field: field.fieldId, message: 'Required field' });
       }
     }
@@ -116,7 +122,10 @@ export class RecordService {
           eq(recordCreateKeys.tenantId, context.tenantId), eq(recordCreateKeys.appId, appId),
           eq(recordCreateKeys.userId, context.userId), eq(recordCreateKeys.key, key),
         ));
-        if (previous) return previous.response;
+        if (previous) {
+          await this.findRecord(tx, context, appId, previous.response.id);
+          return previous.response;
+        }
       }
 
       const data = await this.normalizeData(tx, context, appId, schemaVersion, input.data);
@@ -127,6 +136,7 @@ export class RecordService {
         createdBy: context.userId, updatedBy: context.userId,
       }).returning();
       const record = serializeRecord(row);
+      await this.reserveUniqueValues(tx, context, record);
       await writeRecordEvent(tx, context, record, 'created', fieldChanges({}, data));
       if (key !== undefined) {
         await tx.insert(recordCreateKeys).values({
@@ -141,12 +151,12 @@ export class RecordService {
     return withTenantTransaction(context, (tx) => this.findRecord(tx, context, appId, recordId));
   }
 
-  private async findRecord(tx: TenantTransaction, context: TenantContext, appId: string, recordId: string) {
+  private async findRecord(tx: TenantTransaction, context: TenantContext, appId: string, recordId: string, deleted = false) {
     const [result] = await tx.select({ record: records }).from(records)
       .innerJoin(apps, and(
         eq(apps.tenantId, records.tenantId), eq(apps.id, records.appId),
         this.authorization.appScope(context, appId),
-      )).where(and(eq(records.id, recordId), isNull(records.deletedAt)));
+      )).where(and(eq(records.id, recordId), deleted ? sql`${records.deletedAt} IS NOT NULL` : isNull(records.deletedAt)));
     if (!result) throw new NotFoundException();
     return serializeRecord(result.record);
   }
@@ -165,8 +175,114 @@ export class RecordService {
       )).returning();
       if (!row) this.rejectRevision(await this.findRecord(tx, context, appId, recordId));
       const updated = serializeRecord(row);
+      await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, recordId));
+      await this.reserveUniqueValues(tx, context, updated);
       await writeRecordEvent(tx, context, updated, 'updated', fieldChanges(current.data, data));
       return updated;
+    });
+  }
+
+  private uniqueValuesScope(context: TenantContext, appId: string, recordId: string) {
+    return and(eq(recordUniqueValues.tenantId, context.tenantId),
+      eq(recordUniqueValues.appId, appId), eq(recordUniqueValues.recordId, recordId));
+  }
+
+  private async reserveUniqueValues(tx: TenantTransaction, context: TenantContext, record: RecordResponse) {
+    const definitions = await this.appSchema.getFields(tx, context, record.appId, record.schemaVersion);
+    for (const field of definitions) {
+      const value = record.data[field.fieldId];
+      if (!field.uniqueValue || !value) continue;
+      const normalizedValue = value.normalize('NFKC').toLowerCase();
+      // Bound the indexed key in bytes for PostgreSQL's btree entry size.
+      if (Buffer.byteLength(normalizedValue) > 1000) {
+        throw new BadRequestException([{ field: field.fieldId, message: 'Unique value is too long' }]);
+      }
+      const identity = { tenantId: context.tenantId, appId: record.appId, fieldId: field.fieldId, normalizedValue };
+      const [inserted] = await tx.insert(recordUniqueValues).values({ ...identity, recordId: record.id })
+        .onConflictDoNothing().returning({ recordId: recordUniqueValues.recordId });
+      if (!inserted) {
+        const [holder] = await tx.select({ recordId: recordUniqueValues.recordId }).from(recordUniqueValues).where(and(
+          eq(recordUniqueValues.tenantId, identity.tenantId), eq(recordUniqueValues.appId, identity.appId),
+          eq(recordUniqueValues.fieldId, identity.fieldId), eq(recordUniqueValues.normalizedValue, normalizedValue),
+        ));
+        throw new ConflictException({ field: field.fieldId, message: 'Unique value is occupied', recordId: holder?.recordId });
+      }
+    }
+  }
+
+  async list(context: TenantContext, appId: string, { after, limit = 50 }: z.infer<typeof pageInput>) {
+    return withTenantTransaction(context, async (tx) => {
+      const [app] = await tx.select({ id: apps.id }).from(apps).where(this.authorization.appScope(context, appId));
+      if (!app) throw new NotFoundException();
+      const rows = await tx.select().from(records).where(and(
+        eq(records.tenantId, context.tenantId), eq(records.appId, appId), isNull(records.deletedAt),
+        after === undefined ? undefined : gt(records.recordNo, BigInt(after)),
+      )).orderBy(records.recordNo).limit(limit + 1);
+      return {
+        items: rows.slice(0, limit).map(serializeRecord),
+        nextCursor: rows.length > limit ? rows[limit - 1].recordNo.toString() : null,
+      };
+    });
+  }
+
+  async batchCreate(context: TenantContext, appId: string, inputs: z.infer<typeof createInput>[]) {
+    const results = [];
+    for (const [index, input] of inputs.entries()) {
+      try {
+        results.push({ index, record: await this.create(context, appId, input) });
+      } catch (error) {
+        if (!(error instanceof BadRequestException || error instanceof ConflictException || error instanceof NotFoundException)) throw error;
+        results.push({ index, status: error.getStatus(), error: error.getResponse() });
+      }
+    }
+    return { results };
+  }
+
+  async changeLifecycle(context: TenantContext, appId: string, id: string, revision: number, restore: boolean) {
+    return withTenantTransaction(context, async (tx) => {
+      if (restore && !await this.authorization.requireRecycleAccess(tx, context)) throw new ForbiddenException('无权限');
+      await this.appSchema.publishedVersion(tx, context, appId);
+      const current = await this.findRecord(tx, context, appId, id, restore);
+      if (current.revision !== revision) this.rejectRevision(current);
+      const [row] = await tx.update(records).set({
+        revision: sql`${records.revision} + 1`, updatedBy: context.userId, updatedAt: sql`clock_timestamp()`,
+        deletedAt: restore ? null : sql`clock_timestamp()`, deletedBy: restore ? null : context.userId,
+      }).where(and(
+        eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, id), eq(records.revision, revision),
+      )).returning();
+      if (!row) throw new ConflictException('The record changed');
+      const record = serializeRecord(row);
+      if (restore) await this.reserveUniqueValues(tx, context, record);
+      else await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, id));
+      await writeRecordEvent(tx, context, record, restore ? 'restored' : 'deleted', []);
+      return record;
+    });
+  }
+
+  async history(context: TenantContext, appId: string, id: string) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.findRecord(tx, context, appId, id);
+      const events = await tx.select({
+        event: recordEvents, name: users.displayName, email: users.email, disabledAt: tenantMembers.disabledAt,
+      }).from(recordEvents).innerJoin(users, and(
+        eq(users.tenantId, recordEvents.tenantId), eq(users.id, recordEvents.actorId),
+      )).innerJoin(tenantMembers, and(
+        eq(tenantMembers.tenantId, users.tenantId), eq(tenantMembers.userId, users.id),
+      )).where(and(
+        eq(recordEvents.tenantId, context.tenantId), eq(recordEvents.appId, appId), eq(recordEvents.recordId, id),
+      )).orderBy(recordEvents.recordRevision);
+      const schemas = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
+      for (const { event } of events) {
+        if (!schemas.has(event.schemaVersion)) {
+          schemas.set(event.schemaVersion, await this.appSchema.getFields(tx, context, appId, event.schemaVersion));
+        }
+      }
+      return {
+        events: events.map(({ event, name, email, disabledAt }) => ({
+          ...event, actorLabel: (name ?? email) + (disabledAt ? '（已停用）' : ''),
+        })),
+        schemas: Object.fromEntries(schemas),
+      };
     });
   }
 
@@ -197,6 +313,36 @@ export class RecordsController {
     @Body() body: unknown, @Headers('idempotency-key') key: unknown,
   ) {
     return this.service.create(context, parseInput(identifier, appId), parseInput(createInput, body), parseInput(createKey, key));
+  }
+
+  @Get()
+  list(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
+    return this.service.list(context, parseInput(identifier, appId), parseInput(pageInput, query));
+  }
+
+  @Post('batch')
+  batch(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown) {
+    const { items } = parseInput(z.strictObject({ items: z.array(createInput).min(1).max(100) }), body);
+    return this.service.batchCreate(context, parseInput(identifier, appId), items);
+  }
+
+  @Delete(':recordId')
+  remove(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('recordId') id: string, @Body() body: unknown) {
+    const { revision } = parseInput(revisionInput, body);
+    return this.service.changeLifecycle(context, parseInput(identifier, appId), parseInput(identifier, id), revision, false);
+  }
+
+  @Post(':recordId/restore')
+  restore(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('recordId') id: string, @Body() body: unknown) {
+    const { revision } = parseInput(revisionInput, body);
+    return this.service.changeLifecycle(context, parseInput(identifier, appId), parseInput(identifier, id), revision, true);
+  }
+
+  @Get(':recordId/history')
+  history(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') id: string) {
+    return this.service.history(context, parseInput(identifier, appId), parseInput(identifier, id));
   }
 
   @Get(':recordId')
