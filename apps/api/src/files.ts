@@ -10,12 +10,12 @@ import { z } from 'zod';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
 import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
-import { LocalStorageAdapter, StorageAdapter } from './storage';
+import { attachmentKey, localAttachmentStorage } from './storage';
 import { identifier, parseInput } from './validation';
 
 export const attachmentTypes = ['image/png', 'image/jpeg', 'application/pdf'] as const;
 export const maxAttachmentBytes = 8 * 1024 * 1024;
-export const fileIds = z.array(identifier).max(25).refine((ids) => new Set(ids).size === ids.length);
+export const fileIds = z.array(identifier).refine((ids) => new Set(ids).size === ids.length);
 const uploadInput = z.strictObject({
   name: z.string().min(1).max(240).refine((name) => !/[\x00-\x1f\x7f/\\\p{Surrogate}]/u.test(name)),
   type: z.enum(attachmentTypes),
@@ -30,16 +30,12 @@ function hasSignature(type: (typeof attachmentTypes)[number], data: Buffer) {
 
 @Injectable()
 export class FileService {
-  private readonly storage: StorageAdapter = new LocalStorageAdapter(process.env.ATTACHMENT_DIRECTORY ?? './attachments');
+  private readonly storage = localAttachmentStorage();
 
   constructor(private readonly schema: AppSchemaService, private readonly authorization: AuthorizationService) {}
 
   private fileScope(tenantId: string, appId: string, id: string) {
     return and(eq(files.tenantId, tenantId), eq(files.appId, appId), eq(files.id, id));
-  }
-
-  private storageKey(tenantId: string, appId: string, id: string) {
-    return [tenantId, appId, id, 1].join('/').toLowerCase();
   }
 
   async upload(context: TenantContext, appId: string, input: z.infer<typeof uploadInput>, body: Buffer) {
@@ -61,10 +57,13 @@ export class FileService {
       }).returning();
       return file;
     });
-    const key = this.storageKey(tenantId, appId, pending.id);
+    const key = attachmentKey(tenantId, appId, pending.id);
     try {
-      const result = await this.storage.put(key, body);
       return await withTenantTransaction(context, async (tx) => {
+        const [temporary] = await tx.select({ id: files.id }).from(files)
+          .where(and(this.fileScope(tenantId, appId, pending.id), eq(files.state, 'TEMPORARY'))).for('update');
+        if (!temporary) throw new Error('Pending file expired during upload');
+        const result = await this.storage.put(key, body);
         const [ready] = await tx.update(files).set({ state: 'READY', sha256: result.sha256 })
           .where(and(this.fileScope(tenantId, appId, pending.id), eq(files.state, 'TEMPORARY')))
           .returning({ id: files.id, state: files.state, name: files.name, bytes: files.bytes, sha256: files.sha256 });
@@ -77,7 +76,7 @@ export class FileService {
       await withTenantTransaction(context, async (tx) => {
         const [failed] = await tx.update(files).set({ state: 'DELETED', deletedAt: sql`clock_timestamp()` })
           .where(and(this.fileScope(tenantId, appId, pending.id), eq(files.state, 'TEMPORARY'))).returning();
-        if (failed) await this.storage.remove(key);
+        if (failed) await this.storage.removeIncomplete(key);
       });
       throw error;
     }
@@ -96,7 +95,19 @@ export class FileService {
     const [app] = await tx.select({ limit: apps.attachmentMaxCount }).from(apps).where(and(
       eq(apps.tenantId, tenantId), eq(apps.id, appId),
     ));
-    if (requested.length > app.limit) throw new BadRequestException('Too many attachments for this application');
+    if (requested.length > app.limit) {
+      const overflow = requested.slice(app.limit);
+      const names = await tx.select({ id: files.id, name: files.name }).from(files).where(and(
+        eq(files.tenantId, tenantId), eq(files.appId, appId), eq(files.uploadedBy, context.userId),
+        inArray(files.id, [...new Set(overflow.map(({ fileId }) => fileId))]),
+      ));
+      const byId = new Map(names.map(({ id, name }) => [id, name]));
+      throw new BadRequestException({
+        message: 'Attachment limit exceeded: ' + overflow.map(({ fileId }) => byId.get(fileId) ?? fileId).join(', '),
+        limit: app.limit,
+        files: overflow.map(({ fieldId, fileId }) => ({ fieldId, fileId, name: byId.get(fileId) ?? null })),
+      });
+    }
     for (const target of requested.filter((item) => !current.some((entry) => same(item, entry)))) {
       const scope = this.fileScope(tenantId, appId, target.fileId);
       const [file] = await tx.select().from(files).where(scope).for('update');
@@ -118,7 +129,7 @@ export class FileService {
   }
 
   async readAuthorized(context: TenantContext, appId: string, id: string) {
-    const file = await withTenantTransaction(context, async (tx) => {
+    return withTenantTransaction(context, async (tx) => {
       const { access, fields } = await this.schema.access(tx, context, appId, 'view');
       const fieldIds = fields.filter(({ fieldId, type }) => type === 'attachment' &&
         this.authorization.fieldDecision(access, fieldId, 'view').allowed).map(({ fieldId }) => fieldId);
@@ -130,12 +141,11 @@ export class FileService {
       )).innerJoin(records, and(
         eq(records.tenantId, fileReferences.tenantId), eq(records.appId, fileReferences.appId), eq(records.id, fileReferences.recordId),
       )).where(and(this.fileScope(context.tenantId, appId, id), eq(files.state, 'ATTACHED'), isNull(records.deletedAt),
-        inArray(fileReferences.fieldId, fieldIds), this.authorization.recordScope(access, 'view'))).limit(1);
+        inArray(fileReferences.fieldId, fieldIds), this.authorization.recordScope(access, 'view'))).limit(1).for('share', { of: files });
       if (!found?.file.sha256) throw new NotFoundException('无权限');
-      return found.file;
+      const data = await this.storage.read(attachmentKey(context.tenantId, appId, id), found.file.sha256);
+      return { file: found.file, data };
     });
-    const data = await this.storage.read(this.storageKey(context.tenantId, appId, id), file.sha256!);
-    return { file, data };
   }
 
   async download(context: TenantContext, appId: string, id: string) {

@@ -63,3 +63,11 @@ export async function withTenantTransaction<T>(
     return callback(transaction);
   });
 }
+
+// Maintenance processes discover tenant identifiers, then use ordinary RLS transactions for all task data.
+export async function maintenanceTenants() {
+  const { rows } = await pool.query<{ tenantId: string }>('SELECT tenant_id AS "tenantId" FROM authentication.maintenance_tenants()');
+  return rows.map(({ tenantId }) => Object.freeze({
+    tenantId, userId: '00000000-0000-0000-0000-000000000000',
+  }));
+}

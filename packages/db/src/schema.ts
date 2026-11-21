@@ -310,6 +310,7 @@ export const files = pgTable('files', {
   referenceCount: integer('reference_count').notNull().default(0),
   createdAt: time('created_at').notNull().defaultNow(),
   deletedAt: time('deleted_at'),
+  purgedAt: time('purged_at'),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
   foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
