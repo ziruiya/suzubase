@@ -33,6 +33,8 @@ services:
     command: pnpm --filter @suzubase/api start
     environment:
       DATABASE_URL: postgres://suzubase_runtime:suzubase-runtime-dev@postgres:5432/suzubase
+    volumes:
+      - attachment-data:/workspace/attachments
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -51,3 +53,4 @@ services:
 
 volumes:
   postgres-data:
+  attachment-data:

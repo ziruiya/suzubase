@@ -5,6 +5,7 @@ import { SessionController, SessionGuard } from './identity';
 import { TenantAdminController, TenantAdminService } from './tenant-admin';
 import { AuthorizationService } from './authorization';
 import { AppSchemaController, AppSchemaService } from './app-schema';
+import { FileController, FileService, maxAttachmentBytes } from './files';
 import { RecordQueryService } from './record-query';
 import { RecordService, RecordsController } from './records';
 import { Controller, Get, Module, ServiceUnavailableException } from '@nestjs/common';
@@ -34,13 +35,16 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController, AppSchemaController, RecordsController, TenantAdminController],
-  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, TenantAdminService],
+  controllers: [HealthController, SessionController, AppSchemaController, RecordsController, TenantAdminController, FileController],
+  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, TenantAdminService, FileService],
 })
 class AppModule {}
 
 async function main() {
-  const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter());
+  const adapter = new FastifyAdapter();
+  const app = await NestFactory.create<NestFastifyApplication>(AppModule, adapter);
+  adapter.getInstance().addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: maxAttachmentBytes },
+    (_request, body, done) => done(null, body));
   const config = new DocumentBuilder().setTitle('SuzuBase').setVersion('0').addBearerAuth().build();
   SwaggerModule.setup('docs', app, () => SwaggerModule.createDocument(app, config));
   await app.listen(Number(process.env.PORT ?? 3000), '0.0.0.0');

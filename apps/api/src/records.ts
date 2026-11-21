@@ -14,6 +14,7 @@ import { AuthorizationService } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
 import { RecordQueryService } from './record-query';
 import { writeRecordEvent } from './record-events';
+import { FileService, fileIds } from './files';
 import { normalizeValue } from './field-values';
 import { identifier, parseInput } from './validation';
 
@@ -56,6 +57,7 @@ export class RecordService {
     private readonly appSchema: AppSchemaService,
     private readonly authorization: AuthorizationService,
     private readonly query: RecordQueryService,
+    private readonly files: FileService,
   ) {}
 
   private async normalizeData(
@@ -71,7 +73,17 @@ export class RecordService {
         errors.push({ field: fieldId, message: 'Unknown field' });
         continue;
       }
-      const normalized = value === '' && field.type !== 'number' ? '' : normalizeValue(field.type, value, field.options);
+      let normalized: string | undefined;
+      if (field.type === 'attachment') {
+        try {
+          const parsed = fileIds.safeParse(JSON.parse(value || '[]'));
+          if (parsed.success) normalized = JSON.stringify(parsed.data);
+        } catch {
+          normalized = undefined;
+        }
+      } else {
+        normalized = value === '' && field.type !== 'number' ? '' : normalizeValue(field.type, value, field.options);
+      }
       if (normalized === undefined || !await this.validDirectoryValue(tx, context, field.type, normalized)) {
         errors.push({ field: fieldId, message: `Invalid ${field.type} value` });
       } else {
@@ -80,7 +92,7 @@ export class RecordService {
     }
     for (const field of definitions) {
       const value = normalizedData[field.fieldId];
-      if (field.required && (!value || (multiOptionFieldTypes.has(field.type) && value === '[]'))) {
+      if (field.required && (!value || ((multiOptionFieldTypes.has(field.type) || field.type === 'attachment') && value === '[]'))) {
         errors.push({ field: field.fieldId, message: 'Required field' });
       }
     }
@@ -140,6 +152,7 @@ export class RecordService {
       }).returning();
       const record = serializeRecord(row);
       await this.reserveUniqueValues(tx, context, record);
+      await this.reconcileFiles(tx, context, record);
       await writeRecordEvent(tx, context, record, 'created', fieldChanges({}, data));
       if (key !== undefined) {
         await tx.insert(recordCreateKeys).values({
@@ -180,9 +193,18 @@ export class RecordService {
       const updated = serializeRecord(row);
       await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, recordId));
       await this.reserveUniqueValues(tx, context, updated);
+      await this.reconcileFiles(tx, context, updated);
       await writeRecordEvent(tx, context, updated, 'updated', fieldChanges(current.data, data));
       return updated;
     });
+  }
+
+  private async reconcileFiles(tx: TenantTransaction, context: TenantContext, record: RecordResponse) {
+    const definitions = await this.appSchema.getFields(tx, context, record.appId, record.schemaVersion);
+    const attachments = definitions.filter(({ type }) => type === 'attachment').map(({ fieldId }) => ({
+      fieldId, ids: JSON.parse(record.data[fieldId] || '[]') as string[],
+    }));
+    if (attachments.length) await this.files.reconcile(tx, context, record.appId, record.id, attachments);
   }
 
   private uniqueValuesScope(context: TenantContext, appId: string, recordId: string) {

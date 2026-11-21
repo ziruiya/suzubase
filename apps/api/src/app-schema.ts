@@ -30,6 +30,9 @@ const settingsInput = z.strictObject({
   duplicateHint: z.boolean().optional(),
   numericPrecision: z.int().min(0).max(12).optional(),
   adminMemo: z.string().max(4000).optional(),
+  attachmentMaxBytes: z.int().min(1).max(8 * 1024 * 1024).optional(),
+  attachmentMaxCount: z.int().min(0).max(25).optional(),
+  attachmentTypes: z.array(z.enum(['image/png', 'image/jpeg', 'application/pdf'])).max(3).optional(),
 }).refine((settings) => Object.keys(settings).length > 0 &&
   [settings.description, settings.icon, settings.adminMemo].every((value) => !value || !/[\x00\p{Surrogate}]/u.test(value)));
 const option = z.strictObject({ value: z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,63}$/i), label: metadata.name, disabled: z.boolean().default(false) });
@@ -137,9 +140,9 @@ export class AppSchemaService {
       return await withTenantTransaction(context, async (tx) => {
         if (!await this.authorization.canCreateApp(tx, context)) throw new ForbiddenException('无权限');
         const source = await this.managedApp(tx, context, appId);
-        const { description, icon, themeColor, duplicateHint, numericPrecision, adminMemo } = source;
+        const { description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes } = source;
         const [copy] = await tx.insert(apps).values({
-          ...input, description, icon, themeColor, duplicateHint, numericPrecision, adminMemo,
+          ...input, description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes,
           tenantId: context.tenantId, createdBy: context.userId,
         }).returning();
         const identity = { tenantId: context.tenantId, appId: copy.id };

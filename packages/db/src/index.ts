@@ -4,7 +4,7 @@ import { Pool } from 'pg';
 
 export { and, eq, isNull, lte, gt, sql } from 'drizzle-orm';
 export {
-  apps, appCounters, appVersions, fields, outbox, recordCreateKeys, recordEvents, recordUniqueValues, records, recordReferences,
+  apps, appCounters, appVersions, fields, fileReferences, files, outbox, recordCreateKeys, recordEvents, recordUniqueValues, records, recordReferences,
   groupMembers, loginCredentials, memberGroups, organizations, tenantMembers, tenants, users,
 } from './schema';
 

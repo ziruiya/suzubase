@@ -80,6 +80,9 @@ export const apps = pgTable('apps', {
   titleFieldId: uuid('title_field_id'),
   duplicateHint: boolean('duplicate_hint').notNull().default(false),
   numericPrecision: integer('numeric_precision').notNull().default(2),
+  attachmentMaxBytes: integer('attachment_max_bytes').notNull().default(1048576),
+  attachmentMaxCount: integer('attachment_max_count').notNull().default(5),
+  attachmentTypes: jsonb('attachment_types').$type<string[]>().notNull().default(sql`'["image/png","image/jpeg","application/pdf"]'::jsonb`),
   adminMemo: text('admin_memo').notNull().default(''),
   archivedAt: time('archived_at'),
   deletedAt: time('deleted_at'),
@@ -271,4 +274,40 @@ export const recordUniqueValues = pgTable('record_unique_values', {
   index().on(t.tenantId, t.appId, t.recordId),
   foreignKey({ columns: [t.tenantId, t.appId, t.fieldId], foreignColumns: [fields.tenantId, fields.appId, fields.fieldId] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
+]);
+
+export const fileState = pgEnum('file_state', ['TEMPORARY', 'READY', 'ATTACHED', 'DELETED']);
+
+export const files = pgTable('files', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  uploadedBy: uuid('uploaded_by').notNull(),
+  name: text().notNull(),
+  contentType: text('content_type').notNull(),
+  bytes: integer().notNull(),
+  sha256: text(),
+  state: fileState().notNull().default('TEMPORARY'),
+  referenceCount: integer('reference_count').notNull().default(0),
+  createdAt: time('created_at').notNull().defaultNow(),
+  deletedAt: time('deleted_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
+  foreignKey({ columns: [t.tenantId, t.uploadedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  check('file_reference_count_nonnegative', sql`${t.referenceCount} >= 0`),
+]);
+
+export const fileReferences = pgTable('file_references', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  recordId: uuid('record_id').notNull(),
+  fieldId: uuid('field_id').notNull(),
+  fileId: uuid('file_id').notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.recordId, t.fieldId, t.fileId] }),
+  index().on(t.tenantId, t.appId, t.fileId),
+  foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.fieldId], foreignColumns: [fields.tenantId, fields.appId, fields.fieldId] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.fileId], foreignColumns: [files.tenantId, files.appId, files.id] }),
 ]);

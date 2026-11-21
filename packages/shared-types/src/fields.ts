@@ -19,6 +19,7 @@ export const fieldContract = {
   url: { ...scalar, storage: 'HTTP or HTTPS URL' },
   phone: { ...scalar, storage: 'phone display string' },
   email: { ...scalar, storage: 'email display string' },
+  attachment: { ...multiple, filter: false, storage: 'JSON array of file UUIDs', csv: 'attachment manifest' },
   user: { ...scalar, unique: false, storage: 'tenant user UUID' },
   organization: { ...scalar, unique: false, storage: 'tenant organization UUID' },
   group: { ...scalar, unique: false, storage: 'tenant group UUID' },
