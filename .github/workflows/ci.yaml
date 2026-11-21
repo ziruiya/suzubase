@@ -1,0 +1,55 @@
+name: B0 CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: suzubase
+          POSTGRES_PASSWORD: suzubase-ci
+          POSTGRES_DB: suzubase
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U suzubase -d suzubase -h 127.0.0.1"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      ADMIN_DATABASE_URL: postgres://suzubase:suzubase-ci@127.0.0.1:5432/suzubase
+      MIGRATION_DATABASE_URL: postgres://suzubase_migration:suzubase-migration-ci@127.0.0.1:5432/suzubase
+      RUNTIME_DATABASE_PASSWORD: suzubase-runtime-ci
+      DATABASE_URL: postgres://suzubase_runtime:suzubase-runtime-ci@127.0.0.1:5432/suzubase
+      TEST_API_URL: http://127.0.0.1:3000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.1
+      - name: Install pnpm
+        run: |
+          npm install --global --prefix "$RUNNER_TEMP/suzubase-tools" "$(node -p 'require("./package.json").packageManager')"
+          echo "$RUNNER_TEMP/suzubase-tools/bin" >> "$GITHUB_PATH"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - run: pnpm -r typecheck
+      - name: Migrate and run integration tests
+        run: |
+          pnpm --filter @suzubase/db migrate
+          node apps/api/dist/main.js > "$RUNNER_TEMP/suzubase-api.log" 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+          curl --retry 12 --retry-all-errors --retry-delay 1 -fsS "$TEST_API_URL/health"
+          pnpm test
+      - name: API logs
+        if: failure()
+        run: test ! -f "$RUNNER_TEMP/suzubase-api.log" || cat "$RUNNER_TEMP/suzubase-api.log"

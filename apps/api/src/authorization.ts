@@ -10,11 +10,15 @@ interface PermissionDecision {
   reason: 'app-creator' | 'default-deny';
 }
 
+export type PermissionCondition =
+  | { fieldId: string; operator: 'eq' | 'ne'; value: string }
+  | { fieldId: string; operator: 'empty' | 'nonempty' | 'current-user' | 'current-user-group' };
+
 export interface EffectivePermissionRequest {
   tenantContext: TenantContext;
   targetUserId: string;
   appId: string;
-  recordId?: string;
+  record?: { id: string } | { allOf: readonly PermissionCondition[] };
 }
 
 export interface EffectivePermissions {
@@ -37,11 +41,12 @@ export class AuthorizationService {
 
   async evaluateEffectivePermissions(
     tx: TenantTransaction,
-    { tenantContext, targetUserId, appId, recordId }: EffectivePermissionRequest,
+    { tenantContext, targetUserId, appId, record: selection }: EffectivePermissionRequest,
   ): Promise<EffectivePermissions> {
     // A future permission-preview endpoint must authorize the requesting administrator.
     const target = { tenantId: tenantContext.tenantId, userId: targetUserId };
     const [app] = await tx.select().from(apps).where(this.appScope(target, appId));
+    const recordId = selection && 'id' in selection ? selection.id : undefined;
     const [record] = app && recordId
       ? await tx.select({ schemaVersion: records.schemaVersion }).from(records).where(and(
         eq(records.tenantId, target.tenantId), eq(records.appId, appId), eq(records.id, recordId),
@@ -52,7 +57,8 @@ export class AuthorizationService {
       allowed, reason: allowed ? 'app-creator' : 'default-deny',
     });
     const appPermission = decision(Boolean(app));
-    const recordPermission = decision(Boolean(record));
+    // The creator rule applies uniformly to any record matching a condition.
+    const recordPermission = decision(Boolean(record ?? (recordId === undefined && selection && app)));
     const visibleFields = app && (!recordId || record)
       ? await tx.select({ fieldId: fields.fieldId }).from(fields).where(and(
         eq(fields.tenantId, target.tenantId), eq(fields.appId, appId),

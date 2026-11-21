@@ -10,7 +10,7 @@ import { identifier, parseInput } from './validation';
 
 const loginInput = z.strictObject({
   email: z.email().max(254),
-  password: z.string().min(1).max(1024),
+  password: z.string().min(1).max(1024).refine((value) => !/[\x00\p{Surrogate}]/u.test(value)),
 });
 
 const sessionClaims = z.object({ tenantId: identifier, sub: identifier });

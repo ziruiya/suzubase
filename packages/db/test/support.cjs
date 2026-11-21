@@ -81,4 +81,4 @@ async function publish(token, appId) {
   return expectRequest(201, `/apps/${appId}/publish`, { method: 'POST', token });
 }
 
-module.exports = { addField, configureRuntime, createApp, expectRequest, login, provision, publish };
+module.exports = { addField, configureRuntime, createApp, expectRequest, login, provision, publish, request };

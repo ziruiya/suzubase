@@ -38,6 +38,11 @@ services:
         condition: service_completed_successfully
     ports:
       - "127.0.0.1:${API_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
   web:
     <<: *workspace
     command: pnpm --filter @suzubase/web exec vite preview --host 0.0.0.0 --port 5173

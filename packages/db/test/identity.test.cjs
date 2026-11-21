@@ -13,6 +13,7 @@ test('email and password authenticate independent tenant accounts and reject a s
     assert.equal(claims.sub, identity.userId);
   }
   await expectRequest(401, '/auth/login', { method: 'POST', body: { email: a.email, password: 'wrong' } });
+  await expectRequest(400, '/auth/login', { method: 'POST', body: { email: a.email, password: 'invalid\0password' } });
   await expectRequest(400, '/auth/login', { method: 'POST', body: { email: a.email, password: a.password, tenant_id: b.tenantId } });
 
   configureRuntime();

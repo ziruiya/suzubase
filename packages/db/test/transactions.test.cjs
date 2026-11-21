@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { Client } = require('pg');
-const { addField, configureRuntime, createApp, expectRequest, login, provision, publish } = require('./support.cjs');
+const { addField, configureRuntime, createApp, expectRequest, login, provision, publish, request } = require('./support.cjs');
 
 configureRuntime();
 const { and, appCounters, eq, outbox, recordCreateKeys, recordEvents, records, withTenantTransaction } = require('../dist');
@@ -70,15 +70,9 @@ test('concurrent duplicate creates return the original result and allocate one n
 test('one concurrent revision update wins and stale writes return the current record', async (t) => {
   const f = await fixture();
   const created = await createRecord(201, f, '10');
-  const requests = ['20.50', '30.50'].map(async (value) => {
-    const response = await fetch(new URL(`${f.path}/${created.id}`, process.env.TEST_API_URL ?? 'http://api:3000'), {
-      method: 'PUT',
-      headers: { Authorization: `Bearer ${f.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ revision: created.revision, data: { [f.fieldId]: value } }),
-      signal: AbortSignal.timeout(10000),
-    });
-    return { status: response.status, body: await response.json() };
-  });
+  const requests = ['20.50', '30.50'].map((value) => request(`${f.path}/${created.id}`, {
+    method: 'PUT', token: f.token, body: { revision: created.revision, data: { [f.fieldId]: value } },
+  }));
   const results = await Promise.all(requests);
   assert.deepEqual(results.map(({ status }) => status).sort(), [200, 409]);
   const updated = results.find(({ status }) => status === 200).body;

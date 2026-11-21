@@ -30,8 +30,9 @@ export async function checkDatabase(): Promise<void> {
 
 // This credential verifier returns an identity only after the password matches.
 export async function verifyLogin(email: string, password: string): Promise<TenantContext | undefined> {
-  const result = await db.execute<{ tenantId: string; userId: string }>(
-    sql`SELECT tenant_id AS "tenantId", user_id AS "userId" FROM authentication.verify_login(${email}, ${password})`,
+  const result = await pool.query<{ tenantId: string; userId: string }>(
+    'SELECT tenant_id AS "tenantId", user_id AS "userId" FROM authentication.verify_login($1, $2)',
+    [email, password],
   );
   return result.rows[0];
 }
@@ -41,7 +42,7 @@ export async function withTenantTransaction<T>(
   callback: (transaction: TenantTransaction) => Promise<T>,
 ): Promise<T> {
   const { tenantId } = tenantContext;
-  if (!uuid.test(tenantId)) throw new Error('Invalid tenant context');
+  if (tenantId.length !== 36 || !uuid.test(tenantId)) throw new Error('Invalid tenant context');
   return db.transaction(async (transaction) => {
     // SET LOCAL does not accept bind parameters. Only a validated UUID becomes a SQL literal.
     await transaction.execute(sql.raw(`SET LOCAL suzubase.tenant_id = '${tenantId}'`));
