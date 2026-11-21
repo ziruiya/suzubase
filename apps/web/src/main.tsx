@@ -5,6 +5,7 @@ import { api, appPath, download, json, message, type App, type AppSummary, type 
 import { removeDrafts } from './drafts';
 import { displayValue, RecordEditor, RecordValues } from './forms';
 import { Settings } from './settings';
+import { AccountSecurity } from './account-security';
 import './style.css';
 
 type Item = Pick<RecordResponse, 'id' | 'recordNo' | 'data' | 'revision' | 'schemaVersion'>;
@@ -28,19 +29,26 @@ function useNarrow() {
   return narrow;
 }
 
-function Login({ onLogin }: { onLogin: (session: Session) => void }) {
+function Login({ onLogin, notice }: { onLogin: (session: Session) => void; notice: string }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [challenge, setChallenge] = useState(false);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true); setError('');
     const values = new FormData(event.currentTarget);
     const account = String(values.get('account')).trim();
     try {
-      const { accessToken } = await api<{ accessToken: string }>('/auth/login', undefined, json('POST', {
+      const result = await api<{ accessToken: string } | { secondFactorRequired: true }>('/auth/login', undefined, json('POST', {
         [account.includes('@') ? 'email' : 'loginName']: account,
         password: values.get('password'),
+        ...(challenge && { factor: values.get('factor') }),
       }));
+      if ('secondFactorRequired' in result) {
+        setChallenge(true);
+        return;
+      }
+      const { accessToken } = result;
       const profile = await api<Profile>('/auth/profile', accessToken);
       onLogin({ token: accessToken, profile, draftAllowed: { current: true } });
     } catch (error) {
@@ -53,9 +61,13 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
     <section className="panel stack">
       <div className="brand"><span aria-hidden="true">S</span> SuzuBase</div>
       <h1>Sign in</h1>
+      {notice && <p role="status">{notice}</p>}
       <form className="stack" onSubmit={(event) => void submit(event)}>
         <label>Email or login name <input name="account" required autoComplete="username" /></label>
         <label>Password <input type="password" name="password" required autoComplete="current-password" /></label>
+        {challenge && <label>Authenticator or recovery code
+          <input name="factor" required autoComplete="one-time-code" autoFocus />
+        </label>}
         <button className="primary" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
       </form>
       {error && <p className="error" role="alert">{error}</p>}
@@ -278,25 +290,31 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
 function Root() {
   const [session, setSession] = useState<Session>();
   const [current, setCurrent] = useState<string>();
+  const [security, setSecurity] = useState(false);
+  const [notice, setNotice] = useState('');
   const narrow = useNarrow();
   async function logout() {
     if (!session) return;
     session.draftAllowed.current = false;
     const { tenantId, userId } = session.profile;
-    setSession(undefined); setCurrent(undefined);
+    setSession(undefined); setCurrent(undefined); setSecurity(false);
     await removeDrafts((draft) => draft.scope[0] === tenantId && draft.scope[1] === userId).catch(() => undefined);
   }
   return session ? <>
     <header className="top"><div className="top-inner inline spread">
-      <button className="brand" onClick={() => setCurrent(undefined)}><span aria-hidden="true">S</span> SuzuBase</button>
+      <button className="brand" onClick={() => { setCurrent(undefined); setSecurity(false); }}><span aria-hidden="true">S</span> SuzuBase</button>
       <div className="inline account"><span>{session.profile.displayName ?? session.profile.email}</span>
-        <button onClick={() => void logout()}>Sign out</button></div>
+        {session.profile.isAdmin && <button onClick={() => setSecurity(true)}>Account security</button>}
+        <button onClick={() => { setNotice(''); void logout(); }}>Sign out</button></div>
     </div></header>
     <main className="workspace">
-      {current ? <Records key={current} appId={current} session={session} narrow={narrow} leave={() => setCurrent(undefined)} />
+      {security ? <AccountSecurity token={session.token} close={() => setSecurity(false)} signInAgain={() => {
+        setNotice('Two-factor settings changed. Sign in again to continue.');
+        void logout();
+      }} /> : current ? <Records key={current} appId={current} session={session} narrow={narrow} leave={() => setCurrent(undefined)} />
         : <Portal session={session} narrow={narrow} navigate={setCurrent} />}
     </main>
-  </> : <Login onLogin={setSession} />;
+  </> : <Login notice={notice} onLogin={(value) => { setSession(value); setNotice(''); }} />;
 }
 
 createRoot(document.getElementById('root')!).render(<Root />);

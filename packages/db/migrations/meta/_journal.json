@@ -127,6 +127,13 @@
       "when": 1795265332128,
       "tag": "0017_gate1_login_candidates",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1795274542761,
+      "tag": "0018_administrator_totp",
+      "breakpoints": true
     }
   ]
 }

@@ -62,6 +62,12 @@ export const loginCredentials = authentication.table('login_credentials', {
   userId: uuid('user_id').notNull(),
   email: text().notNull(),
   passwordHash: text('password_hash').notNull(),
+  totpSecret: text('totp_secret'),
+  totpPendingUntil: time('totp_pending_until'),
+  totpLastStep: bigint('totp_last_step', { mode: 'number' }),
+  totpRecoveryHashes: text('totp_recovery_hashes').array().notNull().default(sql`'{}'`),
+  totpFailures: integer('totp_failures').notNull().default(0),
+  totpRetryAfter: time('totp_retry_after'),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.userId] }),
   unique().on(t.tenantId, t.email),
