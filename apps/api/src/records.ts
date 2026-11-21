@@ -1,8 +1,8 @@
 import {
   BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Injectable,
-  NotFoundException, Param, Post, Put, Query, UseGuards,
+  NotFoundException, Param, Post, Put, Query, StreamableFile, UseGuards,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiConflictResponse, ApiHeader, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiBody, ApiConflictResponse, ApiHeader, ApiProduces, ApiTags } from '@nestjs/swagger';
 import {
   and, appCounters, eq, gt, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordUniqueValues, records, sql, TenantContext,
   TenantTransaction, users, withTenantTransaction,
@@ -418,72 +418,96 @@ export class RecordService {
   }
 
   async readArchive(context: TenantContext, appId: string, id: string) {
-    return withTenantTransaction(context, async (tx) => {
-      const [grant] = await tx.select({ allowed: tenantMembers.canReadArchivedFields }).from(tenantMembers).where(and(
-        eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, context.userId), isNull(tenantMembers.disabledAt),
-      ));
-      if (!grant?.allowed) throw new NotFoundException('无权限');
-      const { app, access } = await this.appSchema.access(tx, context, appId, 'view');
-      const [row] = await tx.select({ data: records.archivedData }).from(records).where(and(
-        eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, id),
-        isNull(records.deletedAt), this.authorization.recordScope(access, 'view'),
-      ));
-      if (!row) throw new NotFoundException('无权限');
-      const definitions = await this.appSchema.archivedDefinitions(tx, context, appId, app.publishedSchemaVersion, Object.keys(row.data));
-      return { data: row.data, definitions };
-    });
+    return withTenantTransaction(context, (tx) => this.archive(tx, context, appId, id));
+  }
+
+  private async archive(tx: TenantTransaction, context: TenantContext, appId: string, id: string) {
+    const [grant] = await tx.select({ allowed: tenantMembers.canReadArchivedFields }).from(tenantMembers).where(and(
+      eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, context.userId), isNull(tenantMembers.disabledAt),
+    ));
+    if (!grant?.allowed) throw new NotFoundException('无权限');
+    const { app, access } = await this.appSchema.access(tx, context, appId, 'view');
+    const [row] = await tx.select({ data: records.archivedData }).from(records).where(and(
+      eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, id),
+      isNull(records.deletedAt), this.authorization.recordScope(access, 'view'),
+    ));
+    if (!row) throw new NotFoundException('无权限');
+    const definitions = await this.appSchema.archivedDefinitions(tx, context, appId, app.publishedSchemaVersion, Object.keys(row.data));
+    return { data: row.data, definitions };
   }
 
   async history(context: TenantContext, appId: string, id: string) {
     return withTenantTransaction(context, async (tx) => {
+      await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
       await this.findRecord(tx, context, appId, id);
-      const { access } = await this.appSchema.access(tx, context, appId, 'view');
-      const eventScope = and(eq(recordEvents.tenantId, context.tenantId), eq(recordEvents.appId, appId), eq(recordEvents.recordId, id));
-      const versions = await tx.selectDistinct({ version: recordEvents.schemaVersion }).from(recordEvents).where(eventScope);
-      const schemas = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
-      const filters = [];
-      const versionFields = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
-      for (const { version } of versions) {
-        versionFields.set(version, await this.appSchema.getFields(tx, context, appId, version));
-      }
-      const restrictedOldCalculations = new Set([...versionFields.values()].flatMap((fields) => {
-        const refs = formulaReferences(fields);
-        return [...refs.keys()].filter((fieldId) => !this.authorization.fieldDecision({ ...access, formulaRefs: refs }, fieldId, 'view').allowed);
-      }));
-      for (const [version, fields] of versionFields) {
-        const historic = { ...access, formulaRefs: formulaReferences(fields) };
-        const allowed = fields.filter(({ fieldId }) => access.types.has(fieldId) &&
-          this.authorization.fieldDecision(historic, fieldId, 'view').allowed);
-        schemas.set(version, allowed);
-        const oldCalculations = allowed.filter(({ fieldId }) => restrictedOldCalculations.has(fieldId));
-        const hideMigrationValues = oldCalculations.length ? sql`AND (${recordEvents.source} <> 'migration' OR
-          change.value->>'fieldId' NOT IN (${sql.join(oldCalculations.map(({ fieldId }) => sql`${fieldId}`), sql`,`)}))` : sql``;
-        if (allowed.length) filters.push(sql`(${recordEvents.schemaVersion} = ${version} AND change.value->>'fieldId' IN
-          (${sql.join(allowed.map(({ fieldId }) => sql`${fieldId}`), sql`,`)}) ${hideMigrationValues})`);
-      }
-      const visibleChanges = filters.length ? sql<FieldChange[]>`COALESCE((
-        SELECT jsonb_agg(change.value ORDER BY change.position)
-        FROM jsonb_array_elements(${recordEvents.changes}) WITH ORDINALITY AS change(value, position)
-        WHERE ${sql.join(filters, sql` OR `)}
-      ), '[]'::jsonb)` : sql<FieldChange[]>`'[]'::jsonb`;
-      const events = await tx.select({
-        event: {
-          eventId: recordEvents.eventId, recordRevision: recordEvents.recordRevision, schemaVersion: recordEvents.schemaVersion,
-          occurredAt: recordEvents.occurredAt, actorId: recordEvents.actorId, source: recordEvents.source,
-          kind: recordEvents.kind, changes: visibleChanges,
-        }, name: users.displayName, email: users.email, disabledAt: tenantMembers.disabledAt,
-      }).from(recordEvents).innerJoin(users, and(
-        eq(users.tenantId, recordEvents.tenantId), eq(users.id, recordEvents.actorId),
-      )).innerJoin(tenantMembers, and(
-        eq(tenantMembers.tenantId, users.tenantId), eq(tenantMembers.userId, users.id),
-      )).where(eventScope).orderBy(recordEvents.recordRevision);
-      return {
-        events: events.map(({ event, name, email, disabledAt }) => ({
-          ...event, actorLabel: (name ?? email) + (disabledAt ? '（已停用）' : ''),
-        })),
-        schemas: Object.fromEntries(schemas),
-      };
+      return this.historySnapshot(tx, context, appId, id);
     });
+  }
+
+  async historyExport(context: TenantContext, appId: string, id: string, includeArchived: boolean) {
+    return withTenantTransaction(context, async (tx) => {
+      await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+      await this.appSchema.access(tx, context, appId, 'export');
+      const record = await this.findRecord(tx, context, appId, id);
+      const archive = includeArchived ? await this.archive(tx, context, appId, id) : undefined;
+      const history = await this.historySnapshot(tx, context, appId, id);
+      const body = {
+        recordId: record.id, recordNo: record.recordNo, recordRevision: record.revision, ...history,
+        ...(archive && { archive }),
+      };
+      return new StreamableFile(Buffer.from(JSON.stringify(body, null, 2) + '\n'), {
+        type: 'application/json; charset=utf-8', disposition: 'attachment; filename="record-' + record.recordNo + '-history.json"',
+      });
+    });
+  }
+
+  private async historySnapshot(tx: TenantTransaction, context: TenantContext, appId: string, id: string) {
+    const { access } = await this.appSchema.access(tx, context, appId, 'view');
+    const eventScope = and(eq(recordEvents.tenantId, context.tenantId), eq(recordEvents.appId, appId), eq(recordEvents.recordId, id));
+    const versions = await tx.selectDistinct({ version: recordEvents.schemaVersion }).from(recordEvents).where(eventScope);
+    const schemas = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
+    const filters = [];
+    const versionFields = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
+    for (const { version } of versions) {
+      versionFields.set(version, await this.appSchema.getFields(tx, context, appId, version));
+    }
+    const restrictedOldCalculations = new Set([...versionFields.values()].flatMap((fields) => {
+      const refs = formulaReferences(fields);
+      return [...refs.keys()].filter((fieldId) => !this.authorization.fieldDecision({ ...access, formulaRefs: refs }, fieldId, 'view').allowed);
+    }));
+    for (const [version, fields] of versionFields) {
+      const historic = { ...access, formulaRefs: formulaReferences(fields) };
+      const allowed = fields.filter(({ fieldId }) => access.types.has(fieldId) &&
+        this.authorization.fieldDecision(historic, fieldId, 'view').allowed);
+      schemas.set(version, allowed);
+      const oldCalculations = allowed.filter(({ fieldId }) => restrictedOldCalculations.has(fieldId));
+      const hideMigrationValues = oldCalculations.length ? sql`AND (${recordEvents.source} <> 'migration' OR
+        change.value->>'fieldId' NOT IN (${sql.join(oldCalculations.map(({ fieldId }) => sql`${fieldId}`), sql`,`)}))` : sql``;
+      if (allowed.length) filters.push(sql`(${recordEvents.schemaVersion} = ${version} AND change.value->>'fieldId' IN
+        (${sql.join(allowed.map(({ fieldId }) => sql`${fieldId}`), sql`,`)}) ${hideMigrationValues})`);
+    }
+    const visibleChanges = filters.length ? sql<FieldChange[]>`COALESCE((
+      SELECT jsonb_agg(change.value ORDER BY change.position)
+      FROM jsonb_array_elements(${recordEvents.changes}) WITH ORDINALITY AS change(value, position)
+      WHERE ${sql.join(filters, sql` OR `)}
+    ), '[]'::jsonb)` : sql<FieldChange[]>`'[]'::jsonb`;
+    const events = await tx.select({
+      event: {
+        eventId: recordEvents.eventId, recordRevision: recordEvents.recordRevision, schemaVersion: recordEvents.schemaVersion,
+        occurredAt: recordEvents.occurredAt, actorId: recordEvents.actorId, source: recordEvents.source,
+        kind: recordEvents.kind, changes: visibleChanges,
+      }, name: users.displayName, email: users.email, disabledAt: tenantMembers.disabledAt,
+    }).from(recordEvents).innerJoin(users, and(
+      eq(users.tenantId, recordEvents.tenantId), eq(users.id, recordEvents.actorId),
+    )).innerJoin(tenantMembers, and(
+      eq(tenantMembers.tenantId, users.tenantId), eq(tenantMembers.userId, users.id),
+    )).where(eventScope).orderBy(recordEvents.recordRevision);
+    return {
+      events: events.map(({ event, name, email, disabledAt }) => ({
+        ...event, actorLabel: (name ?? email) + (disabledAt ? '（已停用）' : ''),
+      })),
+      schemas: Object.fromEntries(schemas),
+    };
   }
 
   private rejectRevision(current: RecordResponse): never {
@@ -578,6 +602,14 @@ export class RecordsController {
   @Get(':recordId/archived-fields')
   archivedFields(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') id: string) {
     return this.service.readArchive(context, parseInput(identifier, appId), parseInput(identifier, id));
+  }
+
+  @Get(':recordId/history/export')
+  @ApiProduces('application/json')
+  exportHistory(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('recordId') id: string, @Query() query: unknown) {
+    const { includeArchived } = parseInput(z.strictObject({ includeArchived: z.enum(['true', 'false']).optional() }), query);
+    return this.service.historyExport(context, parseInput(identifier, appId), parseInput(identifier, id), includeArchived === 'true');
   }
 
   @Get(':recordId/history')

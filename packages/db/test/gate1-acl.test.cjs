@@ -57,6 +57,7 @@ test('G1-08 versioned ACLs are enforced by record reads, aggregate, attachment a
   const history = await as(200, 'GET', '/records/' + visible.id + '/history', undefined, reader);
   assert.ok(history.events.every(({ changes }) => changes.every(({ fieldId }) => fieldId !== secret.fieldId)));
   assert.ok(!history.schemas[2].some(({ fieldId }) => fieldId === secret.fieldId));
+  await as(404, 'GET', '/records/' + visible.id + '/history/export', undefined, reader);
   const preview = await as(201, 'POST', '/permissions/preview', { userId: member.userId, recordId: visible.id });
   const hiddenPreview = await as(201, 'POST', '/permissions/preview', { userId: member.userId, recordId: hidden.id });
   assert.equal(preview.record.view.allowed, true);

@@ -140,6 +140,11 @@ test('GF-03 publishes rename and layout, blocks formula dependency, and archives
   assert.equal(pass.migrationReport.migrated, 1);
   assert.deepEqual((await request(200, 'GET', '/records/' + record.id)).data, {});
   await request(404, 'GET', '/records/' + record.id + '/archived-fields');
+  const historyPath = '/records/' + record.id + '/history/export';
+  const normalExport = await request(200, 'GET', historyPath);
+  assert.equal(normalExport.archive, undefined);
+  assert.ok(normalExport.events.every(({ changes }) => changes.every(({ fieldId }) => fieldId !== quantity.fieldId)));
+  await request(404, 'GET', historyPath + '?includeArchived=true');
   const { Client } = require('pg');
   const db = new Client({ connectionString: process.env.ADMIN_DATABASE_URL });
   await db.connect();
@@ -152,6 +157,10 @@ test('GF-03 publishes rename and layout, blocks formula dependency, and archives
   const archive = await request(200, 'GET', '/records/' + record.id + '/archived-fields');
   assert.equal(archive.data[quantity.fieldId], '4');
   assert.equal(archive.definitions[quantity.fieldId].name, 'Units');
+  const historyExport = await request(200, 'GET', historyPath + '?includeArchived=true');
+  assert.deepEqual(historyExport.archive, archive);
+  assert.equal(historyExport.recordId, record.id);
+  assert.deepEqual(historyExport.events.map(({ kind }) => kind), ['created', 'updated', 'schema-migrated']);
   t.diagnostic(JSON.stringify({ blocked, migrated: pass.migrationReport, archive: archive.data }));
 });
 

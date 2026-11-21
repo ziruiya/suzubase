@@ -13,6 +13,7 @@ import './style.css';
 type Item = Pick<RecordResponse, 'id' | 'recordNo' | 'data' | 'revision' | 'schemaVersion'>;
 type RecordForm = { record: RecordResponse; fields: Field[]; formLayout: FormLayout; can: { edit: boolean; delete: boolean } };
 type Search = { field: string; mode: string; query: string };
+type Archive = { data: Record<string, string>; definitions: Record<string, Field> };
 type History = {
   events: { eventId: string; actorLabel: string; kind: string; occurredAt: string; schemaVersion: number;
     changes: { fieldId: string; oldValue: string | null; newValue: string | null }[] }[];
@@ -124,6 +125,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
   const [summary, setSummary] = useState<{ fieldId: string; sum: string | null; average: string | null }[]>([]);
   const [form, setForm] = useState<RecordForm>();
   const [history, setHistory] = useState<History>();
+  const [archive, setArchive] = useState<Archive>();
   const [screen, setScreen] = useState<'list' | 'detail' | 'edit' | 'new' | 'settings' | 'recycle'>('list');
   const [search, setSearch] = useState<Search>();
   const [searchField, setSearchField] = useState('');
@@ -173,7 +175,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
   useEffect(() => { if (screen === 'list' && app) void load(); }, [app, screen, view, search]);
 
   async function open(id: string, where: 'detail' | 'edit' = 'detail') {
-    setError(''); setHistory(undefined);
+    setError(''); setHistory(undefined); setArchive(undefined);
     try {
       setForm(await api<RecordForm>(root + '/' + id + '/form', token));
       setScreen(where);
@@ -225,15 +227,33 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
             .catch((error) => setError(message(error))); }}>Confirm move</button></div>
       </section>}
       <RecordValues fields={form.fields} layout={form.formLayout} record={form.record} session={session} app={app} />
-      <div className="inline"><button onClick={() => void api<History>(root + '/' + form.record.id + '/history', token)
-        .then(setHistory).catch((error) => setError(message(error)))}>Show history</button></div>
+      <div className="inline">
+        <button onClick={() => void api<History>(root + '/' + form.record.id + '/history', token)
+          .then(setHistory).catch((error) => setError(message(error)))}>Show history</button>
+        {app.can.export && <button onClick={() => void download(root + '/' + form.record.id + '/history/export', token, 'history.json')
+          .catch((error) => setError(message(error)))}>Export history</button>}
+        {session.profile.canReadArchivedFields && <>
+          <button onClick={() => void api<Archive>(root + '/' + form.record.id + '/archived-fields', token)
+            .then(setArchive).catch((error) => setError(message(error)))}>Show archived fields</button>
+          {app.can.export && <button onClick={() => void download(root + '/' + form.record.id + '/history/export?includeArchived=true',
+            token, 'history-with-archived-fields.json').catch((error) => setError(message(error)))}>Export history with archived fields</button>}
+        </>}
+      </div>
       {history && <section aria-label="Record history"><h2>History</h2><ol className="history">{history.events.map((event) =>
         <li key={event.eventId}><strong>{event.kind}</strong> · {event.actorLabel}
           <time>{new Date(event.occurredAt).toLocaleString(undefined, { timeZone: session.profile.timeZone })}</time>
-          {event.changes.map((change) => <div key={change.fieldId}>
-            {history.schemas[event.schemaVersion]?.find(({ fieldId }) => fieldId === change.fieldId)?.name ?? change.fieldId}
-            {' · '}{change.oldValue ?? '—'} → {change.newValue ?? '—'}</div>)}
+          {event.changes.map((change) => {
+            const field = history.schemas[event.schemaVersion]?.find(({ fieldId }) => fieldId === change.fieldId);
+            const format = (value: string | null) => value === null ? '—' : field ? displayValue(field, value, session.profile.timeZone) : value;
+            return <div key={change.fieldId}>{field?.name ?? change.fieldId} · {format(change.oldValue)} → {format(change.newValue)}</div>;
+          })}
         </li>)}</ol></section>}
+      {archive && <section aria-label="Archived fields"><h2>Archived fields</h2>
+        {Object.keys(archive.data).length ? <dl>{Object.entries(archive.data).map(([id, value]) => <div key={id}>
+          <dt>{archive.definitions[id]?.name ?? id}</dt>
+          <dd>{archive.definitions[id] ? displayValue(archive.definitions[id], value, session.profile.timeZone) : value}</dd>
+        </div>)}</dl> : <p>This record has no archived field values.</p>}
+      </section>}
     </section>}
     {screen === 'list' && <>
       <div className="heading inline spread">
