@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client';
 import { api, appPath, download, json, message, type App, type AppSummary, type Field, type Profile, type Session } from './api';
 import { removeDrafts } from './drafts';
 import { displayValue, RecordEditor, RecordValues } from './forms';
+import { BulkEdit } from './bulk-edit';
 import { RecycleBin } from './recycle-bin';
 import { Settings } from './settings';
 import { Directory } from './directory';
@@ -133,6 +134,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(true);
   const [confirm, setConfirm] = useState(false);
+  const [bulkEdit, setBulkEdit] = useState(false);
   const token = session.token;
   const base = appPath(appId);
   const root = base + '/records';
@@ -260,10 +262,13 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
         <div><h1>{app.name}</h1>{app.description && <p className="muted">{app.description}</p>}</div>
         <div className="inline">
           {app.can.manage && (!narrow || session.profile.isAdmin) && <button onClick={() => setScreen('settings')}>Settings</button>}
+          {app.can.edit && !app.archivedAt && items.length > 0 && <button onClick={() => setBulkEdit(!bulkEdit)}>Batch edit</button>}
           {session.profile.canManageRecycleBin && app.can.delete && <button onClick={() => setScreen('recycle')}>Record recycle bin</button>}
           {canCreate && <button className="primary" onClick={() => { setForm(undefined); setScreen('new'); setFeedback(''); }}>New record</button>}
         </div>
       </div>
+      {bulkEdit && app.can.edit && <BulkEdit app={app} path={root} rows={items} session={session} done={() => load()}
+        close={() => setBulkEdit(false)} />}
       {app.archivedAt && <p className="notice">This application is archived.</p>}
       <div className="toolbar">
         {app.views.length > 0 && <label>View <select value={view ?? app.defaultId ?? ''}

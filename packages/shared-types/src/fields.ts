@@ -69,8 +69,8 @@ export interface LayoutElement {
   text: string;
 }
 
-export function isRecordInput(type: FieldType) {
-  return type !== 'autoNumber' && type !== 'calculation' && type !== 'layout';
+export function isRecordInput(type: FieldType | undefined) {
+  return type !== undefined && type !== 'autoNumber' && type !== 'calculation' && type !== 'layout';
 }
 
 export interface FieldDefinition {

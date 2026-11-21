@@ -51,3 +51,27 @@ test('G1-04 soft deletes release normalized uniqueness and a conflicting restore
   const next = await request(200, 'GET', '/records?after=' + page.nextCursor);
   assert.equal(next.items[0].id, batch.results[1].record.id);
 });
+
+test('GF-09 batches a single field with independent revisions and validation per row', async (t) => {
+  const token = await login(await provision());
+  const app = await createApp(token);
+  const base = '/apps/' + app.id;
+  const call = (status, method, path, body) => expectRequest(status, base + path, { token, method, body });
+  const field = await call(201, 'POST', '/fields', { name: 'Name', code: 'name', type: 'text', required: true });
+  const note = await call(201, 'POST', '/fields', { name: 'Note', code: 'note', type: 'text' });
+  await publish(token, app.id);
+  const make = (value) => call(201, 'POST', '/records', { data: { [field.fieldId]: value, [note.fieldId]: 'Keep ' + value } });
+  const one = await make('One');
+  const two = await make('Two');
+  const rows = await call(200, 'PATCH', '/records/batch', { fieldId: field.fieldId, value: 'Renamed', items: [
+    { id: one.id, revision: one.revision }, { id: two.id, revision: two.revision + 1 },
+  ] });
+  assert.deepEqual(rows.results.map(({ status }) => status), [200, 409]);
+  assert.equal(rows.results[0].record.data[note.fieldId], 'Keep One');
+  assert.equal((await call(200, 'GET', '/records/' + two.id)).data[field.fieldId], 'Two');
+  assert.equal(rows.results[1].error.code, 'REVISION_CONFLICT');
+  const invalid = await call(200, 'PATCH', '/records/batch', { fieldId: field.fieldId, value: null, items: [{ id: two.id, revision: two.revision }] });
+  assert.equal(invalid.results[0].status, 400);
+  assert.equal((await call(200, 'GET', '/records/' + two.id)).revision, two.revision);
+  t.diagnostic(JSON.stringify({ rowStatuses: rows.results.map(({ status }) => status), clearingRequired: invalid.results[0].status }));
+});

@@ -1,13 +1,13 @@
 import {
   BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Injectable,
-  NotFoundException, Param, Post, Put, Query, StreamableFile, UseGuards,
+  NotFoundException, Param, Patch, Post, Put, Query, StreamableFile, UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiConflictResponse, ApiHeader, ApiProduces, ApiTags } from '@nestjs/swagger';
 import {
   and, appCounters, eq, gt, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordUniqueValues, records, sql, TenantContext,
   TenantTransaction, users, withTenantTransaction,
 } from '@suzubase/db';
-import { FieldChange, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse } from '@suzubase/shared-types';
+import { FieldChange, isRecordInput, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { assignAutoNumber, numberScope } from './auto-number';
 import { AppSchemaService } from './app-schema';
@@ -27,6 +27,12 @@ const dataInput = z.record(identifier, z.string());
 const createInput = z.strictObject({ data: dataInput });
 const updateInput = z.strictObject({ data: dataInput, revision: z.int().min(1).max(2147483647) });
 const revisionInput = updateInput.pick({ revision: true });
+const batchUpdateInput = z.strictObject({
+  fieldId: identifier, value: z.string().nullable(),
+  items: z.array(revisionInput.extend({ id: identifier })).min(1).max(100)
+    .refine((items) => new Set(items.map(({ id }) => id.toLowerCase())).size === items.length),
+});
+type SingleFieldUpdate = z.infer<typeof batchUpdateInput>['items'][number] & { fieldId: string; value: string | null };
 const pageInput = z.strictObject({
   view: identifier.optional(),
   after: z.string().regex(/^[0-9]{1,19}$/).refine((value) => BigInt(value) <= 9223372036854775807n).optional(),
@@ -83,7 +89,8 @@ export class RecordService {
         const allowed = options.map((option) => ({ ...option, disabled: option.disabled && !priorChoices.includes(option.value) }));
         normalized = value === '' && field.type !== 'number' ? '' : normalizeValue(field.type, value, allowed);
       }
-      if (normalized === undefined || !await this.validDirectoryValue(tx, context, field.type, normalized)) {
+      if (normalized === undefined || normalized !== existing?.data[fieldId] &&
+          !await this.validDirectoryValue(tx, context, field.type, normalized)) {
         errors.push({ field: fieldId, message: `Invalid ${field.type} value` });
       } else {
         normalizedData[fieldId] = normalized;
@@ -240,19 +247,31 @@ export class RecordService {
     }
   }
 
-  async update(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof updateInput>) {
+  async update(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof updateInput> | SingleFieldUpdate) {
     return withTenantTransaction(context, async (tx) => {
       const { access, fields } = await this.appSchema.writable(tx, context, appId, 'edit');
       const current = await this.findRecord(tx, context, appId, recordId, 'edit', false, true);
       if (current.revision !== input.revision) this.rejectRevision(this.visibleRecord(access, current));
-      this.assertEditable(access, input.data);
-      const retained = Object.fromEntries(Object.entries(current.data).filter(([id]) =>
-        !this.authorization.editable(access, id) && access.types.get(id) !== 'autoNumber' && access.types.get(id) !== 'calculation'));
-      const data = await this.normalizeData(tx, context, appId, current.schemaVersion, { ...retained, ...input.data }, { data: current.data, fields });
-      for (const [id, value] of Object.entries(current.data)) {
-        if (access.types.get(id) === 'autoNumber') data[id] = value;
-      }
       const definitions = await this.appSchema.getFields(tx, context, appId, current.schemaVersion);
+      const inputTypes = new Map(definitions.map(({ fieldId, type }) => [fieldId, type]));
+      let candidate: RecordData;
+      if ('fieldId' in input) {
+        const type = inputTypes.get(input.fieldId);
+        if (!type || !isRecordInput(type)) throw new BadRequestException([{ field: input.fieldId, message: 'Field is not writable in this record version' }]);
+        this.assertEditable(access, { [input.fieldId]: input.value ?? '' });
+        candidate = Object.fromEntries(Object.entries(current.data).filter(([id]) => isRecordInput(inputTypes.get(id))));
+        if (input.value === null) delete candidate[input.fieldId];
+        else candidate[input.fieldId] = input.value;
+      } else {
+        this.assertEditable(access, input.data);
+        const retained = Object.fromEntries(Object.entries(current.data).filter(([id]) =>
+          !this.authorization.editable(access, id) && isRecordInput(inputTypes.get(id))));
+        candidate = { ...retained, ...input.data };
+      }
+      const data = await this.normalizeData(tx, context, appId, current.schemaVersion, candidate, { data: current.data, fields });
+      for (const [id, value] of Object.entries(current.data)) {
+        if (inputTypes.get(id) === 'autoNumber') data[id] = value;
+      }
       calculateFields(definitions, data);
       const [row] = await tx.update(records).set({
         data, revision: sql`${records.revision} + 1`, updatedBy: context.userId, updatedAt: sql`clock_timestamp()`,
@@ -358,6 +377,22 @@ export class RecordService {
       } catch (error) {
         if (!(error instanceof BadRequestException || error instanceof ConflictException || error instanceof ForbiddenException || error instanceof NotFoundException)) throw error;
         results.push({ index, status: error.getStatus(), error: error.getResponse() });
+      }
+    }
+    return { results };
+  }
+
+  async batchUpdate(context: TenantContext, appId: string, { fieldId, value, items }: z.infer<typeof batchUpdateInput>) {
+    const results = [];
+    for (const [index, item] of items.entries()) {
+      const { id } = item;
+      try {
+        const record = await this.update(context, appId, id, { ...item, fieldId, value });
+        results.push({ index, id, status: 200, record });
+      } catch (error) {
+        if (!(error instanceof BadRequestException || error instanceof ConflictException ||
+          error instanceof ForbiddenException || error instanceof NotFoundException)) throw error;
+        results.push({ index, id, status: error.getStatus(), error: error.getResponse() });
       }
     }
     return { results };
@@ -575,6 +610,12 @@ export class RecordsController {
   batch(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown) {
     const { items } = parseInput(z.strictObject({ items: z.array(createInput).min(1).max(100) }), body);
     return this.service.batchCreate(context, parseInput(identifier, appId), items);
+  }
+
+  @Patch('batch')
+  @AllowApiToken('edit')
+  batchUpdate(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown) {
+    return this.service.batchUpdate(context, parseInput(identifier, appId), parseInput(batchUpdateInput, body));
   }
 
   @Delete(':recordId')

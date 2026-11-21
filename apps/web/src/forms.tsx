@@ -23,7 +23,7 @@ function parseArray(value: string) {
   }
 }
 
-function normalizeInForm(field: Field, value: string, timeZone: string) {
+export function normalizeInForm(field: Field, value: string, timeZone: string) {
   if (field.required && (!value || (field.type === 'richText' && !richTextSummary(value)) || value === '[]' && (multiOptionFieldTypes.has(field.type) || field.type === 'attachment'))) {
     throw new Error('Required');
   }
@@ -54,7 +54,7 @@ export function displayValue(field: Field, value: string, timeZone: string) {
   return value;
 }
 
-function RuntimeField({
+export function RuntimeField({
   field, value, onChange, session, app, onPending, disabled,
 }: {
   field: Field; value: string; onChange: (value: string) => void; session: Session; app: App;
