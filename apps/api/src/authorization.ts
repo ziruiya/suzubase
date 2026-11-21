@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import {
-  and, apps, eq, fields, isNull, lte, records, tenants, tenantMembers, TenantContext, TenantTransaction,
+  and, apps, eq, fields, isNull, lte, records, sql, tenants, tenantMembers, TenantContext, TenantTransaction,
 } from '@suzubase/db';
 
 const appActions = ['view', 'create', 'edit', 'delete', 'import', 'export', 'manage'] as const;
@@ -30,7 +30,26 @@ export interface EffectivePermissions {
 @Injectable()
 export class AuthorizationService {
   appScope(context: TenantContext, appId: string) {
-    return and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId), eq(apps.createdBy, context.userId));
+    return and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId),
+      eq(apps.createdBy, context.userId), isNull(apps.deletedAt));
+  }
+
+  appManagementScope(context: TenantContext) {
+    return and(eq(apps.tenantId, context.tenantId), sql`(
+      ${apps.createdBy} = ${context.userId} OR EXISTS (
+        SELECT 1 FROM ${tenantMembers}
+        WHERE ${tenantMembers.tenantId} = ${apps.tenantId}
+          AND ${tenantMembers.userId} = ${context.userId}
+          AND ${tenantMembers.isAdmin} AND ${tenantMembers.disabledAt} IS NULL
+      )
+    )`);
+  }
+
+  async requireRecycleAccess(tx: TenantTransaction, context: TenantContext) {
+    const [member] = await tx.select({ allowed: tenantMembers.canManageRecycleBin }).from(tenantMembers)
+      .where(and(eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, context.userId),
+        isNull(tenantMembers.disabledAt)));
+    return member?.allowed ?? false;
   }
 
   async canCreateApp(tx: TenantTransaction, context: TenantContext): Promise<boolean> {

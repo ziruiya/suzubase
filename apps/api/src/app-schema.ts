@@ -1,10 +1,10 @@
 import {
   Body, ConflictException, Controller, ForbiddenException, Get, Injectable, NotFoundException,
-  Param, Post, UseGuards,
+  Delete, Param, Patch, Post, Query, UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
 import {
-  and, apps, appCounters, appVersions, eq, fields, lte, TenantContext, TenantTransaction, withTenantTransaction,
+  and, apps, appCounters, appVersions, eq, fields, isNull, lte, recordReferences, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
 import { fieldTypes } from '@suzubase/shared-types';
 import { z } from 'zod';
@@ -18,6 +18,17 @@ const metadata = {
   name: z.string().trim().min(1).max(120).refine((value) => !/[\x00\p{Surrogate}]/u.test(value)),
 };
 const appInput = z.strictObject(metadata);
+const settingsInput = z.strictObject({
+  name: metadata.name.optional(),
+  description: z.string().max(4000).optional(),
+  icon: z.string().max(64).nullable().optional(),
+  themeColor: z.string().regex(/^#[0-9a-f]{6}$/i).nullable().optional(),
+  titleFieldId: identifier.nullable().optional(),
+  duplicateHint: z.boolean().optional(),
+  numericPrecision: z.int().min(0).max(12).optional(),
+  adminMemo: z.string().max(4000).optional(),
+}).refine((settings) => Object.keys(settings).length > 0 &&
+  [settings.description, settings.icon, settings.adminMemo].every((value) => !value || !/[\x00\p{Surrogate}]/u.test(value)));
 const fieldInput = z.strictObject({ ...metadata, type: z.enum(fieldTypes) });
 const metadataProperties = {
   code: { type: 'string', pattern: codePattern.source },
@@ -46,6 +57,101 @@ export class AppSchemaService {
     }
   }
 
+  async list(context: TenantContext, bin: boolean) {
+    return withTenantTransaction(context, async (tx) => {
+      if (bin && !await this.authorization.requireRecycleAccess(tx, context)) throw new ForbiddenException('无权限');
+      return tx.select({
+        id: apps.id, code: apps.code, name: apps.name, description: apps.description, archivedAt: apps.archivedAt,
+        deletedAt: apps.deletedAt,
+      }).from(apps).where(and(
+        this.authorization.appManagementScope(context),
+        bin ? sql`${apps.deletedAt} IS NOT NULL` : isNull(apps.deletedAt),
+      )).orderBy(apps.name, apps.id);
+    });
+  }
+
+  private async managedApp(tx: TenantTransaction, context: TenantContext, appId: string, deleted = false) {
+    const [app] = await tx.select().from(apps).where(and(
+      this.authorization.appManagementScope(context), eq(apps.id, appId),
+      deleted ? sql`${apps.deletedAt} IS NOT NULL` : isNull(apps.deletedAt),
+    )).for('update');
+    if (!app) throw new NotFoundException();
+    return app;
+  }
+
+  async settings(context: TenantContext, appId: string, input?: z.infer<typeof settingsInput>) {
+    return withTenantTransaction(context, async (tx) => {
+      const app = await this.managedApp(tx, context, appId);
+      if (!input) return app;
+      if (input.titleFieldId) {
+        const definitions = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
+        if (!definitions.some(({ fieldId }) => fieldId === input.titleFieldId)) {
+          throw new ConflictException('Title field must exist in the published version');
+        }
+      }
+      const [saved] = await tx.update(apps).set(input).where(and(
+        eq(apps.tenantId, context.tenantId), eq(apps.id, appId),
+      )).returning();
+      return saved;
+    });
+  }
+
+  async changeLifecycle(context: TenantContext, appId: string, action: 'archive' | 'activate' | 'delete' | 'restore') {
+    return withTenantTransaction(context, async (tx) => {
+      if (action === 'restore' && !await this.authorization.requireRecycleAccess(tx, context)) {
+        throw new ForbiddenException('无权限');
+      }
+      const app = await this.managedApp(tx, context, appId, action === 'restore');
+      const inbound = await tx.select({ appId: recordReferences.appId }).from(recordReferences).where(and(
+        eq(recordReferences.tenantId, context.tenantId), eq(recordReferences.targetAppId, appId),
+      )).limit(1);
+      if (action === 'delete' && inbound.length) throw new ConflictException('The application has incoming record references');
+      if (action === 'restore') {
+        const [outbound] = await tx.select({ appId: recordReferences.targetAppId }).from(recordReferences)
+          .innerJoin(apps, and(eq(apps.tenantId, recordReferences.tenantId), eq(apps.id, recordReferences.targetAppId)))
+          .where(and(eq(recordReferences.tenantId, context.tenantId), eq(recordReferences.appId, appId),
+            sql`${apps.deletedAt} IS NOT NULL`)).limit(1);
+        if (outbound) throw new ConflictException('A referenced application is in the recycle bin');
+      }
+      const now = new Date().toISOString();
+      const change = {
+        archive: { archivedAt: now }, activate: { archivedAt: null }, delete: { deletedAt: now }, restore: { deletedAt: null },
+      }[action];
+      const [saved] = await tx.update(apps).set(change).where(and(
+        eq(apps.tenantId, context.tenantId), eq(apps.id, app.id),
+      )).returning();
+      return saved;
+    });
+  }
+
+  async copy(context: TenantContext, appId: string, input: z.infer<typeof appInput>) {
+    try {
+      return await withTenantTransaction(context, async (tx) => {
+        if (!await this.authorization.canCreateApp(tx, context)) throw new ForbiddenException('无权限');
+        const source = await this.managedApp(tx, context, appId);
+        const { description, icon, themeColor, duplicateHint, numericPrecision, adminMemo } = source;
+        const [copy] = await tx.insert(apps).values({
+          ...input, description, icon, themeColor, duplicateHint, numericPrecision, adminMemo,
+          tenantId: context.tenantId, createdBy: context.userId,
+        }).returning();
+        const identity = { tenantId: context.tenantId, appId: copy.id };
+        await tx.insert(appVersions).values({ ...identity, version: 1 });
+        await tx.insert(appCounters).values(identity);
+        const definitions = await this.getFields(tx, context, appId, source.publishedSchemaVersion);
+        for (const { fieldId, code, name, type } of definitions) {
+          const [field] = await tx.insert(fields).values({ ...identity, code, name, type, introducedIn: 1 }).returning();
+          if (source.titleFieldId === fieldId) copy.titleFieldId = field.fieldId;
+        }
+        if (copy.titleFieldId) await tx.update(apps).set({ titleFieldId: copy.titleFieldId })
+          .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, copy.id)));
+        return copy;
+      });
+    } catch (error) {
+      if (postgresErrorCode(error) === '23505') throw new ConflictException('App code already in use');
+      throw error;
+    }
+  }
+
   private async findApp(tx: TenantTransaction, context: TenantContext, appId: string, lock = false) {
     const query = tx.select().from(apps).where(this.authorization.appScope(context, appId));
     const [app] = await (lock ? query.for('update') : query);
@@ -57,7 +163,8 @@ export class AppSchemaService {
     return withTenantTransaction(context, async (tx) => {
       const app = await this.findApp(tx, context, appId);
       const definitions = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
-      return { id: app.id, name: app.name, code: app.code, schemaVersion: app.publishedSchemaVersion, fields: definitions };
+      return { id: app.id, name: app.name, code: app.code, description: app.description, icon: app.icon,
+        themeColor: app.themeColor, titleFieldId: app.titleFieldId, archivedAt: app.archivedAt, schemaVersion: app.publishedSchemaVersion, fields: definitions };
     });
   }
 
@@ -113,7 +220,9 @@ export class AppSchemaService {
   }
 
   async publishedVersion(tx: TenantTransaction, context: TenantContext, appId: string) {
-    return (await this.findApp(tx, context, appId)).publishedSchemaVersion;
+    const app = await this.findApp(tx, context, appId, true);
+    if (app.archivedAt) throw new ConflictException('Application is archived');
+    return app.publishedSchemaVersion;
   }
 }
 
@@ -130,6 +239,37 @@ export class AppSchemaController {
   } })
   create(@AuthenticatedTenant() context: TenantContext, @Body() body: unknown) {
     return this.schemas.createApp(context, parseInput(appInput, body));
+  }
+
+  @Get()
+  list(@AuthenticatedTenant() context: TenantContext, @Query('bin') bin: unknown) {
+    return this.schemas.list(context, parseInput(z.enum(['true', 'false']).optional(), bin) === 'true');
+  }
+
+  @Get(':appId/settings')
+  settings(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
+    return this.schemas.settings(context, parseInput(identifier, id));
+  }
+
+  @Patch(':appId/settings')
+  updateSettings(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
+    return this.schemas.settings(context, parseInput(identifier, id), parseInput(settingsInput, body));
+  }
+
+  @Post(':appId/lifecycle')
+  lifecycle(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
+    const { action } = parseInput(z.strictObject({ action: z.enum(['archive', 'activate', 'restore']) }), body);
+    return this.schemas.changeLifecycle(context, parseInput(identifier, id), action);
+  }
+
+  @Delete(':appId')
+  remove(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
+    return this.schemas.changeLifecycle(context, parseInput(identifier, id), 'delete');
+  }
+
+  @Post(':appId/copy')
+  copy(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
+    return this.schemas.copy(context, parseInput(identifier, id), parseInput(appInput, body));
   }
 
   @Get(':appId')

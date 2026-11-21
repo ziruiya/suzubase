@@ -125,6 +125,7 @@ export class RecordService {
 
   async update(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof updateInput>) {
     return withTenantTransaction(context, async (tx) => {
+      await this.appSchema.publishedVersion(tx, context, appId);
       const current = await this.findRecord(tx, context, appId, recordId);
       if (current.revision !== input.revision) this.rejectRevision(current);
       const data = await this.normalizeData(tx, context, appId, current.schemaVersion, input.data);

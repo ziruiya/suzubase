@@ -8,4 +8,4 @@ COPY packages/shared-types/package.json packages/shared-types/
 RUN npm install --global "$(node -p 'require("./package.json").packageManager')" \
     && pnpm install --frozen-lockfile
 COPY . .
-RUN pnpm -r build
+RUN pnpm -r --workspace-concurrency=1 build

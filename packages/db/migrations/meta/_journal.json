@@ -43,6 +43,13 @@
       "when": 1795265332116,
       "tag": "0005_gate1_identity",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1795265332117,
+      "tag": "0006_gate1_app_management",
+      "breakpoints": true
     }
   ]
 }

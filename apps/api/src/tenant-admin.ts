@@ -45,7 +45,7 @@ export class TenantAdminService {
     return this.run(context, async (tx, settings) => {
       const members = await tx.select({
         id: users.id, loginName: users.loginName, email: users.email, displayName: users.displayName,
-        isAdmin: tenantMembers.isAdmin, disabledAt: tenantMembers.disabledAt, organizationId: tenantMembers.organizationId,
+        isAdmin: tenantMembers.isAdmin, canManageRecycleBin: tenantMembers.canManageRecycleBin, disabledAt: tenantMembers.disabledAt, organizationId: tenantMembers.organizationId,
       }).from(users).innerJoin(tenantMembers, and(
         eq(users.tenantId, tenantMembers.tenantId), eq(users.id, tenantMembers.userId),
       )).where(eq(users.tenantId, context.tenantId));
@@ -98,15 +98,15 @@ export class TenantAdminService {
     });
   }
 
-  updateUser(context: TenantContext, id: string, input: { displayName?: string; organizationId?: string | null }) {
+  updateUser(context: TenantContext, id: string, input: { displayName?: string; organizationId?: string | null; canManageRecycleBin?: boolean }) {
     return this.run(context, async (tx) => {
       const [user] = input.displayName === undefined
         ? await tx.select().from(users).where(and(eq(users.tenantId, context.tenantId), eq(users.id, id)))
         : await tx.update(users).set({ displayName: input.displayName })
           .where(and(eq(users.tenantId, context.tenantId), eq(users.id, id))).returning();
       if (!user) throw new NotFoundException();
-      if (input.organizationId !== undefined) {
-        await tx.update(tenantMembers).set({ organizationId: input.organizationId }).where(and(
+      if (input.organizationId !== undefined || input.canManageRecycleBin !== undefined) {
+        await tx.update(tenantMembers).set({ organizationId: input.organizationId, canManageRecycleBin: input.canManageRecycleBin }).where(and(
           eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, id),
         ));
       }
@@ -236,7 +236,7 @@ export class TenantAdminController {
   @Patch('users/:id')
   updateUser(@AuthenticatedTenant() context: TenantContext, @Param('id') id: string, @Body() body: unknown) {
     return this.admin.updateUser(context, parseInput(identifier, id), parseInput(z.strictObject({
-      displayName: name.optional(), organizationId: identifier.nullable().optional(),
+      displayName: name.optional(), organizationId: identifier.nullable().optional(), canManageRecycleBin: z.boolean().optional(),
     }), body));
   }
 
