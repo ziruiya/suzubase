@@ -1,10 +1,11 @@
 import { and, eq, fileReferences, memberGroups, organizations, records, tenantMembers,
   type TenantContext, type TenantTransaction } from '@suzubase/db';
-import { isRecordInput, multiOptionFieldTypes, optionFieldTypes, type AclConfiguration,
+import { fieldContract, isRecordInput, multiOptionFieldTypes, optionFieldTypes, type AclConfiguration,
   type FieldDefinition, type FormLayout, type RecordData, type ViewCondition, type ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { normalizeValue } from './field-values';
 import { calculateFields, formulaProblems } from './formula';
+import { normalizeSearch, searchableKinds } from './search-projection';
 import { identifier } from './validation';
 import { layoutWidths } from '@suzubase/shared-types';
 
@@ -42,6 +43,10 @@ export function referencesPreflight(published: FieldDefinition[], draft: FieldDe
   for (const view of views.views) {
     for (const column of view.columns) {
       if (changed(column.fieldId)) add(column.fieldId, 'view-column', view.id);
+    }
+    for (const fieldId of view.aggregateFields ?? []) {
+      const field = next.get(fieldId);
+      if (!field || changed(fieldId) || !fieldContract[field.type].aggregate) add(fieldId, 'view-aggregate', view.id);
     }
     if (view.sort && changed(view.sort.fieldId)) add(view.sort.fieldId, 'view-sort', view.id);
     for (const condition of view.conditions) {
@@ -139,7 +144,10 @@ export async function dataPreflight(tx: TenantTransaction, context: TenantContex
       const { fieldId, name, type } = field;
       const original = row.data[fieldId];
       const old = previousById.get(fieldId);
-      let value = empty(field, original) ? undefined : preflightNormalize(field, original!);
+      const raw: unknown = original;
+      const unexpectedType = raw !== undefined && typeof raw !== 'string';
+      const valueIsEmpty = !unexpectedType && empty(field, original);
+      let value = valueIsEmpty || unexpectedType ? undefined : preflightNormalize(field, original!);
       const directoryIds = directory[type as keyof typeof directory];
       if (type !== old?.type && directoryIds && value && !directoryIds.has(value)) value = undefined;
       if (value && type !== old?.type && type === 'attachment') {
@@ -153,12 +161,15 @@ export async function dataPreflight(tx: TenantTransaction, context: TenantContex
       const recordNo = row.recordNo.toString();
       const key = field.uniqueValue && !row.deletedAt && value ? fieldId + ':' + uniqueKey(value) : undefined;
       const conflict = key && reserved.get(key);
-      const reason = field.required && !value && empty(field, original) ? 'required'
-        : !value && !empty(field, original) ? 'incompatible value'
+      const searchTooLarge = Boolean(value) && searchableKinds(field).some((kind) =>
+        Buffer.byteLength(normalizeSearch(kind, value!)) > 1000);
+      const reason = field.required && !value && valueIsEmpty ? 'required'
+        : !value && !valueIsEmpty ? 'incompatible value'
+        : searchTooLarge ? 'search projection is too long'
         : key && Buffer.byteLength(uniqueKey(value!)) > 1000 ? 'unique value is too long'
         : conflict ? 'duplicate unique value' : undefined;
       if (reason) {
-        const item = { recordNo, fieldId, field: name, value: original ?? null, reason };
+        const item = { recordNo, fieldId, field: name, value: unexpectedType ? JSON.stringify(raw) : original ?? null, reason };
         if (destructive && strategy?.incompatible === 'clear-optional' && !field.required) {
           delete data[fieldId];
           repaired.push(item);

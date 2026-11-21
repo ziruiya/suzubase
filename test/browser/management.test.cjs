@@ -69,6 +69,8 @@ test('Gate 1 browser directory, layout drag and undo, saved views, rich text, an
     await page.getByLabel('Operator').selectOption('ne');
     await page.getByLabel('Value', { exact: true }).fill('0');
     await page.getByLabel('Sort field').selectOption(fields.amount.fieldId);
+    await page.getByLabel('Choose summary fields for this view').check();
+    await page.getByRole('group', { name: 'Numeric summaries' }).getByLabel('Amount', { exact: true }).check();
     await page.getByLabel('Add column').selectOption(fields.title.fieldId);
     await page.getByLabel('Width', { exact: true }).fill('220');
     await button('Save view to draft').click();

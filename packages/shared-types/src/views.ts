@@ -7,6 +7,7 @@ export interface SavedView {
   name: string;
   columns: { fieldId: string; width: number }[];
   conditions: ViewCondition[];
+  aggregateFields?: string[];
   sort?: { fieldId: string; direction: 'asc' | 'desc' };
 }
 

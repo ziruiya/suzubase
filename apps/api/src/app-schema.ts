@@ -221,6 +221,7 @@ export class AppSchemaService {
           views: sourceViews.views.map((view) => ({
             ...view, id: viewMapping.get(view.id)!,
             columns: view.columns.map(remap), conditions: view.conditions.map(remap),
+            aggregateFields: view.aggregateFields?.map((id) => fieldMapping.get(id)!),
             sort: view.sort && remap(view.sort),
           })),
         };
@@ -314,7 +315,10 @@ export class AppSchemaService {
     const visible = (fieldId: string) => this.authorization.fieldDecision(access, fieldId, 'view').allowed;
     const views = configuration.views.filter((view) =>
       view.conditions.every(({ fieldId }) => visible(fieldId)) && (!view.sort || visible(view.sort.fieldId)),
-    ).map((view) => ({ ...view, columns: view.columns.filter(({ fieldId }) => visible(fieldId)) }));
+    ).map((view) => ({
+      ...view, columns: view.columns.filter(({ fieldId }) => visible(fieldId)),
+      aggregateFields: view.aggregateFields?.filter(visible),
+    }));
     return { views, defaultId: views.some(({ id }) => id === configuration.defaultId) ? configuration.defaultId : null };
   }
 
@@ -554,9 +558,10 @@ export class AppSchemaService {
       const [published] = await tx.update(apps).set({
         publishedSchemaVersion: version, draftSchemaVersion: null, draftStatus: null,
       }).where(scope).returning();
-      if (!plan.length) return { published };
+      const confirmation = { ...published, skippedDependencies: ['workflow', 'lookup'] };
+      if (!plan.length) return { published: confirmation };
       const report = await this.applyMigration(tx, context, appId, version, draftFields, plan, disclosedRepairs, migration!);
-      return { published: { ...published, migrationReport: report } };
+      return { published: { ...confirmation, migrationReport: report } };
     });
     if (result.failure) throw new ConflictException(result.failure);
     return result.published;
@@ -617,6 +622,10 @@ export class AppSchemaService {
         const definitions = new Map(fields.map((field) => [field.fieldId, field]));
         const columnsValid = input.columns.every(({ fieldId }) => definitions.has(fieldId) && definitions.get(fieldId)!.type !== 'layout');
         const sortField = input.sort && definitions.get(input.sort.fieldId);
+        if (input.aggregateFields?.some((id) => {
+          const field = definitions.get(id);
+          return !field || !fieldContract[field.type].aggregate;
+        })) throw new BadRequestException('View summaries require numeric fields');
         if (!columnsValid || (input.sort && (!sortField || !fieldContract[sortField.type].sort))) {
           throw new BadRequestException('Unsupported view column or sort');
         }

@@ -157,7 +157,8 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
         return;
       }
       const all = new URLSearchParams(params);
-      const numbers = app.fields.filter(({ type }) => fieldContract[type].aggregate).slice(0, 3).map(({ fieldId }) => fieldId);
+      const target = app.views.find(({ id }) => id === (view ?? app.defaultId));
+      const numbers = target?.aggregateFields ?? app.fields.filter(({ type }) => fieldContract[type].aggregate).slice(0, 3).map(({ fieldId }) => fieldId);
       if (numbers.length) all.set('fields', numbers.join(','));
       if (after) params.set('after', after);
       const result = await api<{ items: Item[]; nextCursor: string | null }>(root + '?' + params, token);

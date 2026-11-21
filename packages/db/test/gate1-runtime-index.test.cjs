@@ -69,6 +69,7 @@ test('GF-05 concurrent typed index preflights dirty rows, builds on retry, recor
     await request(201, 'POST', '/publish', body);
     const [retired] = await request(200, 'GET', '/indexes');
     assert.ok(retired.retiredAt);
+    assert.ok(retired.lastUsedAt);
     assert.equal((await ownerDb.query('SELECT to_regclass($1) AS index', ['public.' + built.index])).rows[0].index, null);
     t.diagnostic(JSON.stringify({ building: job.state, failed: failed.problems, available: built, lastUsedAt: used.lastUsedAt,
       indexScan: plan[0].Plan['Node Type'], retiredAt: retired.retiredAt }));

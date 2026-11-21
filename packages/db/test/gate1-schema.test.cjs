@@ -132,10 +132,20 @@ test('GF-03 publishes rename and layout, blocks formula dependency, and archives
   assert.equal(updated.data[total.fieldId], '8');
   await request(201, 'POST', '/rollback-display');
   assert.deepEqual((await request(200, 'GET', '')).formLayout, []);
+  const summary = await request(201, 'POST', '/draft/views', {
+    name: 'Quantity summary', conditions: [], columns: [], aggregateFields: [quantity.fieldId],
+  });
+  assert.deepEqual((await request(201, 'POST', '/publish')).skippedDependencies, ['workflow', 'lookup']);
+  await request(200, 'PATCH', '/draft/fields/' + quantity.fieldId, { type: 'text' });
+  const typeBlocked = await request(409, 'POST', '/publish', { migration: { incompatible: 'reject' } });
+  assert.ok(typeBlocked.problems.some(({ dependency }) => dependency === 'formula'));
+  assert.ok(typeBlocked.problems.some(({ dependency }) => dependency === 'view-aggregate'));
+  await request(200, 'PATCH', '/draft/fields/' + quantity.fieldId, { type: 'number' });
   await request(200, 'DELETE', '/draft/fields/' + quantity.fieldId);
   const blocked = await request(409, 'POST', '/publish', { migration: { incompatible: 'reject' } });
   assert.ok(blocked.problems.some(({ fieldId, dependency }) => fieldId === total.fieldId && dependency === 'formula'));
   await request(200, 'DELETE', '/draft/fields/' + total.fieldId);
+  await request(200, 'DELETE', '/draft/views/' + summary.views[0].id);
   const pass = await request(201, 'POST', '/publish', { migration: { incompatible: 'reject' } });
   assert.equal(pass.migrationReport.migrated, 1);
   assert.deepEqual((await request(200, 'GET', '/records/' + record.id)).data, {});
@@ -161,7 +171,7 @@ test('GF-03 publishes rename and layout, blocks formula dependency, and archives
   assert.deepEqual(historyExport.archive, archive);
   assert.equal(historyExport.recordId, record.id);
   assert.deepEqual(historyExport.events.map(({ kind }) => kind), ['created', 'updated', 'schema-migrated']);
-  t.diagnostic(JSON.stringify({ blocked, migrated: pass.migrationReport, archive: archive.data }));
+  t.diagnostic(JSON.stringify({ typeBlocked, blocked, migrated: pass.migrationReport, archive: archive.data }));
 });
 
 test('GF-03 explicitly repairs incompatible values during type migration and preserves deactivated options', async (t) => {

@@ -20,7 +20,7 @@ export function ViewSettings({ configuration, fields, path, session, refresh }: 
     const saved = views.find((entry) => entry.id === id);
     setSelected(id);
     setRemove(false);
-    setView(saved ? { name: saved.name, columns: saved.columns, sort: saved.sort, conditions: saved.conditions } : blank);
+    setView(saved ? { name: saved.name, columns: saved.columns, sort: saved.sort, conditions: saved.conditions, aggregateFields: saved.aggregateFields } : blank);
   }
 
   async function run(action: () => Promise<void>) {
@@ -58,6 +58,17 @@ export function ViewSettings({ configuration, fields, path, session, refresh }: 
           <option value="asc">Ascending</option><option value="desc">Descending</option>
         </select></label>}
       </div>
+      <fieldset className="stack">
+        <legend>Numeric summaries</legend>
+        <label className="option"><input type="checkbox" checked={view.aggregateFields !== undefined} onChange={(event) =>
+          setView({ ...view, aggregateFields: event.target.checked ? [] : undefined })} /> Choose summary fields for this view</label>
+        {view.aggregateFields && fields.filter(({ type }) => fieldContract[type].aggregate).map(({ fieldId, name }) =>
+          <label className="option" key={fieldId}><input type="checkbox" checked={view.aggregateFields!.includes(fieldId)}
+            disabled={view.aggregateFields!.length >= 10 && !view.aggregateFields!.includes(fieldId)} onChange={(event) => {
+              const current = view.aggregateFields!;
+              setView({ ...view, aggregateFields: event.target.checked ? [...current, fieldId] : current.filter((id) => id !== fieldId) });
+            }} /> {name}</label>)}
+      </fieldset>
       <fieldset className="stack">
         <legend>Columns</legend>
         {!view.columns.length && <p>All visible record fields will be shown.</p>}

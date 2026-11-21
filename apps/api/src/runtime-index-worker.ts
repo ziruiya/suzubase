@@ -71,7 +71,13 @@ export async function runIndexJob(context: TenantContext, ddl: IndexDdl) {
       or(eq(runtimeIndexes.state, 'building'), sql`${runtimeIndexes.retireRequested} IS NOT NULL`),
     )).orderBy(sql`${runtimeIndexes.retireRequested} ASC NULLS LAST`, runtimeIndexes.requestedAt).limit(1);
     if (!job) return;
-    if (job.retireRequested) return { job, retire: true as const };
+    if (job.retireRequested) {
+      const stats = await tx.execute<{ lastUsedAt: string | null }>(sql`
+        SELECT last_idx_scan::text AS "lastUsedAt" FROM pg_catalog.pg_stat_user_indexes
+        WHERE schemaname = 'public' AND indexrelname = ${runtimeIndexName(job)}
+      `);
+      return { job, retire: true as const, lastUsedAt: stats.rows[0]?.lastUsedAt ?? job.lastUsedAt };
+    }
     const [app] = await tx.select({ version: apps.publishedSchemaVersion }).from(apps).where(and(
       eq(apps.tenantId, context.tenantId), eq(apps.id, job.appId), isNull(apps.deletedAt),
     ));
@@ -94,7 +100,7 @@ export async function runIndexJob(context: TenantContext, ddl: IndexDdl) {
     // Reconcile interrupted builds before issuing a new command for the same generated name.
     await ddl.drop(job);
     if (work.retire) {
-      await save({ retiredAt: new Date().toISOString(), retireRequested: null, failureReason: null });
+      await save({ retiredAt: new Date().toISOString(), retireRequested: null, failureReason: null, lastUsedAt: work.lastUsedAt });
       return { index: runtimeIndexName(job), retired: true };
     }
     if (work.failureReason) {

@@ -202,7 +202,7 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/permissions/preview']: { post: { body: appHttp.previewInput, reply: preview,
     description: 'Evaluate a published record, a bounded set of matching records, or application permissions. Preview calls are audited.' } },
   [applications + '/publish']: { post: { body: appHttp.publishInput, optionalBody: true,
-    reply: app.extend({ migrationReport: migrationReport.optional() }), conflict: publishConflict } },
+    reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text) }), conflict: publishConflict } },
   [records]: { get: { query: recordHttp.pageInput, reply: page(record) }, post: { body: recordHttp.createInput, reply: record, conflict: errorSchema } },
   [records + '/search']: { get: { query: recordHttp.searchInput, reply: search } },
   [records + '/aggregates']: { get: { query: recordHttp.aggregateQuery, reply: aggregates } },
