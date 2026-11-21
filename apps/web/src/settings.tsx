@@ -1,5 +1,6 @@
 import { autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, type FieldType, type FormLayout, type ViewConfiguration } from '@suzubase/shared-types';
 import { useEffect, useState, type FormEvent } from 'react';
+import { PermissionsSettings } from './permissions-settings';
 import { ViewSettings } from './view-settings';
 import { IndexSettings } from './index-settings';
 import { LayoutDesigner } from './form-layout';
@@ -133,7 +134,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
       session={session} refresh={refreshDraft} />}
     {active === 'Workflow' && <p>Workflow is not yet enabled.</p>}
     {active === 'Notifications' && <p>Notifications are not yet enabled.</p>}
-    {active === 'Permissions' && <AclSettings app={app} session={session} refresh={refreshDraft} />}
+    {active === 'Permissions' && <PermissionsSettings app={app} fields={definitions} session={session} refresh={refreshDraft} />}
     {active === 'General' && <form className="stack" onSubmit={(event) => {
       event.preventDefault(); const data = new FormData(event.currentTarget);
       void run(async () => {
@@ -238,29 +239,6 @@ function FieldEditor({ field, busy, close, save }: {
       {confirm ? <button type="button" disabled={busy} onClick={() => save(null)}>Confirm deletion of {field.name}</button>
         : <button type="button" disabled={busy} onClick={() => setConfirm(true)}>Delete field</button>}
     </div>
-  </form>;
-}
-
-function AclSettings({ app, session, refresh }: { app: App; session: Session; refresh: () => Promise<void> }) {
-  const path = appPath(app.id) + '/draft/acl';
-  const [value, setValue] = useState('');
-  const [status, setStatus] = useState('');
-  useEffect(() => {
-    void api<{ app: { id: string }[]; field: { id: string }[]; record: { id: string }[] }>(path, session.token).then((acl) => {
-      setValue(JSON.stringify(Object.fromEntries(Object.entries(acl).map(([key, rules]) => [
-        key, rules.map(({ id: _id, ...rule }) => rule),
-      ])), null, 2));
-    }).catch((error) => setStatus(message(error)));
-  }, [path]);
-  return <form className="stack" onSubmit={(event) => {
-    event.preventDefault();
-    void Promise.resolve().then(() => api(path, session.token, json('PUT', JSON.parse(value)))).then(async () => {
-      await refresh(); setStatus('Permissions saved to the draft.');
-    }).catch((error) => setStatus(message(error)));
-  }}>
-    <label>Permission rules (JSON) <textarea value={value} rows={10} onChange={(event) => setValue(event.target.value)} required /></label>
-    <button type="submit">Save permissions to draft</button>
-    {status && <p role="status">{status}</p>}
   </form>;
 }
 

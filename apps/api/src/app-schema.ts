@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Injectable, NotFoundException,
-  Delete, Param, Patch, Post, Put, Query, UseGuards,
+  Delete, Param, Patch, Post, Put, Query, ServiceUnavailableException, UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
 import {
@@ -19,7 +19,7 @@ import { dataPreflight, formLayoutInput, isDestructive, migrationInput, referenc
 import { retireChangedIndexes } from './runtime-index-state';
 import { fieldChanges, serializeRecord, writeRecordEvent } from './record-events';
 import { projectSearchValues } from './search-projection';
-import { viewInput } from './view-input';
+import { conditions, viewInput } from './view-input';
 import { identifier, parseInput, postgresErrorCode } from './validation';
 
 const codePattern = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -674,12 +674,34 @@ export class AppSchemaService {
     });
   }
 
-  async previewPermissions(context: TenantContext, appId: string, target: string, record: string | undefined) {
-    return withTenantTransaction(context, async (tx) => {
-      const app = await this.managedApp(tx, context, appId);
-      const fields = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
-      return this.authorization.preview(tx, context, appId, target, record, new Map(fields.map(({ fieldId, type }) => [fieldId, type])));
-    });
+  async previewPermissions(context: TenantContext, appId: string, target: string,
+    selection: { recordId?: string; conditions?: z.infer<typeof conditions> }) {
+    try {
+      return await withTenantTransaction(context, async (tx) => {
+        if (selection.conditions) await tx.execute(sql`SET LOCAL statement_timeout = '1500ms'`);
+        const app = await this.managedApp(tx, context, appId);
+        const fields = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
+        const byId = new Map(fields.map((field) => [field.fieldId, field]));
+        const normalized = selection.conditions?.map((condition) => {
+          const field = byId.get(condition.fieldId);
+          if (!field || !fieldContract[field.type].filter ||
+              (condition.operator === 'current-user' && field.type !== 'user') ||
+              (condition.operator === 'current-user-group' && field.type !== 'group')) {
+            throw new BadRequestException('Unsupported permission preview condition');
+          }
+          if (!('value' in condition)) return condition;
+          const value = normalizeValue(field.type, condition.value, field.options);
+          if (value === undefined) throw new BadRequestException('Invalid permission preview value');
+          return { ...condition, value };
+        });
+        return this.authorization.preview(tx, context, appId, target, { recordId: selection.recordId, conditions: normalized }, fields);
+      });
+    } catch (error) {
+      if (postgresErrorCode(error) === '57014') {
+        throw new ServiceUnavailableException('Permission preview timed out. Narrow the conditions and retry.');
+      }
+      throw error;
+    }
   }
 
   async writable(tx: TenantTransaction, context: TenantContext, appId: string, action: AppAction) {
@@ -829,8 +851,10 @@ export class AppSchemaController {
 
   @Post(':appId/permissions/preview')
   preview(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
-    const { userId, recordId } = parseInput(z.strictObject({ userId: identifier, recordId: identifier.optional() }), body);
-    return this.schemas.previewPermissions(context, parseInput(identifier, id), userId, recordId);
+    const { userId, ...selection } = parseInput(z.strictObject({
+      userId: identifier, recordId: identifier.optional(), conditions: conditions.min(1).optional(),
+    }).refine((input) => !(input.recordId && input.conditions)), body);
+    return this.schemas.previewPermissions(context, parseInput(identifier, id), userId, selection);
   }
 
   @Post(':appId/publish')

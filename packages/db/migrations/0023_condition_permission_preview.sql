@@ -1,0 +1,1 @@
+ALTER TABLE "permission_audit" ADD COLUMN "record_conditions" jsonb;

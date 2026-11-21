@@ -95,7 +95,35 @@ test('Gate 1 browser directory, layout drag and undo, saved views, rich text, an
     const formatted = page.locator('.rich-text-value b, .rich-text-value strong');
     await formatted.waitFor();
     assert.equal(await formatted.innerText(), 'Formatted note');
-    t.diagnostic('Directory created Tokyo and renamed Sales Japan. Drag, undo, two previews, configured view, restore and rich-text formatting passed.');
+    await button('Orders').click();
+    await button('Settings').click();
+    await button('Permissions').click();
+    await button('Add application rule').click();
+    const applicationRules = page.getByRole('group', { name: 'Application permissions' });
+    await applicationRules.getByLabel('Subject', { exact: true }).selectOption(owner.userId);
+    await button('Add record rule').click();
+    const recordRules = page.getByRole('group', { name: 'Record permissions' });
+    await recordRules.getByLabel('Subject', { exact: true }).selectOption(owner.userId);
+    await recordRules.getByRole('button', { name: 'Add condition', exact: true }).click();
+    await recordRules.getByLabel('Condition field', { exact: true }).selectOption(fields.amount.fieldId);
+    await recordRules.getByLabel('Value', { exact: true }).fill('20');
+    await button('Add field rule').click();
+    const fieldRules = page.getByRole('group', { name: 'Field permissions' });
+    await fieldRules.getByLabel('Field').selectOption(fields.title.fieldId);
+    await fieldRules.getByLabel('Subject', { exact: true }).selectOption(owner.userId);
+    await button('Save permissions to draft').click();
+    await page.getByText('Permissions saved to the draft.').waitFor();
+    await button('Preflight and publish').click();
+    await page.getByText('Draft preflight passed and the schema was published.').waitFor();
+    await page.getByLabel('Target user').selectOption(owner.userId);
+    await page.getByLabel('Preview scope').selectOption('conditions');
+    const preview = page.locator('form').filter({ has: button('Evaluate permissions') });
+    await preview.getByRole('button', { name: 'Add condition', exact: true }).click();
+    await preview.getByLabel('Condition field', { exact: true }).selectOption(fields.amount.fieldId);
+    await preview.getByLabel('Value', { exact: true }).fill('20');
+    await button('Evaluate permissions').click();
+    await page.getByText('1 records matched the conditions.', { exact: true }).waitFor();
+    t.diagnostic('Directory, pointer drag and undo, desktop and mobile previews, saved views, restore, rich text, all ACL layers and conditional preview passed.');
   } finally {
     await browser.close();
   }

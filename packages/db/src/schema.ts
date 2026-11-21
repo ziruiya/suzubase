@@ -1,4 +1,4 @@
-import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type ViewCondition } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -339,6 +339,7 @@ export const permissionAudit = pgTable('permission_audit', {
   actorId: uuid('actor_id').notNull(),
   targetUserId: uuid('target_user_id').notNull(),
   recordId: uuid('record_id'),
+  recordConditions: jsonb('record_conditions').$type<ViewCondition[]>(),
   occurredAt: time('occurred_at').notNull().defaultNow(),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.id] }),

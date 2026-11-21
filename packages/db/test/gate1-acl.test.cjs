@@ -63,13 +63,27 @@ test('G1-08 versioned ACLs are enforced by record reads, aggregate, attachment a
   assert.equal(preview.record.edit.allowed, true);
   assert.equal(preview.fields[secret.fieldId].view.allowed, false);
   assert.equal(hiddenPreview.record.view.allowed, false);
+  const byCondition = await as(201, 'POST', '/permissions/preview', {
+    userId: member.userId, conditions: [{ fieldId: assignee.fieldId, operator: 'current-user' }],
+  });
+  assert.equal(byCondition.matchedRecords, '1');
+  assert.equal(byCondition.record.view.allowedRecords, aggregate.count);
+  assert.equal(byCondition.record.edit.allowed, preview.record.edit.allowed);
+  assert.deepEqual(byCondition.record.view.matched, preview.record.view.matched);
+  assert.equal(byCondition.fields[secret.fieldId].view.allowed, false);
+  const excluded = await as(201, 'POST', '/permissions/preview', {
+    userId: member.userId, conditions: [{ fieldId: amount.fieldId, operator: 'eq', value: '50' }],
+  });
+  assert.equal(excluded.matchedRecords, '1');
+  assert.equal(excluded.record.view.allowedRecords, '0');
   const db = new Client({ connectionString: process.env.ADMIN_DATABASE_URL });
   await db.connect();
   try {
-    const audit = await db.query('SELECT record_id FROM permission_audit WHERE tenant_id = $1 AND app_id = $2', [owner.tenantId, app.id]);
-    assert.equal(audit.rows.length, 2);
+    const audit = await db.query('SELECT record_id, record_conditions FROM permission_audit WHERE tenant_id = $1 AND app_id = $2', [owner.tenantId, app.id]);
+    assert.equal(audit.rows.length, 4);
+    assert.equal(audit.rows.filter(({ record_conditions }) => record_conditions !== null).length, 2);
   } finally {
     await db.end();
   }
-  t.diagnostic(JSON.stringify({ list: list.items.length, aggregate, visible: preview.record, hidden: hiddenPreview.record }));
+  t.diagnostic(JSON.stringify({ list: list.items.length, aggregate, visible: preview.record, hidden: hiddenPreview.record, byCondition: byCondition.record, excluded: excluded.record }));
 });

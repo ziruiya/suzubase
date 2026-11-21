@@ -178,14 +178,17 @@ export class AuthorizationService {
     if (!target) throw new BadRequestException('Unknown permission subject');
   }
 
-  async preview(tx: TenantTransaction, actor: TenantContext, appId: string, targetId: string, recordId: string | undefined,
-    types: Map<string, FieldType>) {
+  async preview(tx: TenantTransaction, actor: TenantContext, appId: string, targetId: string,
+    selection: { recordId?: string; conditions?: ViewCondition[] }, fields: FieldDefinition[]) {
+    const { recordId, conditions } = selection;
+    const types = new Map(fields.map(({ fieldId, type }) => [fieldId, type]));
+    const formulaRefs = formulaReferences(fields);
     const [app] = await tx.select().from(apps).where(this.appScope(actor, appId, 'manage'));
     if (!app) throw new NotFoundException('无权限');
     const target = { tenantId: actor.tenantId, userId: targetId };
     const principal = await this.principal(tx, target);
     const acl = await this.configuration(tx, target, appId, app.publishedSchemaVersion);
-    const access = { principal, acl, types };
+    const access = { principal, acl, types, formulaRefs };
     const appDecisions = {} as Record<AppAction, PermissionDecision>;
     for (const action of appActions) {
       const [row] = await tx.select({ id: apps.id }).from(apps).where(this.appScope(target, appId, action));
@@ -193,37 +196,58 @@ export class AuthorizationService {
       const allowed = Boolean(row);
       appDecisions[action] = { allowed, matched: allowed && !matched.length ? ['app-owner-or-tenant-admin'] : matched };
     }
-    const recordDecisions = {} as Record<RecordAction, PermissionDecision>;
+    let candidates = and(eq(records.tenantId, target.tenantId), eq(records.appId, appId), isNull(records.deletedAt));
+    let matchedRecords: string | undefined;
+    if (recordId) candidates = and(candidates, eq(records.id, recordId));
+    if (conditions) {
+      const [actorCanView] = await tx.select({ id: apps.id }).from(apps).where(this.appScope(actor, appId, 'view'));
+      const acting = { principal: await this.principal(tx, actor), acl, types, formulaRefs };
+      if (!actorCanView || conditions.some(({ fieldId }) => !this.fieldDecision(acting, fieldId, 'view').allowed)) {
+        throw new NotFoundException('无权限');
+      }
+      candidates = and(candidates, this.recordScope(acting, 'view'),
+        ...conditions.map((condition) => this.condition(target, condition, types.get(condition.fieldId))));
+      const [{ count }] = await tx.select({ count: sql<string>`count(*)::text` }).from(records).where(candidates);
+      matchedRecords = count;
+    }
+    const recordDecisions = {} as Record<RecordAction, PermissionDecision & { allowedRecords?: string }>;
     for (const action of recordActions) {
       const gates = action === 'view' ? ['view'] as const : ['view', action] as const;
-      const decision: PermissionDecision = { allowed: false, matched: [] };
+      const decision: PermissionDecision & { allowedRecords?: string } = {
+        allowed: false, matched: [], ...(conditions && { allowedRecords: '0' }),
+      };
       recordDecisions[action] = decision;
-      if (!gates.every((gate) => appDecisions[gate].allowed) || !recordId) continue;
-      const where = and(eq(records.tenantId, target.tenantId), eq(records.appId, appId), eq(records.id, recordId),
-        isNull(records.deletedAt), ...gates.map((gate) => this.recordScope(access, gate)));
-      const [record] = await tx.select({ id: records.id }).from(records).where(where);
-      if (!record) continue;
-      decision.allowed = true;
+      if (!gates.every((gate) => appDecisions[gate].allowed) || (!recordId && !conditions)) continue;
+      const where = and(candidates, ...gates.map((gate) => this.recordScope(access, gate)));
+      if (conditions) {
+        const [{ count }] = await tx.select({ count: sql<string>`count(*)::text` }).from(records).where(where);
+        decision.allowedRecords = count;
+        decision.allowed = count !== '0';
+      } else {
+        const [record] = await tx.select({ id: records.id }).from(records).where(where).limit(1);
+        decision.allowed = Boolean(record);
+      }
+      if (!decision.allowed) continue;
       const rules = this.recordRules(principal, acl, action, types);
       if (!rules.length) decision.matched.push('default-record-access');
       for (const rule of rules) {
-        const [matched] = await tx.select({ id: records.id }).from(records).where(and(where, rule.predicate));
+        const [matched] = await tx.select({ id: records.id }).from(records).where(and(where, rule.predicate)).limit(1);
         if (matched) decision.matched.push(rule.id);
       }
     }
     const fieldDecisions = Object.fromEntries([...types.keys()].map((id) => [id, Object.fromEntries(
       fieldActions.map((action) => {
         const decision = this.fieldDecision(access, id, action);
-        const recordGate = !recordId || recordDecisions[action === 'view' ? 'view' : 'edit'].allowed;
+        const recordGate = (!recordId && !conditions) || recordDecisions[action === 'view' ? 'view' : 'edit'].allowed;
         const enabled = recordGate && (action === 'view' ? appDecisions.view.allowed :
           appDecisions.edit.allowed && this.editable(access, id));
         return [action, enabled ? decision : { allowed: false, matched: [] }];
       }),
     )]));
     await tx.insert(permissionAudit).values({
-      tenantId: actor.tenantId, appId, actorId: actor.userId, targetUserId: targetId, recordId,
+      tenantId: actor.tenantId, appId, actorId: actor.userId, targetUserId: targetId, recordId, recordConditions: conditions,
     });
-    return { app: appDecisions, record: recordDecisions, fields: fieldDecisions };
+    return { app: appDecisions, record: recordDecisions, fields: fieldDecisions, ...(conditions && { matchedRecords }) };
   }
 }
 
