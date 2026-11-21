@@ -36,6 +36,13 @@
       "when": 1795265332115,
       "tag": "0004_record_create_keys",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1795265332116,
+      "tag": "0005_gate1_identity",
+      "breakpoints": true
     }
   ]
 }

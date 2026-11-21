@@ -41,7 +41,7 @@ test('all Drizzle migrations run from an empty PostgreSQL database and can be re
       ORDER BY c.relname
     `);
     assert.deepEqual(rows.map(({ relname }) => relname), [
-      'app_counters', 'app_versions', 'apps', 'fields', 'login_credentials', 'outbox',
+      'app_counters', 'app_versions', 'apps', 'fields', 'group_members', 'login_credentials', 'member_groups', 'organizations', 'outbox',
       'record_create_keys', 'record_events', 'record_references', 'records', 'tenant_members', 'tenants', 'users',
     ]);
     assert.ok(rows.every(({ relrowsecurity, owner }) => relrowsecurity && owner === 'suzubase_migration'));

@@ -11,24 +11,45 @@ const time = (name: string) => timestamp(name, { withTimezone: true, mode: 'stri
 export const tenants = pgTable('tenants', {
   id: uuid().primaryKey().defaultRandom(),
   name: text().notNull(),
+  allowAppCreation: boolean('allow_app_creation').notNull().default(false),
+  passwordMinimum: integer('password_minimum').notNull().default(12),
+  passwordComplexity: boolean('password_complexity').notNull().default(true),
 });
+
+export const organizations = pgTable('organizations', {
+  tenantId: tenantId(),
+  id: uuid().notNull().defaultRandom(),
+  name: text().notNull(),
+  parentId: uuid('parent_id'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.parentId], foreignColumns: [t.tenantId, t.id] }),
+]);
 
 export const users = pgTable('users', {
   tenantId: tenantId(),
   id: uuid().notNull().defaultRandom(),
   email: text().notNull(),
+  loginName: text('login_name'),
+  displayName: text('display_name'),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.id] }),
   unique().on(t.tenantId, t.email),
+  unique().on(t.tenantId, t.loginName),
 ]);
 
 export const tenantMembers = pgTable('tenant_members', {
   tenantId: tenantId(),
   userId: uuid('user_id').notNull(),
+  isAdmin: boolean('is_admin').notNull().default(false),
+  disabledAt: time('disabled_at'),
+  sessionVersion: integer('session_version').notNull().default(0),
+  organizationId: uuid('organization_id'),
   canCreateApps: boolean('can_create_apps').notNull().default(false),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.userId] }),
   foreignKey({ columns: [t.tenantId, t.userId], foreignColumns: [users.tenantId, users.id] }),
+  foreignKey({ columns: [t.tenantId, t.organizationId], foreignColumns: [organizations.tenantId, organizations.id] }),
 ]);
 
 export const authentication = pgSchema('authentication');
@@ -206,5 +227,21 @@ export const recordCreateKeys = pgTable('record_create_keys', {
     columns: [t.tenantId, t.appId, t.recordId],
     foreignColumns: [records.tenantId, records.appId, records.id],
   }).onDelete('cascade'),
+  foreignKey({ columns: [t.tenantId, t.userId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
+export const memberGroups = pgTable('member_groups', {
+  tenantId: tenantId(),
+  id: uuid().notNull().defaultRandom(),
+  name: text().notNull(),
+}, (t) => [primaryKey({ columns: [t.tenantId, t.id] })]);
+
+export const groupMembers = pgTable('group_members', {
+  tenantId: tenantId(),
+  groupId: uuid('group_id').notNull(),
+  userId: uuid('user_id').notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.groupId, t.userId] }),
+  foreignKey({ columns: [t.tenantId, t.groupId], foreignColumns: [memberGroups.tenantId, memberGroups.id] }),
   foreignKey({ columns: [t.tenantId, t.userId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
 ]);

@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import {
-  and, apps, eq, fields, isNull, lte, records, tenantMembers, TenantContext, TenantTransaction,
+  and, apps, eq, fields, isNull, lte, records, tenants, tenantMembers, TenantContext, TenantTransaction,
 } from '@suzubase/db';
 
 const appActions = ['view', 'create', 'edit', 'delete', 'import', 'export', 'manage'] as const;
@@ -34,9 +34,10 @@ export class AuthorizationService {
   }
 
   async canCreateApp(tx: TenantTransaction, context: TenantContext): Promise<boolean> {
-    const [member] = await tx.select({ allowed: tenantMembers.canCreateApps }).from(tenantMembers)
+    const [member] = await tx.select({ allowed: tenantMembers.canCreateApps, admin: tenantMembers.isAdmin, tenantAllows: tenants.allowAppCreation })
+      .from(tenantMembers).innerJoin(tenants, eq(tenants.id, tenantMembers.tenantId))
       .where(and(eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, context.userId)));
-    return member?.allowed ?? false;
+    return Boolean(member && (member.admin || member.allowed || member.tenantAllows));
   }
 
   async evaluateEffectivePermissions(

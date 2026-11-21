@@ -4,16 +4,17 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ApiBody, ApiOkResponse, ApiTags } from '@nestjs/swagger';
-import { TenantContext, verifyLogin } from '@suzubase/db';
+import { and, eq, tenantMembers, TenantContext, verifyLogin, withTenantTransaction } from '@suzubase/db';
 import { z } from 'zod';
 import { identifier, parseInput } from './validation';
 
 const loginInput = z.strictObject({
-  email: z.email().max(254),
+  email: z.email().max(254).optional(),
+  loginName: z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,63}$/i).optional(),
   password: z.string().min(1).max(1024).refine((value) => !/[\x00\p{Surrogate}]/u.test(value)),
-});
+}).refine(({ email, loginName }) => Boolean(email) !== Boolean(loginName));
 
-const sessionClaims = z.object({ tenantId: identifier, sub: identifier });
+const sessionClaims = z.object({ tenantId: identifier, sub: identifier, sessionVersion: z.number().int() });
 
 interface AuthenticatedRequest {
   headers: { authorization?: string };
@@ -35,11 +36,11 @@ export class SessionController {
   })
   @ApiOkResponse({ description: 'One-hour session token for the UI and same-origin clients.' })
   async login(@Body() body: unknown) {
-    const { email, password } = parseInput(loginInput, body);
-    const identity = await verifyLogin(email.toLowerCase(), password);
+    const { email, loginName, password } = parseInput(loginInput, body);
+    const identity = await verifyLogin((email ?? loginName!).toLowerCase(), password);
     if (!identity) throw new UnauthorizedException('Invalid credentials');
     return {
-      accessToken: await this.sessions.signAsync({ tenantId: identity.tenantId }, { subject: identity.userId }),
+      accessToken: await this.sessions.signAsync({ tenantId: identity.tenantId, sessionVersion: identity.sessionVersion }, { subject: identity.userId }),
       expiresIn: 3600,
     };
   }
@@ -55,7 +56,15 @@ export class SessionGuard implements CanActivate {
     if (!match) throw new UnauthorizedException();
     try {
       const claims = sessionClaims.parse(await this.sessions.verifyAsync(match[1]));
-      request.tenantContext = Object.freeze({ tenantId: claims.tenantId, userId: claims.sub });
+      const identity = { tenantId: claims.tenantId, userId: claims.sub };
+      const active = await withTenantTransaction(identity, async (tx) => {
+        const [member] = await tx.select().from(tenantMembers).where(and(
+          eq(tenantMembers.tenantId, identity.tenantId), eq(tenantMembers.userId, identity.userId),
+        ));
+        return member && member.disabledAt === null && member.sessionVersion === claims.sessionVersion;
+      });
+      if (!active) throw new UnauthorizedException();
+      request.tenantContext = Object.freeze(identity);
     } catch {
       throw new UnauthorizedException('Invalid session');
     }

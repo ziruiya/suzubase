@@ -5,7 +5,7 @@ import { Pool } from 'pg';
 export { and, eq, isNull, lte, sql } from 'drizzle-orm';
 export {
   apps, appCounters, appVersions, fields, outbox, recordCreateKeys, recordEvents, records, recordReferences,
-  tenantMembers, tenants, users,
+  groupMembers, loginCredentials, memberGroups, organizations, tenantMembers, tenants, users,
 } from './schema';
 
 export interface TenantContext {
@@ -29,9 +29,9 @@ export async function checkDatabase(): Promise<void> {
 }
 
 // This credential verifier returns an identity only after the password matches.
-export async function verifyLogin(email: string, password: string): Promise<TenantContext | undefined> {
-  const result = await pool.query<{ tenantId: string; userId: string }>(
-    'SELECT tenant_id AS "tenantId", user_id AS "userId" FROM authentication.verify_login($1, $2)',
+export async function verifyLogin(email: string, password: string): Promise<(TenantContext & { sessionVersion: number }) | undefined> {
+  const result = await pool.query<{ tenantId: string; userId: string; sessionVersion: number }>(
+    'SELECT tenant_id AS "tenantId", user_id AS "userId", session_version AS "sessionVersion" FROM authentication.verify_login($1, $2)',
     [email, password],
   );
   return result.rows[0];

@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import { randomBytes } from 'node:crypto';
 import { JwtModule } from '@nestjs/jwt';
 import { SessionController, SessionGuard } from './identity';
+import { TenantAdminController, TenantAdminService } from './tenant-admin';
 import { AuthorizationService } from './authorization';
 import { AppSchemaController, AppSchemaService } from './app-schema';
 import { RecordService, RecordsController } from './records';
@@ -32,8 +33,8 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController, AppSchemaController, RecordsController],
-  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService],
+  controllers: [HealthController, SessionController, AppSchemaController, RecordsController, TenantAdminController],
+  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, TenantAdminService],
 })
 class AppModule {}
 
