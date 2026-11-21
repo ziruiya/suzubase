@@ -1,4 +1,4 @@
-import { fieldTypes, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -101,6 +101,7 @@ export const appVersions = pgTable('app_versions', {
   tenantId: tenantId(),
   appId: uuid('app_id').notNull(),
   version: integer().notNull(),
+  aclConfiguration: jsonb('acl_configuration').$type<AclConfiguration>().notNull().default(sql`'{"app":[],"record":[],"field":[]}'::jsonb`),
   viewConfiguration: jsonb('view_configuration').$type<ViewConfiguration>().notNull().default(sql`'{"views":[],"defaultId":null}'::jsonb`),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.version] }),
@@ -310,4 +311,19 @@ export const fileReferences = pgTable('file_references', {
   foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.fieldId], foreignColumns: [fields.tenantId, fields.appId, fields.fieldId] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.fileId], foreignColumns: [files.tenantId, files.appId, files.id] }),
+]);
+
+export const permissionAudit = pgTable('permission_audit', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  actorId: uuid('actor_id').notNull(),
+  targetUserId: uuid('target_user_id').notNull(),
+  recordId: uuid('record_id'),
+  occurredAt: time('occurred_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
+  foreignKey({ columns: [t.tenantId, t.actorId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  foreignKey({ columns: [t.tenantId, t.targetUserId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
 ]);

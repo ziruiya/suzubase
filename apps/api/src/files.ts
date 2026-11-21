@@ -4,7 +4,7 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import {
-  and, apps, eq, fileReferences, files, isNull, records, sql, TenantContext, TenantTransaction, withTenantTransaction,
+  and, apps, eq, inArray, fileReferences, files, isNull, records, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
 import { z } from 'zod';
 import { AppSchemaService } from './app-schema';
@@ -46,8 +46,10 @@ export class FileService {
     const { tenantId, userId } = context;
     if (!Buffer.isBuffer(body)) throw new BadRequestException('Expected a binary upload');
     const pending = await withTenantTransaction(context, async (tx) => {
-      await this.schema.publishedVersion(tx, context, appId);
-      const [app] = await tx.select().from(apps).where(this.authorization.appScope(context, appId));
+      const { app } = await this.schema.writable(tx, context, appId, 'edit').catch((error) => {
+        if (!(error instanceof NotFoundException)) throw error;
+        return this.schema.writable(tx, context, appId, 'create');
+      });
       if (body.length > app.attachmentMaxBytes) {
         throw new BadRequestException({ file: input.name, message: 'File exceeds the application size limit' });
       }
@@ -116,13 +118,18 @@ export class FileService {
 
   async download(context: TenantContext, appId: string, id: string) {
     const file = await withTenantTransaction(context, async (tx) => {
+      const { access, fields } = await this.schema.access(tx, context, appId, 'view');
+      const fieldIds = fields.filter(({ fieldId, type }) => type === 'attachment' &&
+        this.authorization.fieldDecision(access, fieldId, 'view').allowed).map(({ fieldId }) => fieldId);
+      if (!fieldIds.length) throw new NotFoundException('无权限');
       const [found] = await tx.select({ file: files }).from(files).innerJoin(apps, and(
         eq(apps.tenantId, files.tenantId), eq(apps.id, files.appId), this.authorization.appScope(context, appId),
       )).innerJoin(fileReferences, and(
         eq(fileReferences.tenantId, files.tenantId), eq(fileReferences.appId, files.appId), eq(fileReferences.fileId, files.id),
       )).innerJoin(records, and(
         eq(records.tenantId, fileReferences.tenantId), eq(records.appId, fileReferences.appId), eq(records.id, fileReferences.recordId),
-      )).where(and(this.fileScope(context.tenantId, appId, id), eq(files.state, 'ATTACHED'), isNull(records.deletedAt))).limit(1);
+      )).where(and(this.fileScope(context.tenantId, appId, id), eq(files.state, 'ATTACHED'), isNull(records.deletedAt),
+        inArray(fileReferences.fieldId, fieldIds), this.authorization.recordScope(access, 'view'))).limit(1);
       if (!found?.file.sha256) throw new NotFoundException('无权限');
       return found.file;
     });

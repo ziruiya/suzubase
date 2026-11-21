@@ -4,13 +4,13 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiConflictResponse, ApiHeader, ApiTags } from '@nestjs/swagger';
 import {
-  and, appCounters, apps, eq, gt, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordUniqueValues, records, sql, TenantContext,
+  and, appCounters, eq, gt, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordUniqueValues, records, sql, TenantContext,
   TenantTransaction, users, withTenantTransaction,
 } from '@suzubase/db';
-import { FieldChange, multiOptionFieldTypes, RecordData, RecordResponse } from '@suzubase/shared-types';
+import { FieldChange, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AppSchemaService } from './app-schema';
-import { AuthorizationService } from './authorization';
+import { AuthorizationService, RecordAccess } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
 import { RecordQueryService } from './record-query';
 import { writeRecordEvent } from './record-events';
@@ -127,7 +127,9 @@ export class RecordService {
 
   async create(context: TenantContext, appId: string, input: z.infer<typeof createInput>, key?: string) {
     return withTenantTransaction(context, async (tx) => {
-      const schemaVersion = await this.appSchema.publishedVersion(tx, context, appId);
+      const { app, access } = await this.appSchema.writable(tx, context, appId, 'create');
+      const schemaVersion = app.publishedSchemaVersion;
+      this.assertEditable(access, input.data);
       const identity = { tenantId: context.tenantId, appId };
       const counterScope = and(eq(appCounters.tenantId, context.tenantId), eq(appCounters.appId, appId));
       if (key !== undefined) {
@@ -139,7 +141,7 @@ export class RecordService {
         ));
         if (previous) {
           await this.findRecord(tx, context, appId, previous.response.id);
-          return previous.response;
+          return this.visibleRecord(access, previous.response);
         }
       }
 
@@ -159,7 +161,10 @@ export class RecordService {
           ...identity, userId: context.userId, key, recordId: record.id, response: record,
         });
       }
-      return record;
+      if (access.acl.record.some(({ action }) => action === 'view')) {
+        return this.findRecord(tx, context, appId, record.id);
+      }
+      return this.visibleRecord(access, record);
     });
   }
 
@@ -167,22 +172,46 @@ export class RecordService {
     return withTenantTransaction(context, (tx) => this.findRecord(tx, context, appId, recordId));
   }
 
-  private async findRecord(tx: TenantTransaction, context: TenantContext, appId: string, recordId: string, deleted = false) {
-    const [result] = await tx.select({ record: records }).from(records)
-      .innerJoin(apps, and(
-        eq(apps.tenantId, records.tenantId), eq(apps.id, records.appId),
-        this.authorization.appScope(context, appId),
-      )).where(and(eq(records.id, recordId), deleted ? sql`${records.deletedAt} IS NOT NULL` : isNull(records.deletedAt)));
-    if (!result) throw new NotFoundException();
-    return serializeRecord(result.record);
+  private async findRecord(
+    tx: TenantTransaction, context: TenantContext, appId: string, recordId: string,
+    action: RecordAction = 'view', deleted = false, raw = false,
+  ) {
+    const { access } = await this.appSchema.access(tx, context, appId, 'view');
+    const [row] = await tx.select({
+      id: records.id, tenantId: records.tenantId, appId: records.appId, recordNo: records.recordNo,
+      schemaVersion: records.schemaVersion, revision: records.revision, status: records.status,
+      createdAt: records.createdAt, createdBy: records.createdBy, updatedAt: records.updatedAt,
+      updatedBy: records.updatedBy, deletedAt: records.deletedAt, deletedBy: records.deletedBy,
+      data: raw ? records.data : this.authorization.projection(access),
+    }).from(records).where(and(
+      eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, recordId),
+      deleted ? sql`${records.deletedAt} IS NOT NULL` : isNull(records.deletedAt),
+      this.authorization.recordScope(access, 'view'),
+      action !== 'view' ? this.authorization.recordScope(access, action) : undefined,
+    ));
+    if (!row) throw new NotFoundException('无权限');
+    return serializeRecord(row);
+  }
+
+  private visibleRecord(access: RecordAccess, record: RecordResponse): RecordResponse {
+    return { ...record, data: Object.fromEntries(Object.entries(record.data).filter(([id]) =>
+      this.authorization.fieldDecision(access, id, 'view').allowed)) };
+  }
+
+  private assertEditable(access: RecordAccess, data: RecordData) {
+    for (const id of Object.keys(data)) {
+      if (!this.authorization.editable(access, id)) throw new ForbiddenException('无权限');
+    }
   }
 
   async update(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof updateInput>) {
     return withTenantTransaction(context, async (tx) => {
-      await this.appSchema.publishedVersion(tx, context, appId);
-      const current = await this.findRecord(tx, context, appId, recordId);
-      if (current.revision !== input.revision) this.rejectRevision(current);
-      const data = await this.normalizeData(tx, context, appId, current.schemaVersion, input.data);
+      const { access } = await this.appSchema.writable(tx, context, appId, 'edit');
+      const current = await this.findRecord(tx, context, appId, recordId, 'edit', false, true);
+      if (current.revision !== input.revision) this.rejectRevision(this.visibleRecord(access, current));
+      this.assertEditable(access, input.data);
+      const retained = Object.fromEntries(Object.entries(current.data).filter(([id]) => !this.authorization.editable(access, id)));
+      const data = await this.normalizeData(tx, context, appId, current.schemaVersion, { ...retained, ...input.data });
       const [row] = await tx.update(records).set({
         data, revision: sql`${records.revision} + 1`, updatedBy: context.userId, updatedAt: sql`clock_timestamp()`,
       }).where(and(
@@ -195,7 +224,7 @@ export class RecordService {
       await this.reserveUniqueValues(tx, context, updated);
       await this.reconcileFiles(tx, context, updated);
       await writeRecordEvent(tx, context, updated, 'updated', fieldChanges(current.data, data));
-      return updated;
+      return this.findRecord(tx, context, appId, recordId);
     });
   }
 
@@ -230,14 +259,24 @@ export class RecordService {
           eq(recordUniqueValues.tenantId, identity.tenantId), eq(recordUniqueValues.appId, identity.appId),
           eq(recordUniqueValues.fieldId, identity.fieldId), eq(recordUniqueValues.normalizedValue, normalizedValue),
         ));
-        throw new ConflictException({ field: field.fieldId, message: 'Unique value is occupied', recordId: holder?.recordId });
+        let visibleHolder: string | undefined;
+        if (holder) {
+          try {
+            const visible = await this.findRecord(tx, context, record.appId, holder.recordId);
+            if (Object.hasOwn(visible.data, field.fieldId)) visibleHolder = visible.id;
+          } catch (error) {
+            if (!(error instanceof NotFoundException)) throw error;
+          }
+        }
+        if (!visibleHolder) throw new ForbiddenException('无权限');
+        throw new ConflictException({ field: field.fieldId, message: 'Unique value is occupied', recordId: visibleHolder });
       }
     }
   }
 
   async list(context: TenantContext, appId: string, { after, limit = 50, view }: z.infer<typeof pageInput>) {
     return withTenantTransaction(context, async (tx) => {
-      const { where, sort, sortValue, numericSort, descending } = await this.query.scope(tx, context, appId, view);
+      const { where, sort, sortValue, numericSort, descending, data } = await this.query.scope(tx, context, appId, view);
       let afterCondition = after === undefined ? undefined : gt(records.recordNo, BigInt(after));
       if (after !== undefined && sort) {
         const [cursor] = await tx.select({ value: sortValue! }).from(records)
@@ -255,7 +294,12 @@ export class RecordService {
       }
       const order = sort ? [sql`${sort} ${descending ? sql`DESC` : sql`ASC`} NULLS LAST`, records.recordNo]
         : [records.recordNo];
-      const rows = await tx.select().from(records).where(and(where, afterCondition)).orderBy(...order).limit(limit + 1);
+      const rows = await tx.select({
+        id: records.id, tenantId: records.tenantId, appId: records.appId, recordNo: records.recordNo,
+        schemaVersion: records.schemaVersion, revision: records.revision, status: records.status,
+        createdAt: records.createdAt, createdBy: records.createdBy, updatedAt: records.updatedAt,
+        updatedBy: records.updatedBy, deletedAt: records.deletedAt, deletedBy: records.deletedBy, data,
+      }).from(records).where(and(where, afterCondition)).orderBy(...order).limit(limit + 1);
       return {
         items: rows.slice(0, limit).map(serializeRecord),
         nextCursor: rows.length > limit ? rows[limit - 1].recordNo.toString() : null,
@@ -269,7 +313,7 @@ export class RecordService {
       try {
         results.push({ index, record: await this.create(context, appId, input) });
       } catch (error) {
-        if (!(error instanceof BadRequestException || error instanceof ConflictException || error instanceof NotFoundException)) throw error;
+        if (!(error instanceof BadRequestException || error instanceof ConflictException || error instanceof ForbiddenException || error instanceof NotFoundException)) throw error;
         results.push({ index, status: error.getStatus(), error: error.getResponse() });
       }
     }
@@ -279,8 +323,8 @@ export class RecordService {
   async changeLifecycle(context: TenantContext, appId: string, id: string, revision: number, restore: boolean) {
     return withTenantTransaction(context, async (tx) => {
       if (restore && !await this.authorization.requireRecycleAccess(tx, context)) throw new ForbiddenException('无权限');
-      await this.appSchema.publishedVersion(tx, context, appId);
-      const current = await this.findRecord(tx, context, appId, id, restore);
+      const { access } = await this.appSchema.writable(tx, context, appId, 'delete');
+      const current = await this.findRecord(tx, context, appId, id, 'delete', restore);
       if (current.revision !== revision) this.rejectRevision(current);
       const [row] = await tx.update(records).set({
         revision: sql`${records.revision} + 1`, updatedBy: context.userId, updatedAt: sql`clock_timestamp()`,
@@ -293,15 +337,26 @@ export class RecordService {
       if (restore) await this.reserveUniqueValues(tx, context, record);
       else await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, id));
       await writeRecordEvent(tx, context, record, restore ? 'restored' : 'deleted', []);
-      return record;
+      return this.visibleRecord(access, record);
     });
   }
 
   async history(context: TenantContext, appId: string, id: string) {
     return withTenantTransaction(context, async (tx) => {
       await this.findRecord(tx, context, appId, id);
+      const { access } = await this.appSchema.access(tx, context, appId, 'view');
+      const visible = [...access.types.keys()].filter((id) => this.authorization.fieldDecision(access, id, 'view').allowed);
+      const visibleChanges = visible.length ? sql<FieldChange[]>`COALESCE((
+        SELECT jsonb_agg(change.value ORDER BY change.position)
+        FROM jsonb_array_elements(${recordEvents.changes}) WITH ORDINALITY AS change(value, position)
+        WHERE change.value->>'fieldId' IN (${sql.join(visible.map((id) => sql`${id}`), sql`,`)})
+      ), '[]'::jsonb)` : sql<FieldChange[]>`'[]'::jsonb`;
       const events = await tx.select({
-        event: recordEvents, name: users.displayName, email: users.email, disabledAt: tenantMembers.disabledAt,
+        event: {
+          eventId: recordEvents.eventId, recordRevision: recordEvents.recordRevision, schemaVersion: recordEvents.schemaVersion,
+          occurredAt: recordEvents.occurredAt, actorId: recordEvents.actorId, source: recordEvents.source,
+          kind: recordEvents.kind, changes: visibleChanges,
+        }, name: users.displayName, email: users.email, disabledAt: tenantMembers.disabledAt,
       }).from(recordEvents).innerJoin(users, and(
         eq(users.tenantId, recordEvents.tenantId), eq(users.id, recordEvents.actorId),
       )).innerJoin(tenantMembers, and(
@@ -312,7 +367,8 @@ export class RecordService {
       const schemas = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
       for (const { event } of events) {
         if (!schemas.has(event.schemaVersion)) {
-          schemas.set(event.schemaVersion, await this.appSchema.getFields(tx, context, appId, event.schemaVersion));
+          schemas.set(event.schemaVersion, (await this.appSchema.getFields(tx, context, appId, event.schemaVersion))
+            .filter(({ fieldId }) => visible.includes(fieldId)));
         }
       }
       return {
