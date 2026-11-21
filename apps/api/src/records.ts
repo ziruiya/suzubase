@@ -211,7 +211,10 @@ export class RecordService {
     tx: TenantTransaction, context: TenantContext, appId: string, recordId: string,
     action: RecordAction = 'view', deleted = false, raw = false,
   ) {
-    const { access } = await this.appSchema.access(tx, context, appId, 'view');
+    const { access } = await this.appSchema.access(tx, context, appId, 'view').catch((error: unknown) => {
+      if (error instanceof NotFoundException) throw new NotFoundException();
+      throw error;
+    });
     const [row] = await tx.select({
       id: records.id, tenantId: records.tenantId, appId: records.appId, recordNo: records.recordNo,
       schemaVersion: records.schemaVersion, revision: records.revision, status: records.status,
@@ -224,7 +227,10 @@ export class RecordService {
       this.authorization.recordScope(access, 'view'),
       action !== 'view' ? this.authorization.recordScope(access, action) : undefined,
     ));
-    if (!row) throw new NotFoundException('无权限');
+    if (!row) {
+      const hasRecordRules = access.acl.record.some((rule) => rule.action === 'view' || rule.action === action);
+      throw new NotFoundException(hasRecordRules ? '无权限' : undefined);
+    }
     return serializeRecord(row);
   }
 

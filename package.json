@@ -6,7 +6,8 @@
   },
   "packageManager": "pnpm@12.21.0",
   "scripts": {
-    "test": "node --test packages/db/test/*.test.cjs"
+    "test": "node --test --test-concurrency=1 packages/db/test/*.test.cjs",
+    "test:browser": "node --test --test-concurrency=1 test/browser/*.test.cjs"
   },
   "devDependencies": {
     "playwright": "^1.65.1"

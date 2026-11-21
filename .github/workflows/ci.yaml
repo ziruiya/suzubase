@@ -1,4 +1,4 @@
-name: B0 CI
+name: SuzuBase CI
 
 on:
   push:
@@ -30,6 +30,7 @@ jobs:
       RUNTIME_DATABASE_PASSWORD: suzubase-runtime-ci
       DATABASE_URL: postgres://suzubase_runtime:suzubase-runtime-ci@127.0.0.1:5432/suzubase
       TEST_API_URL: http://127.0.0.1:3000
+      TEST_WEB_URL: http://127.0.0.1:5173
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -40,9 +41,10 @@ jobs:
           npm install --global --prefix "$RUNNER_TEMP/suzubase-tools" "$(node -p 'require("./package.json").packageManager')"
           echo "$RUNNER_TEMP/suzubase-tools/bin" >> "$GITHUB_PATH"
       - run: pnpm install --frozen-lockfile
-      - run: pnpm -r build
-      - run: pnpm -r typecheck
-      - name: Migrate and run integration tests
+      - run: pnpm -r --workspace-concurrency=1 build
+      - run: pnpm -r --workspace-concurrency=1 typecheck
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: Migrate and run integration and browser tests
         run: |
           pnpm --filter @suzubase/db migrate
           node apps/api/dist/main.js > "$RUNNER_TEMP/suzubase-api.log" 2>&1 &
@@ -50,6 +52,15 @@ jobs:
           trap 'kill "$api_pid" 2>/dev/null || true' EXIT
           curl --retry 12 --retry-all-errors --retry-delay 1 -fsS "$TEST_API_URL/health"
           pnpm test
-      - name: API logs
+          pnpm --filter @suzubase/web exec vite preview --host 127.0.0.1 --port 5173 > "$RUNNER_TEMP/suzubase-web.log" 2>&1 &
+          web_pid=$!
+          trap 'kill "$web_pid" "$api_pid" 2>/dev/null || true' EXIT
+          curl --retry 12 --retry-all-errors --retry-delay 1 -fsS "$TEST_WEB_URL/api/health"
+          pnpm test:browser
+      - name: Application logs
         if: failure()
-        run: test ! -f "$RUNNER_TEMP/suzubase-api.log" || cat "$RUNNER_TEMP/suzubase-api.log"
+        run: |
+          for name in api web; do
+            log="$RUNNER_TEMP/suzubase-$name.log"
+            test ! -f "$log" || cat "$log"
+          done

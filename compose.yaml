@@ -32,6 +32,7 @@ services:
     <<: *workspace
     command: pnpm --filter @suzubase/api start
     environment:
+      SEARCH_TIMING: ${SEARCH_TIMING:-0}
       DATABASE_URL: postgres://suzubase_runtime:suzubase-runtime-dev@postgres:5432/suzubase
     volumes:
       - attachment-data:/workspace/attachments

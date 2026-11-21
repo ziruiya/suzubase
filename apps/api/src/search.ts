@@ -28,6 +28,17 @@ function normalize(kind: SearchKind, value: string) {
   return normalized;
 }
 
+function upperPrefixBound(prefix: string) {
+  const characters = [...prefix];
+  while (characters.length) {
+    const codePoint = characters.pop()!.codePointAt(0)!;
+    if (codePoint === 0x10ffff) continue;
+    const next = codePoint === 0xd7ff ? 0xe000 : codePoint + 1;
+    return characters.join('') + String.fromCodePoint(next);
+  }
+  return undefined;
+}
+
 function searchableKinds(field: { type: FieldType; searchMode: TextSearchMode | null }): SearchKind[] {
   if (field.type === 'phone') return ['phone', 'phone-reverse'];
   if (field.type === 'email') return ['email'];
@@ -72,9 +83,14 @@ export class SearchService {
         if (!value || (kind === 'phone-reverse' && !/^[0-9]{4,}$/.test(value))) {
           throw new BadRequestException('Enter a valid search value. Phone suffixes require at least four digits.');
         }
-        const pattern = value.replace(/[\\_%]/g, '\\$&') + '%';
-        const filter = input.mode === 'exact' ? eq(recordSearchValues.value, value)
-          : sql`${recordSearchValues.value} LIKE ${pattern}`;
+        // LIKE is not leakproof in PostgreSQL, so RLS can prevent the planner from
+        // turning it into an index range. The text_pattern_ops comparisons are
+        // leakproof and use the same byte ordering as the projection index.
+        const upper = input.mode === 'exact' ? undefined : upperPrefixBound(value);
+        const filter = input.mode === 'exact' ? eq(recordSearchValues.value, value) : and(
+          sql`${recordSearchValues.value} OPERATOR(pg_catalog.~>=~) ${value}`,
+          upper === undefined ? undefined : sql`${recordSearchValues.value} OPERATOR(pg_catalog.~<~) ${upper}`,
+        );
         const matches = tx.select({ recordId: recordSearchValues.recordId }).from(recordSearchValues).where(and(
           eq(recordSearchValues.tenantId, context.tenantId), eq(recordSearchValues.appId, appId),
           eq(recordSearchValues.fieldId, input.field), eq(recordSearchValues.kind, kind), filter,
