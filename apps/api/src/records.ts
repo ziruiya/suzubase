@@ -4,7 +4,7 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiConflictResponse, ApiHeader, ApiTags } from '@nestjs/swagger';
 import {
-  and, appCounters, apps, eq, isNull, recordCreateKeys, records, sql, TenantContext,
+  and, appCounters, apps, eq, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, records, sql, TenantContext,
   TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
 import { FieldChange, RecordData, RecordResponse } from '@suzubase/shared-types';
@@ -13,6 +13,7 @@ import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
 import { writeRecordEvent } from './record-events';
+import { normalizeValue } from './field-values';
 import { identifier, parseInput } from './validation';
 
 const dataInput = z.record(identifier, z.string());
@@ -25,17 +26,6 @@ const dataSchema = {
   description: 'Keys are field UUIDs. Numbers are decimal strings such as "-12.50", stored as "-12.5".',
   additionalProperties: { type: 'string' },
 };
-
-function normalizeDecimal(value: string): string | undefined {
-  if (value.length > 200) return undefined;
-  const parts = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(value);
-  if (!parts || parts[0] !== value) return undefined;
-  const [, sign, integer, fraction = ''] = parts;
-  const whole = integer.replace(/^0+(?=\d)/, '');
-  const partial = fraction.replace(/0+$/, '');
-  const prefix = sign === '-' && (whole !== '0' || partial) ? '-' : '';
-  return partial ? `${prefix}${whole}.${partial}` : `${prefix}${whole}`;
-}
 
 function serializeRecord(row: typeof records.$inferSelect): RecordResponse {
   const { id, appId, recordNo, data, schemaVersion, revision, status, createdBy, createdAt, updatedBy, updatedAt } = row;
@@ -64,16 +54,54 @@ export class RecordService {
     tx: TenantTransaction, context: TenantContext, appId: string, version: number, data: RecordData,
   ): Promise<RecordData> {
     const definitions = await this.appSchema.getFields(tx, context, appId, version);
-    const types = new Map(definitions.map(({ fieldId, type }) => [fieldId, type]));
-    return Object.fromEntries(Object.entries(data).map(([fieldId, value]) => {
-      const type = types.get(fieldId);
-      if (!type) throw new BadRequestException(`Unknown field ${fieldId}`);
-      const normalized = type === 'number'
-        ? normalizeDecimal(value)
-        : /[\r\n\x00\u2028\u2029\p{Surrogate}]/u.test(value) ? undefined : value;
-      if (normalized === undefined) throw new BadRequestException(`Invalid ${type} value for field ${fieldId}`);
-      return [fieldId, normalized];
-    }));
+    const fields = new Map(definitions.map((field) => [field.fieldId, field]));
+    const errors: { field: string; message: string }[] = [];
+    const normalizedData: RecordData = {};
+    for (const [fieldId, value] of Object.entries(data)) {
+      const field = fields.get(fieldId);
+      if (!field) {
+        errors.push({ field: fieldId, message: 'Unknown field' });
+        continue;
+      }
+      const normalized = value === '' && field.type !== 'number' ? '' : normalizeValue(field.type, value, field.options);
+      if (normalized === undefined || !await this.validDirectoryValue(tx, context, field.type, normalized)) {
+        errors.push({ field: fieldId, message: `Invalid ${field.type} value` });
+      } else {
+        normalizedData[fieldId] = normalized;
+      }
+    }
+    for (const field of definitions) {
+      if (field.required && ['', '[]', undefined].includes(normalizedData[field.fieldId])) {
+        errors.push({ field: field.fieldId, message: 'Required field' });
+      }
+    }
+    if (errors.length) throw new BadRequestException(errors);
+    return normalizedData;
+  }
+
+  private async validDirectoryValue(tx: TenantTransaction, context: TenantContext, type: string, id: string) {
+    if (!id) return true;
+    switch (type) {
+      case 'user': {
+        const [user] = await tx.select({ id: tenantMembers.userId }).from(tenantMembers).where(and(
+          eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, id), isNull(tenantMembers.disabledAt),
+        ));
+        return Boolean(user);
+      }
+      case 'organization': {
+        const [organization] = await tx.select({ id: organizations.id }).from(organizations).where(and(
+          eq(organizations.tenantId, context.tenantId), eq(organizations.id, id),
+        ));
+        return Boolean(organization);
+      }
+      case 'group': {
+        const [group] = await tx.select({ id: memberGroups.id }).from(memberGroups).where(and(
+          eq(memberGroups.tenantId, context.tenantId), eq(memberGroups.id, id),
+        ));
+        return Boolean(group);
+      }
+      default: return true;
+    }
   }
 
   async create(context: TenantContext, appId: string, input: z.infer<typeof createInput>, key?: string) {

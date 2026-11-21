@@ -1,4 +1,4 @@
-import { fieldTypes, type FieldChange, type RecordData, type RecordResponse } from '@suzubase/shared-types';
+import { fieldTypes, type FieldChange, type FieldOption, type RecordData, type RecordResponse } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -113,6 +113,8 @@ export const fields = pgTable('fields', {
   code: text().notNull(),
   name: text().notNull(),
   type: fieldType().notNull(),
+  required: boolean().notNull().default(false),
+  options: jsonb().$type<FieldOption[]>().notNull().default(sql`'[]'::jsonb`),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.fieldId] }),
   unique().on(t.tenantId, t.appId, t.code),

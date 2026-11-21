@@ -4,9 +4,9 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
 import {
-  and, apps, appCounters, appVersions, eq, fields, isNull, lte, recordReferences, sql, TenantContext, TenantTransaction, withTenantTransaction,
+  and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, recordReferences, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { fieldTypes } from '@suzubase/shared-types';
+import { fieldTypes, optionFieldTypes } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AuthorizationService } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
@@ -29,7 +29,11 @@ const settingsInput = z.strictObject({
   adminMemo: z.string().max(4000).optional(),
 }).refine((settings) => Object.keys(settings).length > 0 &&
   [settings.description, settings.icon, settings.adminMemo].every((value) => !value || !/[\x00\p{Surrogate}]/u.test(value)));
-const fieldInput = z.strictObject({ ...metadata, type: z.enum(fieldTypes) });
+const option = z.strictObject({ value: z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,63}$/i), label: metadata.name, disabled: z.boolean().default(false) });
+const fieldInput = z.strictObject({
+  ...metadata, type: z.enum(fieldTypes), required: z.boolean().default(false), options: z.array(option).max(200).default([]),
+}).refine(({ options, type }) => optionFieldTypes.has(type) === (options.length > 0)
+  && new Set(options.map(({ value }) => value)).size === options.length, { path: ['options'] });
 const metadataProperties = {
   code: { type: 'string', pattern: codePattern.source },
   name: { type: 'string', minLength: 1, maxLength: 120 },
@@ -138,8 +142,8 @@ export class AppSchemaService {
         await tx.insert(appVersions).values({ ...identity, version: 1 });
         await tx.insert(appCounters).values(identity);
         const definitions = await this.getFields(tx, context, appId, source.publishedSchemaVersion);
-        for (const { fieldId, code, name, type } of definitions) {
-          const [field] = await tx.insert(fields).values({ ...identity, code, name, type, introducedIn: 1 }).returning();
+        for (const { fieldId, code, name, type, required, options } of definitions) {
+          const [field] = await tx.insert(fields).values({ ...identity, code, name, type, required, options, introducedIn: 1 }).returning();
           if (source.titleFieldId === fieldId) copy.titleFieldId = field.fieldId;
         }
         if (copy.titleFieldId) await tx.update(apps).set({ titleFieldId: copy.titleFieldId })
@@ -169,7 +173,7 @@ export class AppSchemaService {
   }
 
   getFields(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
-    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type })
+    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required, options: fields.options })
       .from(fields).where(and(
         eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), lte(fields.introducedIn, version),
       )).orderBy(fields.introducedIn, fields.code);
@@ -195,6 +199,28 @@ export class AppSchemaService {
     }
   }
 
+  async getDraft(context: TenantContext, appId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      const app = await this.managedApp(tx, context, appId);
+      const version = app.draftSchemaVersion;
+      return { version, status: app.draftStatus, fields: version === null ? [] : await this.getFields(tx, context, appId, version) };
+    });
+  }
+
+  async setDraftRequired(context: TenantContext, appId: string, fieldId: string, required: boolean) {
+    return withTenantTransaction(context, async (tx) => {
+      const app = await this.managedApp(tx, context, appId);
+      if (app.draftSchemaVersion === null) throw new ConflictException('No draft to edit');
+      const scope = and(eq(fields.tenantId, context.tenantId), eq(fields.appId, appId),
+        eq(fields.fieldId, fieldId), eq(fields.introducedIn, app.draftSchemaVersion));
+      const [field] = await tx.update(fields).set({ required }).where(scope).returning();
+      if (!field) throw new NotFoundException();
+      await tx.update(apps).set({ draftStatus: 'editing' })
+        .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
+      return field;
+    });
+  }
+
   async publish(context: TenantContext, appId: string) {
     const result = await withTenantTransaction(context, async (tx) => {
       const app = await this.findApp(tx, context, appId, true);
@@ -203,13 +229,27 @@ export class AppSchemaService {
       const [addition] = await tx.select({ fieldId: fields.fieldId }).from(fields).where(and(
         eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), eq(fields.introducedIn, version),
       )).limit(1);
-      // B0 drafts can only add optional fields. Existing definitions are immutable, so
-      // a valid successor with an addition has no destructive dependencies to check.
-      if (version !== app.publishedSchemaVersion + 1 || !addition) {
+      const requireFields = await tx.select({ fieldId: fields.fieldId, name: fields.name }).from(fields).where(and(
+        eq(fields.tenantId, context.tenantId), eq(fields.appId, appId),
+        eq(fields.introducedIn, version), eq(fields.required, true),
+      ));
+      const missing = requireFields.length ? await tx.select({
+        recordNo: sql<string>`${records.recordNo}::text`, fieldId: fields.fieldId, field: fields.name,
+      }).from(records).innerJoin(fields, and(
+        eq(fields.tenantId, records.tenantId), eq(fields.appId, records.appId),
+        eq(fields.introducedIn, version), eq(fields.required, true),
+      )).where(and(eq(records.tenantId, context.tenantId), eq(records.appId, appId),
+        sql`COALESCE(${records.data} ->> ${fields.fieldId}::text, '') IN ('', '[]')`)) : [];
+      if (version !== app.publishedSchemaVersion + 1 || !addition || missing.length) {
         await tx.update(apps).set({ draftStatus: 'validation-failed' })
           .where(this.authorization.appScope(context, appId));
-        return { failure: { appId, version, message: 'Expected the next schema version with at least one new field' } };
+        return { failure: {
+          appId, version, message: missing.length ? 'Existing records are missing required values' : 'Expected one or more new fields',
+          problems: missing.map((problem) => ({ ...problem, value: null, reason: 'required' })),
+          skippedDependencies: ['workflow', 'lookup'],
+        } };
       }
+      await tx.update(apps).set({ draftStatus: 'publishable' }).where(this.authorization.appScope(context, appId));
       const [published] = await tx.update(apps).set({
         publishedSchemaVersion: version, draftSchemaVersion: null, draftStatus: null,
       }).where(this.authorization.appScope(context, appId)).returning();
@@ -284,6 +324,18 @@ export class AppSchemaController {
   } })
   addField(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
     return this.schemas.addField(context, parseInput(identifier, id), parseInput(fieldInput, body));
+  }
+
+  @Get(':appId/draft')
+  draft(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
+    return this.schemas.getDraft(context, parseInput(identifier, id));
+  }
+
+  @Patch(':appId/draft/fields/:fieldId')
+  editDraft(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string,
+    @Param('fieldId') fieldId: string, @Body() body: unknown) {
+    const { required } = parseInput(z.strictObject({ required: z.boolean() }), body);
+    return this.schemas.setDraftRequired(context, parseInput(identifier, id), parseInput(identifier, fieldId), required);
   }
 
   @Post(':appId/publish')
