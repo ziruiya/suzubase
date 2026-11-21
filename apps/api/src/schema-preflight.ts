@@ -15,7 +15,7 @@ export const formLayoutInput = z.array(z.strictObject({
   cells: z.array(z.strictObject({ fieldId: identifier, width: z.literal(layoutWidths) })).min(1).max(4),
 })).max(500);
 
-export const migrationInput = z.strictObject({ incompatible: z.enum(['reject', 'clear-optional']).default('reject') });
+export const migrationInput = z.strictObject({ incompatible: z.enum(['reject', 'clear-optional']).default('reject'), workflowAssignees: z.literal('administrator-pool').optional() });
 export type MigrationStrategy = z.infer<typeof migrationInput>;
 
 export function isDestructive(current: FieldDefinition[], next: FieldDefinition[]) {

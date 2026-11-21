@@ -227,7 +227,7 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/workflow/publish']: { post: { reply: workflowHttp.definition, conflict: errorSchema } },
   [applications + '/workflow/enabled']: { patch: { body: workflowHttp.enabledInput, reply: workflowHttp.enabledInput, conflict: errorSchema } },
   [applications + '/publish']: { post: { body: appHttp.publishInput, optionalBody: true,
-    reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text) }), conflict: publishConflict } },
+    reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text), resolvedDependencies: z.array(z.looseObject({ fieldId: text, dependency: text, reason: text })) }), conflict: publishConflict } },
   [records]: { get: { query: recordHttp.pageInput, reply: page(record) }, post: { body: recordHttp.createInput, reply: record, conflict: errorSchema } },
   [entry + '/comments']: {
     get: { query: commentHttp.listQuery, reply: commentHttp.page },

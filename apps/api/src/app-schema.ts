@@ -11,6 +11,7 @@ import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes,
 import { z } from 'zod';
 import { AuthorizationService, formulaReferences, RecordAccess } from './authorization';
 import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
+import { inboundReferences, inspectWorkflowChanges, lockSchemaChanges, moveToAdministratorPool, outgoingReferences } from './collaboration-preflight';
 import { aclInput } from './acl-input';
 import { formulaInput, formulaProblems } from './formula';
 import { normalizeValue } from './field-values';
@@ -190,15 +191,24 @@ export class AppSchemaService {
 
   async changeLifecycle(context: TenantContext, appId: string, action: 'archive' | 'activate' | 'delete' | 'restore') {
     return withTenantTransaction(context, async (tx) => {
+      if (action === 'delete' || action === 'restore') await lockSchemaChanges(tx, context);
       if (action === 'restore' && !await this.authorization.requireRecycleAccess(tx, context)) {
         throw new ForbiddenException('无权限');
       }
       const app = await this.managedApp(tx, context, appId, action === 'restore');
+      if (action === 'delete') {
+        const definitions = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
+        const problems = await inboundReferences(tx, context, this, this.authorization, appId, definitions, [], true);
+        if (problems.length) throw new ConflictException({ message: 'Dependency check failed', problems });
+      }
       const inbound = await tx.select({ appId: recordReferences.appId }).from(recordReferences).where(and(
         eq(recordReferences.tenantId, context.tenantId), eq(recordReferences.targetAppId, appId),
       )).limit(1);
       if (action === 'delete' && inbound.length) throw new ConflictException('The application has incoming record references');
       if (action === 'restore') {
+        const definitions = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
+        const problems = await outgoingReferences(tx, context, this, appId, definitions);
+        if (problems.length) throw new ConflictException({ message: 'Dependency check failed', problems });
         const [outbound] = await tx.select({ appId: recordReferences.targetAppId }).from(recordReferences)
           .innerJoin(apps, and(eq(apps.tenantId, recordReferences.tenantId), eq(apps.id, recordReferences.targetAppId)))
           .where(and(eq(recordReferences.tenantId, context.tenantId), eq(recordReferences.appId, appId),
@@ -219,6 +229,7 @@ export class AppSchemaService {
   async copy(context: TenantContext, appId: string, input: z.infer<typeof appInput>) {
     try {
       return await withTenantTransaction(context, async (tx) => {
+        await lockSchemaChanges(tx, context);
         if (!await this.authorization.canCreateApp(tx, context)) throw new ForbiddenException('无权限');
         const source = await this.managedApp(tx, context, appId);
         const { description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes, localDrafts, commentsEnabled } = source;
@@ -607,6 +618,7 @@ export class AppSchemaService {
 
   async publish(context: TenantContext, appId: string, migration?: MigrationStrategy) {
     const result = await withTenantTransaction(context, async (tx) => {
+      await lockSchemaChanges(tx, context);
       const app = await this.managedApp(tx, context, appId);
       const version = app.draftSchemaVersion;
       if (version === null) throw new ConflictException('No draft to publish');
@@ -614,7 +626,15 @@ export class AppSchemaService {
       const draft = await this.getVersion(tx, context, appId, version);
       const currentFields = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
       const draftFields = await this.getFields(tx, context, appId, version);
-      const dependencyProblems = referencesPreflight(currentFields, draftFields, draft.viewConfiguration, draft.aclConfiguration, app.titleFieldId, draft.notificationRules);
+      const dependencyProblems = await this.checkDependencies(tx, context, app, currentFields, draftFields, draft);
+      dependencyProblems.push(...await inboundReferences(tx, context, this, this.authorization, appId, currentFields, draftFields));
+      const view = await this.access(tx, context, appId, 'view').catch((error: unknown) => {
+        if (error instanceof NotFoundException) return undefined;
+        throw error;
+      });
+      const workflow = await inspectWorkflowChanges(tx, { tenantId: context.tenantId, appId }, currentFields, draftFields,
+        app.workflowEnabled, migration?.workflowAssignees === 'administrator-pool', { auth: this.authorization, access: view?.access });
+      dependencyProblems.push(...workflow.problems);
       if (!validLayout(draft.formLayout, draftFields)) {
         dependencyProblems.push({ fieldId: '', dependency: 'layout', reason: 'Update invalid layout references' });
       }
@@ -652,7 +672,7 @@ export class AppSchemaService {
           appId, version,
           message: issues.length ? 'Existing records are incompatible' : dependencyProblems.length ? 'Dependency check failed' :
             needsMigration ? 'Choose an explicit data migration strategy' : 'Draft has no changes',
-          problems: [...disclosedIssues, ...dependencyProblems], migrationRequired: needsMigration, skippedDependencies: ['workflow', 'lookup'],
+          problems: [...disclosedIssues, ...dependencyProblems], migrationRequired: needsMigration, skippedDependencies: [],
         } };
       }
       const retiring = await retireChangedIndexes(tx, context, appId, currentFields, draftFields);
@@ -660,20 +680,29 @@ export class AppSchemaService {
         await tx.update(apps).set({ draftStatus: 'validation-failed' }).where(scope);
         return { failure: { appId, version, message: 'Wait for concurrent index retirement, then publish again',
           problems: retiring.map(({ fieldId, id }) => ({ fieldId, indexId: id, dependency: 'runtime-index', reason: 'Retirement queued' })),
-          skippedDependencies: ['workflow', 'lookup'],
+          skippedDependencies: [],
         } };
       }
       await tx.update(apps).set({ draftStatus: 'publishable' }).where(scope);
       const [published] = await tx.update(apps).set({
         publishedSchemaVersion: version, draftSchemaVersion: null, draftStatus: null,
       }).where(scope).returning();
-      const confirmation = { ...published, skippedDependencies: ['workflow', 'lookup'] };
-      if (!plan.length) return { published: confirmation };
-      const report = await this.applyMigration(tx, context, appId, version, draftFields, plan, disclosedRepairs, migration!);
-      return { published: { ...confirmation, migrationReport: report } };
+      const confirmation = { ...published, skippedDependencies: [], resolvedDependencies: workflow.resolved };
+      const report = plan.length ? await this.applyMigration(tx, context, appId, version, draftFields, plan, disclosedRepairs, migration!) : undefined;
+      await moveToAdministratorPool(tx, context, appId, workflow.pool);
+      return { published: { ...confirmation, ...(report && { migrationReport: report }) } };
     });
     if (result.failure) throw new ConflictException(result.failure);
     return result.published;
+  }
+
+  async checkDependencies(tx: TenantTransaction, context: TenantContext, app: typeof apps.$inferSelect,
+    current: FieldDefinition[], next: FieldDefinition[], snapshot: typeof appVersions.$inferSelect,
+  ) {
+    return [
+      ...referencesPreflight(current, next, snapshot.viewConfiguration, snapshot.aclConfiguration, app.titleFieldId, snapshot.notificationRules),
+      ...await outgoingReferences(tx, context, this, app.id, next),
+    ];
   }
 
   private async applyMigration(tx: TenantTransaction, context: TenantContext, appId: string, version: number,
@@ -681,6 +710,9 @@ export class AppSchemaService {
     repaired: { reason: string }[], strategy: MigrationStrategy) {
     const identity = { tenantId: context.tenantId, appId };
     await tx.delete(recordUniqueValues).where(and(eq(recordUniqueValues.tenantId, context.tenantId), eq(recordUniqueValues.appId, appId)));
+    const lookupIds = definitions.filter(({ lookup }) => lookup).map(({ fieldId }) => fieldId);
+    await tx.delete(recordReferences).where(and(eq(recordReferences.tenantId, context.tenantId), eq(recordReferences.appId, appId),
+      lookupIds.length ? sql`${recordReferences.fieldId} NOT IN (${sql.join(lookupIds.map((id) => sql`${id}`), sql`,`)})` : undefined));
     const uniqueFields = definitions.filter((field) => field.uniqueValue);
     for (const { row, data, archive } of plan) {
       const [updated] = await tx.update(records).set({

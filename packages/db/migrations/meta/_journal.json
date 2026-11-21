@@ -218,6 +218,13 @@
       "when": 1795283286723,
       "tag": "0030_gate2_notifications",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1795283809519,
+      "tag": "0031_gate2_preflight",
+      "breakpoints": true
     }
   ]
 }

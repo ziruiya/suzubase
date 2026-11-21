@@ -258,6 +258,7 @@ export const recordWorkflowState = pgTable('record_workflow_state', {
   workflowVersion: integer('workflow_version').notNull(),
   stateId: uuid('state_id').notNull(),
   revision: integer().notNull(),
+  attentionReason: text('attention_reason'),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.recordId] }),
   foreignKey({

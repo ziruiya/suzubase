@@ -6,7 +6,7 @@ import type { SelectorOptions } from './selector-options';
 type State = { id: string; code: string; name: string; terminal: boolean };
 type Choice = { id: string; name: string; target: State; reason: string | null };
 type Runtime = {
-  version: number; state: State; actions: Choice[]; canReassign: boolean; repairStates: State[];
+  version: number; state: State; actions: Choice[]; canReassign: boolean; repairStates: State[]; attentionReason: string | null;
   assignees: { id: string; name: string; disabled: boolean }[];
 };
 type WorkflowEvent = {
@@ -57,6 +57,7 @@ export function WorkflowDetail({ record, session, refresh }: { record: RecordRes
   if (!workflow) return error ? <p role="alert">{error}</p> : null;
   return <section className="stack" aria-label="Workflow">
     <h2>{workflow.state.name}</h2>
+    {workflow.attentionReason && <p role="status" className="notice">{workflow.attentionReason}</p>}
     <p>Assignees · {workflow.assignees.map(({ name, disabled }) => name + (disabled ? ' (disabled)' : '')).join(', ') || 'None'}</p>
     {error && !choice && <p role="alert">{error}</p>}
     {workflow.actions.length > 0 && <div className="workflow-actions inline">
@@ -122,7 +123,7 @@ export function WorkflowDetail({ record, session, refresh }: { record: RecordRes
     }}>{history ? 'Hide workflow history' : 'Show workflow history'}</button>
     {history && <ol className="history" aria-label="Workflow history">{history.map((event) => <li key={event.eventId}>
       <strong>{event.kind === 'WORKFLOW_REPAIR' ? 'Workflow repair' : event.action ??
-        (event.kind === 'workflow-reassigned' ? 'Reassigned' : 'Entered workflow')}</strong> · {event.actor}
+        (event.kind === 'workflow-reassigned' ? 'Reassigned' : event.kind === 'workflow-pool' ? 'Administrator review' : 'Entered workflow')}</strong> · {event.actor}
       <time>{new Date(event.occurredAt).toLocaleString(undefined, { timeZone: session.profile.timeZone })}</time>
       <div>{event.from ? event.from + ' → ' : ''}{event.to}</div>
       {event.reason && <p>{event.reason}</p>}

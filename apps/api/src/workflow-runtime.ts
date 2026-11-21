@@ -33,7 +33,7 @@ const taskQuery = z.strictObject({
 const stateSummary = z.object({ id: identifier, code: z.string(), name: z.string(), terminal: z.boolean() });
 const memberSummary = z.object({ id: identifier, name: z.string(), disabled: z.boolean() });
 const runtimeSummary = z.object({
-  version: z.int(), state: stateSummary, assignees: z.array(memberSummary), canReassign: z.boolean(), repairStates: z.array(stateSummary),
+  version: z.int(), state: stateSummary, assignees: z.array(memberSummary), canReassign: z.boolean(), attentionReason: z.string().nullable(), repairStates: z.array(stateSummary),
   actions: z.array(z.object({ id: identifier, name: z.string(), target: stateSummary, reason: z.string().nullable() })),
 });
 const taskPage = z.object({
@@ -131,7 +131,7 @@ export class WorkflowRuntimeService {
       .orderBy(workflowStates.name, workflowStates.id) : [];
     return {
       loaded, graph: new Map(graphRows.map((row) => [row.action.id, row])),
-      runtime: { version: workflowVersion, state, assignees, actions, repairStates, canReassign: canEdit && canManage && !state.terminal },
+      runtime: { version: workflowVersion, state, assignees, actions, repairStates, attentionReason: loaded.workflow.attentionReason, canReassign: canEdit && canManage && !state.terminal },
     };
   }
 
@@ -222,7 +222,7 @@ export class WorkflowRuntimeService {
     }).where(and(eq(records.tenantId, scope.tenantId), eq(records.appId, scope.appId), eq(records.id, scope.recordId),
       eq(records.revision, revision), isNull(records.deletedAt))).returning();
     if (!updated) throw new ConflictException('Workflow state changed. Refresh the record.');
-    await tx.update(recordWorkflowState).set({ stateId: target.id, revision: updated.revision }).where(workStateScope(scope));
+    await tx.update(recordWorkflowState).set({ stateId: target.id, revision: updated.revision, attentionReason: null }).where(workStateScope(scope));
     await setAssignees(tx, scope, ids, kind);
     const record = serializeRecord(updated);
     const eventId = await writeRecordEvent(tx, context, record, kind, []);

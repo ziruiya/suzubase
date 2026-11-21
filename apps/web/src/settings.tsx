@@ -27,6 +27,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
   const [busy, setBusy] = useState(false);
   const [preflight, setPreflight] = useState<unknown>();
   const [migration, setMigration] = useState('');
+  const [workflowFallback, setWorkflowFallback] = useState(false);
   const [editing, setEditing] = useState<Field>();
   const definitions = draft?.version ? draft.fields : draft?.publishedFields ?? app.fields;
   const layout = draft?.formLayout ?? app.formLayout;
@@ -168,9 +169,13 @@ export function Settings({ app, session, narrow, onClose, reload }: {
       <button className="primary" disabled={busy} onClick={() => void run(async () => {
         setPreflight(undefined);
         try {
-          const result = await api<{ migrationReport?: unknown }>(path + '/publish', token,
-            json('POST', migration ? { migration: { incompatible: migration } } : undefined));
-          setPreflight(result.migrationReport);
+          const result = await api<{ migrationReport?: unknown; resolvedDependencies?: unknown[] }>(path + '/publish', token,
+            json('POST', migration || workflowFallback ? { migration: { incompatible: migration || 'reject',
+              ...(workflowFallback && { workflowAssignees: 'administrator-pool' }) } } : undefined));
+          setPreflight(result.resolvedDependencies?.length ? {
+            migrationReport: result.migrationReport, resolvedDependencies: result.resolvedDependencies,
+          } : result.migrationReport);
+          setWorkflowFallback(false);
           setMigration('');
           await refreshDraft(); await reload(); setNotice('Draft preflight passed and the schema was published.');
         } catch (error) {
@@ -186,6 +191,8 @@ export function Settings({ app, session, narrow, onClose, reload }: {
         <option value="reject">Migrate compatible values</option>
         <option value="clear-optional">Clear incompatible optional values and save a report</option>
       </select></label>}
+      {!narrow && <label className="option"><input type="checkbox" checked={workflowFallback} onChange={(event) =>
+        setWorkflowFallback(event.target.checked)} /> Route affected open workflows to the administrator pool</label>}
     </div>}
     {preflight !== undefined && <details open><summary>Publication report</summary><pre>{JSON.stringify(preflight, null, 2)}</pre></details>}
   </section>;

@@ -158,6 +158,8 @@ export class WorkflowDefinitionService {
       const graph = await readWorkflowGraph(tx, draft);
       const fields = await this.schema.getFields(tx, context, appId, app.publishedSchemaVersion);
       const problems = [...graphProblems(graph, fields, true), ...await directoryProblems(tx, context.tenantId, graph)];
+      const snapshot = await this.schema.getVersion(tx, context, appId, app.publishedSchemaVersion);
+      problems.push(...await this.schema.checkDependencies(tx, context, app, fields, fields, snapshot));
       if (problems.length) throw new ConflictException({ problems });
       await tx.update(workflowDefinitions).set({ status: 'published' })
         .where(and(scope, eq(workflowDefinitions.id, draft.id), eq(workflowDefinitions.status, 'draft')));
@@ -169,8 +171,13 @@ export class WorkflowDefinitionService {
     return withTenantTransaction(context, async (tx) => {
       const app = await this.schema.managedApp(tx, context, appId);
       if (app.archivedAt) throw new ConflictException('Application is archived');
-      if (enabled && !await currentWorkflow(tx, { tenantId: context.tenantId, appId })) {
-        throw new ConflictException('Publish a workflow before enabling it');
+      if (enabled) {
+        const current = await currentWorkflow(tx, { tenantId: context.tenantId, appId });
+        if (!current) throw new ConflictException('Publish a workflow before enabling it');
+        const graph = await readWorkflowGraph(tx, current);
+        const fields = await this.schema.getFields(tx, context, appId, app.publishedSchemaVersion);
+        const problems = [...graphProblems(graph, fields, true), ...await directoryProblems(tx, context.tenantId, graph)];
+        if (problems.length) throw new ConflictException({ problems });
       }
       await tx.update(apps).set({ workflowEnabled: enabled })
         .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));

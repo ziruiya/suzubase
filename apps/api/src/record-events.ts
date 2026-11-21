@@ -6,7 +6,7 @@ export async function writeRecordEvent(
   tx: TenantTransaction,
   context: TenantContext,
   record: RecordResponse,
-  kind: 'created' | 'updated' | 'lookup-refetched' | 'deleted' | 'restored' | 'schema-migrated' | 'workflow-action' | 'workflow-reassigned' | 'WORKFLOW_REPAIR' | 'comment-created' | 'comment-deleted',
+  kind: 'created' | 'updated' | 'lookup-refetched' | 'deleted' | 'restored' | 'schema-migrated' | 'workflow-action' | 'workflow-reassigned' | 'WORKFLOW_REPAIR' | 'workflow-pool' | 'comment-created' | 'comment-deleted',
   changes: FieldChange[],
   source: 'api' | 'import' | 'migration' = 'api',
   object?: { type: 'comment'; id: string },

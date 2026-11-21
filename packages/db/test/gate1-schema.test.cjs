@@ -135,7 +135,7 @@ test('GF-03 publishes rename and layout, blocks formula dependency, and archives
   const summary = await request(201, 'POST', '/draft/views', {
     name: 'Quantity summary', conditions: [], columns: [], aggregateFields: [quantity.fieldId],
   });
-  assert.deepEqual((await request(201, 'POST', '/publish')).skippedDependencies, ['workflow', 'lookup']);
+  assert.deepEqual((await request(201, 'POST', '/publish')).skippedDependencies, []);
   await request(200, 'PATCH', '/draft/fields/' + quantity.fieldId, { type: 'text' });
   const typeBlocked = await request(409, 'POST', '/publish', { migration: { incompatible: 'reject' } });
   assert.ok(typeBlocked.problems.some(({ dependency }) => dependency === 'formula'));
