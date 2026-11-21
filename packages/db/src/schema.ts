@@ -1,4 +1,4 @@
-import { fieldTypes, type AclConfiguration, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -384,4 +384,21 @@ export const csvJobs = pgTable('csv_jobs', {
   primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
   foreignKey({ columns: [t.tenantId, t.userId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.schemaVersion], foreignColumns: [appVersions.tenantId, appVersions.appId, appVersions.version] }),
+]);
+
+export const apiTokens = authentication.table('api_tokens', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  issuedBy: uuid('issued_by').notNull(),
+  label: text().notNull(),
+  secretHash: text('secret_hash').notNull(),
+  actions: jsonb().$type<ApiTokenAction[]>().notNull(),
+  createdAt: time('created_at').notNull().defaultNow(),
+  revokedAt: time('revoked_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  unique().on(t.secretHash),
+  foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
+  foreignKey({ columns: [t.tenantId, t.issuedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
 ]);

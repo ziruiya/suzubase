@@ -10,7 +10,7 @@ import {
 import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, optionFieldTypes, SavedView, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AuthorizationService, RecordAccess } from './authorization';
-import { AuthenticatedTenant, SessionGuard } from './identity';
+import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
 import { aclInput } from './acl-input';
 import { normalizeValue } from './field-values';
 import { viewInput } from './view-input';
@@ -487,22 +487,26 @@ export class AppSchemaController {
   }
 
   @Get(':appId/settings')
+  @AllowApiToken('manage')
   settings(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
     return this.schemas.settings(context, parseInput(identifier, id));
   }
 
   @Patch(':appId/settings')
+  @AllowApiToken('manage')
   updateSettings(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
     return this.schemas.settings(context, parseInput(identifier, id), parseInput(settingsInput, body));
   }
 
   @Post(':appId/lifecycle')
+  @AllowApiToken('manage')
   lifecycle(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
     const { action } = parseInput(z.strictObject({ action: z.enum(['archive', 'activate', 'restore']) }), body);
     return this.schemas.changeLifecycle(context, parseInput(identifier, id), action);
   }
 
   @Delete(':appId')
+  @AllowApiToken('manage')
   remove(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
     return this.schemas.changeLifecycle(context, parseInput(identifier, id), 'delete');
   }
@@ -513,11 +517,13 @@ export class AppSchemaController {
   }
 
   @Get(':appId')
+  @AllowApiToken('view')
   get(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
     return this.schemas.getPublished(context, parseInput(identifier, id));
   }
 
   @Post(':appId/fields')
+  @AllowApiToken('manage')
   @ApiBody({ schema: {
     type: 'object', required: ['code', 'name', 'type'], additionalProperties: false,
     properties: { ...metadataProperties, type: { type: 'string', enum: [...fieldTypes] } },
@@ -527,11 +533,13 @@ export class AppSchemaController {
   }
 
   @Get(':appId/draft')
+  @AllowApiToken('manage')
   draft(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
     return this.schemas.getDraft(context, parseInput(identifier, id));
   }
 
   @Patch(':appId/draft/fields/:fieldId')
+  @AllowApiToken('manage')
   editDraft(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string,
     @Param('fieldId') fieldId: string, @Body() body: unknown) {
     const { required } = parseInput(z.strictObject({ required: z.boolean() }), body);
@@ -539,17 +547,20 @@ export class AppSchemaController {
   }
 
   @Post(':appId/draft/views')
+  @AllowApiToken('manage')
   createView(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
     return this.schemas.editView(context, parseInput(identifier, id), { action: 'save', value: parseInput(viewInput, body) });
   }
 
   @Put(':appId/draft/views/default')
+  @AllowApiToken('manage')
   defaultView(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
     const { viewId } = parseInput(z.strictObject({ viewId: identifier.nullable() }), body);
     return this.schemas.editView(context, parseInput(identifier, id), { action: 'default', id: viewId });
   }
 
   @Put(':appId/draft/views/:viewId')
+  @AllowApiToken('manage')
   updateView(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string,
     @Param('viewId') viewId: string, @Body() body: unknown) {
     return this.schemas.editView(context, parseInput(identifier, id), {
@@ -558,16 +569,19 @@ export class AppSchemaController {
   }
 
   @Delete(':appId/draft/views/:viewId')
+  @AllowApiToken('manage')
   deleteView(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Param('viewId') viewId: string) {
     return this.schemas.editView(context, parseInput(identifier, id), { action: 'delete', id: parseInput(identifier, viewId) });
   }
 
   @Get(':appId/draft/acl')
+  @AllowApiToken('manage')
   acl(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
     return this.schemas.editAcl(context, parseInput(identifier, id));
   }
 
   @Put(':appId/draft/acl')
+  @AllowApiToken('manage')
   saveAcl(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
     return this.schemas.editAcl(context, parseInput(identifier, id), parseInput(aclInput, body));
   }
@@ -579,6 +593,7 @@ export class AppSchemaController {
   }
 
   @Post(':appId/publish')
+  @AllowApiToken('manage')
   publish(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
     return this.schemas.publish(context, parseInput(identifier, id));
   }

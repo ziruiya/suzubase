@@ -9,7 +9,7 @@ import {
 import { z } from 'zod';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
-import { AuthenticatedTenant, SessionGuard } from './identity';
+import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
 import { LocalStorageAdapter, StorageAdapter } from './storage';
 import { identifier, parseInput } from './validation';
 
@@ -163,6 +163,7 @@ export class FileController {
   }
 
   @Get(':id')
+  @AllowApiToken('view')
   download(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('id') id: string) {
     return this.files.download(context, parseInput(identifier, appId), parseInput(identifier, id));
   }

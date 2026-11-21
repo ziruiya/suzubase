@@ -19,3 +19,6 @@ export interface AclConfiguration {
   record: { id: string; action: RecordAction; subject: RecordSubject; conditions: ViewCondition[] }[];
   field: { id: string; action: FieldAction; subject: DirectorySubject; fieldId: string }[];
 }
+
+export const apiTokenActions = ['view', 'create', 'edit', 'delete', 'manage'] as const;
+export type ApiTokenAction = (typeof apiTokenActions)[number];

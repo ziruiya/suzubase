@@ -6,6 +6,7 @@ import { TenantAdminController, TenantAdminService } from './tenant-admin';
 import { AuthorizationService } from './authorization';
 import { AppSchemaController, AppSchemaService } from './app-schema';
 import { FileController, FileService, maxAttachmentBytes } from './files';
+import { ApiTokenController, ApiTokenService } from './api-tokens';
 import { CsvController, CsvService } from './csv';
 import { SearchService } from './search';
 import { RecordQueryService } from './record-query';
@@ -37,8 +38,8 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController, AppSchemaController, RecordsController, TenantAdminController, FileController, CsvController],
-  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, TenantAdminService, FileService, SearchService, CsvService],
+  controllers: [HealthController, SessionController, AppSchemaController, RecordsController, TenantAdminController, FileController, CsvController, ApiTokenController],
+  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, TenantAdminService, FileService, SearchService, CsvService, ApiTokenService],
 })
 class AppModule {}
 
@@ -47,7 +48,8 @@ async function main() {
   const app = await NestFactory.create<NestFastifyApplication>(AppModule, adapter);
   adapter.getInstance().addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: maxAttachmentBytes },
     (_request, body, done) => done(null, body));
-  const config = new DocumentBuilder().setTitle('SuzuBase').setVersion('0').addBearerAuth().build();
+  const config = new DocumentBuilder().setTitle('SuzuBase').setVersion('1')
+    .addBearerAuth({ type: 'http', scheme: 'bearer', description: 'Send a session JWT or an app token on supported app routes. Token administration requires a session.' }).build();
   SwaggerModule.setup('docs', app, () => SwaggerModule.createDocument(app, config));
   await app.listen(Number(process.env.PORT ?? 3000), '0.0.0.0');
 }

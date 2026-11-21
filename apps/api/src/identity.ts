@@ -1,11 +1,12 @@
 import {
   Body, CanActivate, Controller, createParamDecorator, ExecutionContext, HttpCode,
-  Injectable, Post, UnauthorizedException,
+  Injectable, Post, SetMetadata, UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ApiBody, ApiOkResponse, ApiTags } from '@nestjs/swagger';
-import { and, eq, tenantMembers, TenantContext, verifyLogin, withTenantTransaction } from '@suzubase/db';
+import { and, eq, tenantMembers, TenantContext, verifyApiToken, verifyLogin, withTenantTransaction } from '@suzubase/db';
 import { z } from 'zod';
+import { ApiTokenAction } from '@suzubase/shared-types';
 import { identifier, parseInput } from './validation';
 
 const loginInput = z.strictObject({
@@ -18,8 +19,12 @@ const sessionClaims = z.object({ tenantId: identifier, sub: identifier, sessionV
 
 interface AuthenticatedRequest {
   headers: { authorization?: string };
+  params?: { appId?: string; id?: string };
   tenantContext: TenantContext;
 }
+
+const tokenAction = Symbol('API token action');
+export const AllowApiToken = (action: ApiTokenAction) => SetMetadata(tokenAction, action);
 
 @ApiTags('session')
 @Controller('auth')
@@ -54,6 +59,17 @@ export class SessionGuard implements CanActivate {
     const request = executionContext.switchToHttp().getRequest<AuthenticatedRequest>();
     const match = /^Bearer (\S+)$/i.exec(request.headers.authorization ?? '');
     if (!match) throw new UnauthorizedException();
+    if (/^sb1_[A-Za-z0-9_-]{43}$/.test(match[1])) {
+      const action: ApiTokenAction | undefined = Reflect.getMetadata(tokenAction, executionContext.getHandler());
+      const appId = request.params?.appId ?? request.params?.id;
+      if (!action || !appId) throw new UnauthorizedException('无权限');
+      const token = await verifyApiToken(match[1]);
+      if (!token || token.appId !== appId.toLowerCase() || !token.actions.includes(action)) {
+        throw new UnauthorizedException('无权限');
+      }
+      request.tenantContext = Object.freeze({ tenantId: token.tenantId, userId: token.userId });
+      return true;
+    }
     try {
       const claims = sessionClaims.parse(await this.sessions.verifyAsync(match[1]));
       const identity = { tenantId: claims.tenantId, userId: claims.sub };

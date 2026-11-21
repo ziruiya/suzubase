@@ -1,10 +1,12 @@
 import { sql } from 'drizzle-orm';
 import { drizzle, NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
+import { createHash } from 'node:crypto';
+import type { ApiTokenAction } from '@suzubase/shared-types';
 
 export { and, eq, inArray, or, isNull, lte, gt, sql } from 'drizzle-orm';
 export {
-  apps, appCounters, autoNumberCounters, issuedAutoNumbers, appVersions, csvJobs, permissionAudit, fields, fileReferences, files, outbox, recordCreateKeys, recordEvents, recordSearchValues, recordUniqueValues, records, recordReferences,
+  apiTokens, apps, appCounters, autoNumberCounters, issuedAutoNumbers, appVersions, csvJobs, permissionAudit, fields, fileReferences, files, outbox, recordCreateKeys, recordEvents, recordSearchValues, recordUniqueValues, records, recordReferences,
   groupMembers, loginCredentials, memberGroups, organizations, tenantMembers, tenants, users,
 } from './schema';
 
@@ -33,6 +35,18 @@ export async function verifyLogin(email: string, password: string): Promise<(Ten
   const result = await pool.query<{ tenantId: string; userId: string; sessionVersion: number }>(
     'SELECT tenant_id AS "tenantId", user_id AS "userId", session_version AS "sessionVersion" FROM authentication.verify_login($1, $2)',
     [email, password],
+  );
+  return result.rows[0];
+}
+
+export function apiTokenHash(token: string) {
+  return createHash('sha256').update(token, 'ascii').digest('hex');
+}
+
+export async function verifyApiToken(token: string) {
+  const result = await pool.query<TenantContext & { appId: string; actions: ApiTokenAction[] }>(
+    'SELECT tenant_id AS "tenantId", user_id AS "userId", app_id AS "appId", actions FROM authentication.verify_api_token($1)',
+    [apiTokenHash(token)],
   );
   return result.rows[0];
 }

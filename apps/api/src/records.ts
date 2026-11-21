@@ -12,7 +12,7 @@ import { z } from 'zod';
 import { assignAutoNumber, numberScope } from './auto-number';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService, RecordAccess } from './authorization';
-import { AuthenticatedTenant, SessionGuard } from './identity';
+import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
 import { RecordQueryService } from './record-query';
 import { writeRecordEvent } from './record-events';
 import { FileService, fileIds } from './files';
@@ -435,6 +435,7 @@ export class RecordsController {
   ) {}
 
   @Post()
+  @AllowApiToken('create')
   @ApiHeader({
     name: 'Idempotency-Key',
     required: false,
@@ -452,16 +453,19 @@ export class RecordsController {
   }
 
   @Get()
+  @AllowApiToken('view')
   list(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
     return this.service.list(context, parseInput(identifier, appId), parseInput(pageInput, query));
   }
 
   @Get('search')
+  @AllowApiToken('view')
   searchRecords(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
     return this.search.search(context, parseInput(identifier, appId), parseInput(searchInput, query));
   }
 
   @Get('aggregates')
+  @AllowApiToken('view')
   aggregate(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
     const { view, fields } = parseInput(z.strictObject({
       view: identifier.optional(),
@@ -472,12 +476,14 @@ export class RecordsController {
   }
 
   @Post('batch')
+  @AllowApiToken('create')
   batch(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown) {
     const { items } = parseInput(z.strictObject({ items: z.array(createInput).min(1).max(100) }), body);
     return this.service.batchCreate(context, parseInput(identifier, appId), items);
   }
 
   @Delete(':recordId')
+  @AllowApiToken('delete')
   remove(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Param('recordId') id: string, @Body() body: unknown) {
     const { revision } = parseInput(revisionInput, body);
@@ -485,6 +491,7 @@ export class RecordsController {
   }
 
   @Post(':recordId/restore')
+  @AllowApiToken('delete')
   restore(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Param('recordId') id: string, @Body() body: unknown) {
     const { revision } = parseInput(revisionInput, body);
@@ -492,16 +499,19 @@ export class RecordsController {
   }
 
   @Get(':recordId/history')
+  @AllowApiToken('view')
   history(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') id: string) {
     return this.service.history(context, parseInput(identifier, appId), parseInput(identifier, id));
   }
 
   @Get(':recordId')
+  @AllowApiToken('view')
   get(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') id: string) {
     return this.service.get(context, parseInput(identifier, appId), parseInput(identifier, id));
   }
 
   @Put(':recordId')
+  @AllowApiToken('edit')
   @ApiBody({ schema: {
     type: 'object', required: ['data', 'revision'], additionalProperties: false,
     properties: { data: { ...dataSchema, description: 'Complete replacement field map.' }, revision: { type: 'integer', minimum: 1 } },
