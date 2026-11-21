@@ -46,6 +46,7 @@ const pageInput = z.strictObject({
   after: z.string().regex(/^[0-9]{1,19}$/).refine((value) => BigInt(value) <= 9223372036854775807n).optional(),
   limit: z.string().regex(/^[1-9][0-9]{0,2}$/).transform(Number).pipe(z.number().max(100)).optional(),
 });
+const relatedQuery = pageInput.pick({ after: true });
 const aggregateQuery = z.strictObject({
   view: identifier.optional(),
   fields: z.string().max(369).transform((value) => value.split(','))
@@ -55,7 +56,7 @@ const recycleQuery = pageInput.omit({ view: true });
 const batchCreateInput = z.strictObject({ items: z.array(createInput).min(1).max(100) });
 const historyExportQuery = z.strictObject({ includeArchived: z.enum(['true', 'false']).optional() });
 export const recordHttp = { createInput, updateInput, revisionInput, batchUpdateInput, batchCreateInput,
-  pageInput, searchInput, aggregateQuery, recycleQuery, historyExportQuery, lookupPreviewInput, lookupRefreshInput, lookupSearchInput };
+  pageInput, searchInput, aggregateQuery, recycleQuery, historyExportQuery, lookupPreviewInput, lookupRefreshInput, lookupSearchInput, relatedQuery };
 
 const keyPattern = /^[!-~]{1,128}$/;
 const createKey = z.string().regex(keyPattern).optional();
@@ -396,6 +397,20 @@ export class RecordService {
     });
   }
 
+  async relatedRecords(context: TenantContext, appId: string, recordId: string, fieldId: string, after?: string) {
+    return withTenantTransaction(context, async (tx) => {
+      const record = await this.findRecord(tx, context, appId, recordId);
+      const { access } = await this.appSchema.access(tx, context, appId, 'view');
+      const definitions = await this.appSchema.getFields(tx, context, appId, record.schemaVersion);
+      const config = definitions.find((field) => field.fieldId === fieldId)?.related;
+      if (!config || [fieldId, config.localFieldId].some((id) =>
+        !access.types.has(id) || !this.authorization.fieldDecision(access, id, 'view').allowed)) {
+        throw new NotFoundException('无权限');
+      }
+      return this.query.relatedPage(tx, context, config, record.data, after);
+    });
+  }
+
   async referenceSearch(context: TenantContext, appId: string, input: z.infer<typeof lookupSearchInput>) {
     return withTenantTransaction(context, async (tx) => {
       await tx.execute(sql`SET LOCAL statement_timeout = '1500ms'`);
@@ -724,6 +739,14 @@ export class RecordsController {
   @AllowApiToken('view')
   list(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
     return this.service.list(context, parseInput(identifier, appId), parseInput(pageInput, query));
+  }
+
+  @Get(':recordId/related/:fieldId')
+  relatedRecords(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('recordId') recordId: string, @Param('fieldId') fieldId: string, @Query() query: unknown,
+  ) {
+    return this.service.relatedRecords(context, parseInput(identifier, appId), parseInput(identifier, recordId),
+      parseInput(identifier, fieldId), parseInput(relatedQuery, query).after);
   }
 
   @Get('reference-search')

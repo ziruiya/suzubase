@@ -27,6 +27,7 @@ const field = z.object({
   fieldId: id, code: text, name: text, type: z.enum(fieldTypes), required: flag, uniqueValue: flag,
   options: z.array(appHttp.option), formula: formulaInput.nullable(), layoutElement: appHttp.layoutInput.nullable(),
   lookup: appHttp.lookupInput.nullable().optional(),
+  related: appHttp.relatedInput.nullable().optional(),
   autoNumber: appHttp.numbering.nullable(), searchMode: z.enum(textSearchModes).nullable(),
 });
 const formField = field.extend({ editable: flag });
@@ -205,6 +206,9 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/publish']: { post: { body: appHttp.publishInput, optionalBody: true,
     reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text) }), conflict: publishConflict } },
   [records]: { get: { query: recordHttp.pageInput, reply: page(record) }, post: { body: recordHttp.createInput, reply: record, conflict: errorSchema } },
+  [entry + '/related/{fieldId}']: { get: { query: recordHttp.relatedQuery, reply: z.object({
+    columns: z.array(z.object({ fieldId: id, name: text })), items: z.array(data), next: recordNo.nullable(), count: text,
+  }) } },
   [records + '/reference-search']: { get: { query: recordHttp.lookupSearchInput, reply: z.object({
     columns: z.array(z.object({ fieldId: id, name: text })), items: z.array(data), next: recordNo.nullable(),
   }) } },

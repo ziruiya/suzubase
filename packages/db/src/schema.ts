@@ -1,4 +1,4 @@
-import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type LookupConfiguration, type ViewCondition } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type LookupConfiguration, type RelatedConfiguration, type ViewCondition } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -136,6 +136,7 @@ export const fields = pgTable('fields', {
   searchMode: text('search_mode').$type<TextSearchMode>(),
   formula: jsonb().$type<Formula>(),
   lookup: jsonb().$type<LookupConfiguration>(),
+  related: jsonb().$type<RelatedConfiguration>(),
   layoutElement: jsonb('layout_element').$type<LayoutElement>(),
   autoNumber: jsonb('auto_number').$type<AutoNumberConfiguration>(),
   options: jsonb().$type<FieldOption[]>().notNull().default(sql`'[]'::jsonb`),

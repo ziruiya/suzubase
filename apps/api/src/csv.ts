@@ -5,7 +5,7 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiProduces, ApiTags } from '@nestjs/swagger';
 import { and, csvJobs, eq, records, sql, TenantContext, TenantTransaction, withTenantTransaction } from '@suzubase/db';
-import { RecordData } from '@suzubase/shared-types';
+import { relatedCountHelp, RecordData, RelatedConfiguration } from '@suzubase/shared-types';
 import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 import { zipSync } from 'fflate';
@@ -83,7 +83,7 @@ export class CsvService {
       const lookupColumns = headers.filter((header) => target(header) === 'lookup' || /^lookup:/i.test(header));
       const mapping = headers.map((header) => lookupColumns.includes(header) ? null : target(header));
       const targets = mapping.filter((id): id is string => id !== null);
-      if (targets.some((id) => !fields.some(({ fieldId, type }) => fieldId === id && type !== 'layout' && type !== 'calculation')) || new Set(targets).size !== targets.length) {
+      if (targets.some((id) => !fields.some(({ fieldId, type }) => fieldId === id && type !== 'layout' && type !== 'calculation' && type !== 'related')) || new Set(targets).size !== targets.length) {
         throw new BadRequestException('Map each column to a distinct published field');
       }
       if (!targets.length && !lookupColumns.length) throw new BadRequestException('Map at least one column');
@@ -179,6 +179,26 @@ export class CsvService {
     });
   }
 
+  private async exportRelated(tx: TenantTransaction, context: TenantContext, config: RelatedConfiguration, data: RecordData) {
+    try {
+      const page = await this.query.relatedPage(tx, context, config, data);
+      if (BigInt(page.count) > 10000n) throw new BadRequestException('Related records exceed the 10,000-row export limit');
+      const lines = [page.count + ' related records. ' + relatedCountHelp];
+      let current = page;
+      while (true) {
+        for (const item of current.items) {
+          if (current.columns.length) lines.push(current.columns.map(({ fieldId, name }) => name + ': ' + (item[fieldId] ?? '')).join(' | '));
+        }
+        if (!current.next || !current.columns.length) break;
+        current = await this.query.relatedPage(tx, context, config, data, current.next);
+      }
+      return lines.join('\n');
+    } catch (error) {
+      if (error instanceof NotFoundException) return '';
+      throw error;
+    }
+  }
+
   async export(context: TenantContext, appId: string, { view: viewId, attachments, ...filters }: z.infer<typeof exportQuery>) {
     const bundle = attachments === 'true';
     const { csv, attachmentIds, richText } = await withTenantTransaction(context, async (tx) => {
@@ -186,7 +206,7 @@ export class CsvService {
       const selected = (view?.columns.length
         ? view.columns.map(({ fieldId }) => fields.find((field) => field.fieldId === fieldId)!)
         : fields).filter(({ type }) => type !== 'layout');
-      const eligible = tx.select({ data }).from(records).$dynamic();
+      const eligible = tx.select({ data, schemaVersion: records.schemaVersion }).from(records).$dynamic();
       const search = 'field' in filters ? filters : undefined;
       if (search) {
         const hits = this.search.matchingRecords(tx, context, appId, fields, search);
@@ -197,9 +217,25 @@ export class CsvService {
         .orderBy(...(sort ? [sql`${sort} ${descending ? sql`DESC` : sql`ASC`} NULLS LAST`, records.recordNo] : [records.recordNo]))
         .limit(10001);
       if (rows.length > 10000) throw new BadRequestException('Export exceeds 10,000 rows. Narrow the view filters.');
+      const csv = [selected.map(({ code }) => code)];
+      const visible = new Set(fields.map(({ fieldId }) => fieldId));
+      const hasRelated = selected.some(({ type }) => type === 'related');
+      const schemas = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
+      for (const row of rows) {
+        if (hasRelated && !schemas.has(row.schemaVersion)) {
+          schemas.set(row.schemaVersion, await this.schema.getFields(tx, context, appId, row.schemaVersion));
+        }
+        const cells = [];
+        for (const { fieldId, type } of selected) {
+          const raw = row.data[fieldId] ?? '';
+          const related = type === 'related' && schemas.get(row.schemaVersion)?.find((field) => field.fieldId === fieldId)?.related;
+          cells.push(related && visible.has(related.localFieldId) ? await this.exportRelated(tx, context, related, row.data)
+            : type === 'richText' ? richTextPlain(raw) : raw);
+        }
+        csv.push(cells);
+      }
       return {
-        csv: [selected.map(({ code }) => code), ...rows.map(({ data }) => selected.map(({ fieldId, type }) =>
-          type === 'richText' ? richTextPlain(data[fieldId] ?? '') : data[fieldId] ?? ''))],
+        csv,
         richText: selected.some(({ type }) => type === 'richText'),
         attachmentIds: bundle ? [...new Set(rows.flatMap(({ data }) => selected
           .filter(({ type }) => type === 'attachment').flatMap(({ fieldId }) => JSON.parse(data[fieldId] || '[]') as string[])))] : [],

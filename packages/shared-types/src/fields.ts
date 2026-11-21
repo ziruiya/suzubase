@@ -31,6 +31,7 @@ export const fieldContract = {
   richText: { ...displayOnly, storage: 'sanitized HTML fragment', csv: 'plain text' },
   calculation: { ...displayOnly, storage: 'computed decimal or string snapshot', csv: 'computed result, export only' },
   lookup: { ...displayOnly, storage: 'typed snapshots in mapped fields plus record_references', csv: 'local key input, typed snapshots export only' },
+  related: { ...displayOnly, storage: 'no stored value', csv: 'live display fields as read-only text' },
   layout: { ...displayOnly, storage: 'schema only', csv: 'omitted' },
 } as const;
 
@@ -73,7 +74,7 @@ export interface LayoutElement {
 }
 
 export function isRecordInput(type: FieldType | undefined) {
-  return type !== undefined && type !== 'autoNumber' && type !== 'calculation' && type !== 'layout' && type !== 'lookup';
+  return type !== undefined && type !== 'autoNumber' && type !== 'calculation' && type !== 'layout' && type !== 'lookup' && type !== 'related';
 }
 
 export interface ReferencePresentation {
@@ -81,6 +82,15 @@ export interface ReferencePresentation {
   conditions?: ViewCondition[];
   sort?: SavedView['sort'];
 }
+
+export interface RelatedConfiguration extends ReferencePresentation {
+  appId: string;
+  localFieldId: string;
+  matchFieldId: string;
+  pageSize: number;
+}
+
+export const relatedCountHelp = 'Counts only records you can view.';
 
 export interface LookupConfiguration extends ReferencePresentation {
   appId: string;
@@ -95,6 +105,7 @@ export function lookupTargets(fields: FieldDefinition[]) {
 
 export interface FieldDefinition {
   lookup?: LookupConfiguration | null;
+  related?: RelatedConfiguration | null;
   fieldId: string;
   code: string;
   name: string;

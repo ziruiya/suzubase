@@ -60,8 +60,12 @@ const lookupInput = z.strictObject({
   copies: z.array(z.strictObject({ sourceFieldId: identifier, targetFieldId: identifier })).min(1).max(50),
 }).refine(({ copies }) => new Set(copies.map(({ targetFieldId }) => targetFieldId)).size === copies.length,
   { message: 'Each lookup destination must be distinct' });
+const relatedInput = z.strictObject({
+  ...referencePresentation,
+  appId: identifier, localFieldId: identifier, matchFieldId: identifier, pageSize: z.int().min(1).max(100),
+});
 const fieldProperties = z.strictObject({
-  ...metadata, type: z.enum(fieldTypes), lookup: lookupInput.optional(), formula: formulaInput.optional(), layoutElement: layoutInput.optional(), autoNumber: numbering.optional(), searchMode: z.enum(textSearchModes).optional(), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
+  ...metadata, type: z.enum(fieldTypes), lookup: lookupInput.optional(), related: relatedInput.optional(), formula: formulaInput.optional(), layoutElement: layoutInput.optional(), autoNumber: numbering.optional(), searchMode: z.enum(textSearchModes).optional(), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
 });
 const fieldPatch = fieldProperties.extend({
   required: z.boolean(), uniqueValue: z.boolean(), options: z.array(option).max(200),
@@ -73,6 +77,7 @@ const fieldInput = fieldProperties.refine(({ options, type }) => optionFieldType
     !(type === 'autoNumber' && required), { path: ['autoNumber'] })
   .refine(({ type, formula, layoutElement, required }) => (type === 'calculation') === Boolean(formula) &&
     (type === 'layout') === Boolean(layoutElement) && (!required || isRecordInput(type)), { path: ['type'] })
+  .refine(({ type, related }) => (type === 'related') === Boolean(related), { path: ['related'] })
   .refine(({ type, lookup }) => (type === 'lookup') === Boolean(lookup), { path: ['lookup'] })
   .refine(({ type, searchMode }) => !searchMode || type === 'text', { path: ['searchMode'] });
 const lifecycleInput = z.strictObject({ action: z.enum(['archive', 'activate', 'restore']) });
@@ -84,7 +89,7 @@ const publishInput = z.strictObject({ migration: migrationInput.optional() });
 const binQuery = z.enum(['true', 'false']).optional();
 
 export const appHttp = {
-  createAppInput, appInput, settingsInput, lifecycleInput, fieldInput, fieldPatch, layoutInput, option, numbering, lookupInput,
+  createAppInput, appInput, settingsInput, lifecycleInput, fieldInput, fieldPatch, layoutInput, option, numbering, lookupInput, relatedInput,
   formLayoutInput, viewInput, defaultViewInput, aclInput, previewInput, publishInput, binQuery,
 };
 
@@ -206,10 +211,11 @@ export class AppSchemaService {
         await tx.insert(appCounters).values(identity);
         const definitions = await this.getFields(tx, context, appId, source.publishedSchemaVersion);
         const fieldMapping = new Map(definitions.map(({ fieldId }) => [fieldId, randomUUID()]));
-        for (const { fieldId, code, name, type, required, uniqueValue, options, autoNumber, searchMode, formula, layoutElement, lookup } of definitions) {
+        for (const { fieldId, code, name, type, required, uniqueValue, options, autoNumber, searchMode, formula, layoutElement, lookup, related } of definitions) {
           const copiedId = fieldMapping.get(fieldId)!;
           await tx.insert(fields).values({
             ...identity, fieldId: copiedId, code, name, type, required, uniqueValue, options, searchMode, layoutElement, introducedIn: 1,
+            related: related && { ...related, localFieldId: fieldMapping.get(related.localFieldId)! },
             lookup: lookup && {
               ...lookup,
               localKeyFieldId: fieldMapping.get(lookup.localKeyFieldId)!,
@@ -341,7 +347,7 @@ export class AppSchemaService {
     const definitionRows = await tx.select({
       fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required,
       uniqueValue: fields.uniqueValue, autoNumber: fields.autoNumber, searchMode: fields.searchMode,
-      options: fields.options, lookup: fields.lookup, formula: fields.formula, layoutElement: fields.layoutElement,
+      options: fields.options, lookup: fields.lookup, related: fields.related, formula: fields.formula, layoutElement: fields.layoutElement,
     }).from(fields).where(and(
       eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), lte(fields.introducedIn, version),
     )).orderBy(fields.introducedIn, fields.code);
@@ -400,6 +406,7 @@ export class AppSchemaService {
           }
         }
         if (input.lookup) await this.validateLookup(tx, context, input.lookup, definitions);
+        if (input.related) await this.validateRelated(tx, context, input.related, definitions);
         const [field] = await tx.insert(fields).values({ ...identity, ...input, introducedIn: version }).returning();
         return field;
       });
@@ -407,6 +414,18 @@ export class AppSchemaService {
       if (postgresErrorCode(error) === '23505') throw new ConflictException('Field code already in use');
       throw error;
     }
+  }
+
+  private async validateRelated(tx: TenantTransaction, context: TenantContext,
+    config: z.infer<typeof relatedInput>, localFields: FieldDefinition[],
+  ) {
+    const { fields: targetFields } = await this.access(tx, context, config.appId, 'view');
+    const local = localFields.find(({ fieldId }) => fieldId === config.localFieldId);
+    const target = targetFields.find(({ fieldId }) => fieldId === config.matchFieldId);
+    if (!local || !target || local.type !== target.type || !fieldContract[target.type].sort) {
+      throw new BadRequestException('Related records require matching scalar field types');
+    }
+    config.conditions = normalizeReferencePresentation(config, targetFields);
   }
 
   private async validateLookup(tx: TenantTransaction, context: TenantContext,
@@ -468,6 +487,7 @@ export class AppSchemaService {
           ...before, ...patch, type,
           formula: patch.formula ?? (sameType ? before.formula ?? undefined : undefined),
           autoNumber: patch.autoNumber ?? (sameType ? before.autoNumber ?? undefined : undefined),
+          related: patch.related ?? (sameType ? before.related ?? undefined : undefined),
           lookup: patch.lookup ?? (sameType ? before.lookup ?? undefined : undefined),
           layoutElement: patch.layoutElement ?? (sameType ? before.layoutElement ?? undefined : undefined),
           searchMode: patch.searchMode ?? (sameType ? before.searchMode ?? undefined : undefined),
@@ -484,7 +504,8 @@ export class AppSchemaService {
           throw new BadRequestException('An established automatic-number sequence cannot be reconfigured here');
         }
         if (input.lookup) await this.validateLookup(tx, context, input.lookup, definitions.filter((entry) => entry.fieldId !== id));
-        edited = { ...input, fieldId: id, lookup: input.lookup ?? null, autoNumber: input.autoNumber ?? null, formula: input.formula ?? null,
+        if (input.related) await this.validateRelated(tx, context, input.related, definitions.filter((entry) => entry.fieldId !== id));
+        edited = { ...input, fieldId: id, related: input.related ?? null, lookup: input.lookup ?? null, autoNumber: input.autoNumber ?? null, formula: input.formula ?? null,
           layoutElement: input.layoutElement ?? null, searchMode: input.searchMode ?? null };
       }
       const version = await this.beginDraft(tx, context, app);

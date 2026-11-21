@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
 import { directoryType, type SelectorOptions } from './selector-options';
 import { LookupPreview, LookupRefresh, ReferenceSelector } from './lookup';
+import { RelatedRecords } from './related';
 import { FormGrid } from './form-layout';
 import { RichTextEditor, RichTextValue, richTextSummary } from './rich-text';
 import { draftKey, recoverDraft, removeDrafts, writeDraft, type Draft, type DraftScope } from './drafts';
@@ -163,7 +164,7 @@ export function RecordValues({ fields, layout, record, session, app, directory, 
   return <div className="record-values">
     <FormGrid fields={fields} layout={layout} render={(field) => <dl className="value-row">
       <dt>{field.name}</dt>
-      <dd>{field.lookup ? <>
+      <dd>{field.related ? <RelatedRecords token={session.token} appId={app.id} recordId={record.id} fieldId={field.fieldId} /> : field.lookup ? <>
         {record.data[field.lookup.localKeyFieldId] ?? '—'}
         {onRefresh && fields.some((key) => key.fieldId === field.lookup!.localKeyFieldId && key.editable) &&
           record.data[field.lookup.localKeyFieldId] && <LookupRefresh token={session.token} onSaved={onRefresh}
@@ -344,7 +345,7 @@ export function RecordEditor({
     </section>}
     <FormGrid fields={fields} layout={layout} render={(field) => <div className="form-field">
       <label htmlFor={'field-' + field.fieldId} id={'field-' + field.fieldId + '-label'}>{field.name}{field.required ? ' *' : ''}</label>
-      {field.lookup ? <>
+      {field.related ? record && <RelatedRecords token={token} appId={app.id} recordId={record.id} fieldId={field.fieldId} /> : field.lookup ? <>
       <LookupPreview token={token} fieldId={field.fieldId} recordId={record?.id}
         path={appPath(app.id) + '/records/lookup-preview'} disabled={busy}
         value={watchedValues[field.lookup.localKeyFieldId] ?? ''} />

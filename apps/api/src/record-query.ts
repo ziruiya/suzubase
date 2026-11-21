@@ -2,7 +2,7 @@ import { BadRequestException, Injectable, NotFoundException, ServiceUnavailableE
 import {
   and, eq, gt, isNull, or, records, recordUniqueValues, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { fieldContract, AppAction, LookupConfiguration, ReferencePresentation } from '@suzubase/shared-types';
+import { fieldContract, AppAction, LookupConfiguration, RecordData, RelatedConfiguration, ReferencePresentation } from '@suzubase/shared-types';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
 import { uniqueKey } from './schema-preflight';
@@ -54,8 +54,14 @@ export class RecordQueryService {
     return row;
   }
 
+  async relatedPage(tx: TenantTransaction, context: TenantContext, config: RelatedConfiguration, data: RecordData, after?: string) {
+    const page = await this.referencePage(tx, context, config.appId, config,
+      { fieldId: config.matchFieldId, value: data[config.localFieldId] ?? '' }, config.pageSize, after, true);
+    return { ...page, count: page.count! };
+  }
+
   async referencePage(tx: TenantTransaction, context: TenantContext, appId: string, config: ReferencePresentation,
-    match: { fieldId: string; value: string; prefix?: boolean }, limit: number, after?: string,
+    match: { fieldId: string; value: string; prefix?: boolean }, limit: number, after?: string, includeCount = false,
   ) {
     const { fields, access } = await this.schema.access(tx, context, appId, 'view');
     const visible = (id: string) => access.types.has(id) && this.authorization.fieldDecision(access, id, 'view').allowed;
@@ -71,7 +77,8 @@ export class RecordQueryService {
       this.authorization.recordScope(access, 'view'),
       match.prefix
         ? sql`length(${raw}) > 0 AND starts_with(lower(${raw}), lower(${match.value}))`
-        : this.authorization.condition(context, { fieldId: match.fieldId, operator: 'eq', value: match.value }, access.types.get(match.fieldId)),
+        : match.value === '' ? sql`false`
+          : this.authorization.condition(context, { fieldId: match.fieldId, operator: 'eq', value: match.value }, access.types.get(match.fieldId)),
       ...config.conditions?.map((condition) => this.authorization.condition(context, condition, access.types.get(condition.fieldId))) ?? [],
     );
     const sortField = config.sort?.fieldId;
@@ -100,7 +107,11 @@ export class RecordQueryService {
     const rows = await tx.select({ recordNo: records.recordNo, data: projection })
       .from(records).where(and(scope, cursor))
       .orderBy(...sort ? [sql`${sort} ${direction} NULLS LAST`] : [], records.recordNo).limit(limit + 1);
+    const total = includeCount
+      ? (await tx.select({ count: sql<string>`count(*)::text` }).from(records).where(scope))[0].count
+      : undefined;
     return {
+      ...(total !== undefined && { count: total }),
       columns, items: rows.slice(0, limit).map(({ data }) => data),
       next: rows.length > limit ? rows[limit - 1].recordNo.toString() : null,
     };
