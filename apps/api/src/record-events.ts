@@ -6,14 +6,17 @@ export async function writeRecordEvent(
   tx: TenantTransaction,
   context: TenantContext,
   record: RecordResponse,
-  kind: 'created' | 'updated' | 'lookup-refetched' | 'deleted' | 'restored' | 'schema-migrated' | 'workflow-action' | 'workflow-reassigned' | 'WORKFLOW_REPAIR',
+  kind: 'created' | 'updated' | 'lookup-refetched' | 'deleted' | 'restored' | 'schema-migrated' | 'workflow-action' | 'workflow-reassigned' | 'WORKFLOW_REPAIR' | 'comment-created' | 'comment-deleted',
   changes: FieldChange[],
   source: 'api' | 'import' | 'migration' = 'api',
+  object?: { type: 'comment'; id: string },
 ): Promise<string> {
   const scope = { tenantId: context.tenantId, appId: record.appId };
   const [{ eventId }] = await tx.insert(recordEvents).values({
     ...scope, recordId: record.id, recordRevision: record.revision, schemaVersion: record.schemaVersion,
     actorId: context.userId, source, kind, changes,
+    objectType: object?.type ?? (kind.startsWith('workflow-') || kind === 'WORKFLOW_REPAIR' ? 'workflow' : 'record'),
+    objectId: object?.id,
   }).returning({ eventId: recordEvents.eventId });
   if (kind !== 'created') await tx.update(recordWorkflowState).set({ revision: record.revision })
     .where(workStateScope({ ...scope, recordId: record.id }));

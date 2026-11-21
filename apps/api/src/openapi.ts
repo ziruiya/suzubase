@@ -3,6 +3,7 @@ import { apiTokenActions, fieldTypes, indexPurposes, textSearchModes } from '@su
 import { z } from 'zod';
 import { appHttp } from './app-schema';
 import { authHttp } from './identity';
+import { commentHttp } from './comments';
 import { csvHttp } from './csv';
 import { fileHttp } from './files';
 import { recordHttp } from './records';
@@ -68,7 +69,7 @@ const publishConflict = z.looseObject({
 });
 const publishedApp = appSummary.omit({ deletedAt: true }).extend({
   icon: text.nullable(), themeColor: text.nullable(), titleFieldId: nullableId, localDrafts: flag, schemaVersion: integer,
-  workflowStates: z.array(z.object({ code: text, name: text })),
+  commentsEnabled: flag, workflowStates: z.array(z.object({ code: text, name: text })),
   fields: z.array(formField), formLayout: appHttp.formLayoutInput,
   can: z.object({ edit: flag, delete: flag, create: flag, manage: flag, export: flag }),
   ...viewConfiguration.shape,
@@ -117,7 +118,7 @@ const history = z.object({
   schemas: z.record(text, z.array(field)),
   events: z.array(z.object({
     eventId: id, recordRevision: integer, schemaVersion: integer, occurredAt: timestamp, actorId: id,
-    actorLabel: text, source: text, kind: text,
+    actorLabel: text, source: text, kind: text, objectType: text, objectId: nullableId,
     changes: z.array(z.object({ fieldId: id, rowId: id.optional(), childFieldId: id.optional(),
       rowChange: z.enum(['added', 'removed', 'moved']).optional(), oldValue: text.nullable(), newValue: text.nullable() })),
   })),
@@ -217,6 +218,12 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/publish']: { post: { body: appHttp.publishInput, optionalBody: true,
     reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text) }), conflict: publishConflict } },
   [records]: { get: { query: recordHttp.pageInput, reply: page(record) }, post: { body: recordHttp.createInput, reply: record, conflict: errorSchema } },
+  [entry + '/comments']: {
+    get: { query: commentHttp.listQuery, reply: commentHttp.page },
+    post: { body: commentHttp.createInput, reply: z.object({ id, createdAt: timestamp, eventId: id, revision: integer }) },
+  },
+  [entry + '/comments/mention-options']: { get: { reply: z.array(choice.extend({ disabled: flag })) } },
+  [entry + '/comments/{commentId}']: { delete: { reply: result('deleted').extend({ eventId: id, revision: integer }) } },
   [entry + '/workflow']: { get: { reply: z.object({ workflow: workflowRuntimeHttp.runtimeSummary.nullable() }) } },
   [entry + '/workflow/actions']: { post: { body: workflowRuntimeHttp.executeInput, reply: workflowRuntimeHttp.mutation, conflict: errorSchema } },
   [entry + '/workflow/reassign']: { post: { body: workflowRuntimeHttp.reassignInput, reply: workflowRuntimeHttp.mutation, conflict: errorSchema } },

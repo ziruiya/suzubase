@@ -149,7 +149,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
       event.preventDefault(); const data = new FormData(event.currentTarget);
       void run(async () => {
         await api(path + '/settings', token, json('PATCH', {
-          name: data.get('name'), description: data.get('description'), localDrafts: data.has('drafts'),
+          name: data.get('name'), description: data.get('description'), localDrafts: data.has('drafts'), commentsEnabled: data.has('commentsEnabled'),
         }));
         await reload(); setNotice('Settings saved.');
       });
@@ -158,6 +158,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
       <label>Name <input name="name" defaultValue={app.name} required /></label>
       <label>Description <textarea name="description" defaultValue={app.description} /></label>
       <label className="option"><input type="checkbox" name="drafts" defaultChecked={app.localDrafts} /> Enable local record drafts</label>
+      <label className="option"><input type="checkbox" name="commentsEnabled" defaultChecked={app.commentsEnabled} /> Enable comments</label>
       <button className="primary" disabled={busy}>Save settings</button>
     </form>}
     {active === 'Indexes' && <IndexSettings app={app} session={session} />}

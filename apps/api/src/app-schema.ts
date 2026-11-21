@@ -35,6 +35,7 @@ const settingsInput = z.strictObject({
   name: metadata.name.optional(),
   description: z.string().max(4000).optional(),
   localDrafts: z.boolean().optional(),
+  commentsEnabled: z.boolean().optional(),
   icon: z.string().max(64).nullable().optional(),
   themeColor: z.string().regex(/^#[0-9a-f]{6}$/i).nullable().optional(),
   titleFieldId: identifier.nullable().optional(),
@@ -220,9 +221,9 @@ export class AppSchemaService {
       return await withTenantTransaction(context, async (tx) => {
         if (!await this.authorization.canCreateApp(tx, context)) throw new ForbiddenException('无权限');
         const source = await this.managedApp(tx, context, appId);
-        const { description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes, localDrafts } = source;
+        const { description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes, localDrafts, commentsEnabled } = source;
         const [copy] = await tx.insert(apps).values({
-          ...input, description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes, localDrafts,
+          ...input, description, icon, themeColor, duplicateHint, numericPrecision, adminMemo, attachmentMaxBytes, attachmentMaxCount, attachmentTypes, localDrafts, commentsEnabled,
           tenantId: context.tenantId, createdBy: context.userId,
         }).returning();
         const identity = { tenantId: context.tenantId, appId: copy.id };
@@ -311,6 +312,7 @@ export class AppSchemaService {
           ? app.titleFieldId : null,
         formLayout: this.visibleLayout(await this.layout(tx, context, appId, app.publishedSchemaVersion), definitions),
         archivedAt: app.archivedAt, localDrafts: app.localDrafts, can,
+        commentsEnabled: app.commentsEnabled,
         workflowStates: await publishedWorkflowStates(tx, { tenantId: context.tenantId, appId }),
         schemaVersion: app.publishedSchemaVersion, fields: definitions, ...views };
     });

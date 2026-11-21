@@ -742,7 +742,7 @@ export class RecordService {
       event: {
         eventId: recordEvents.eventId, recordRevision: recordEvents.recordRevision, schemaVersion: recordEvents.schemaVersion,
         occurredAt: recordEvents.occurredAt, actorId: recordEvents.actorId, source: recordEvents.source,
-        kind: recordEvents.kind, changes: visibleChanges,
+        kind: recordEvents.kind, objectType: recordEvents.objectType, objectId: recordEvents.objectId, changes: visibleChanges,
       }, name: users.displayName, email: users.email, disabledAt: tenantMembers.disabledAt,
     }).from(recordEvents).innerJoin(users, and(
       eq(users.tenantId, recordEvents.tenantId), eq(users.id, recordEvents.actorId),

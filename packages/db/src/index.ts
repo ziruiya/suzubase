@@ -7,6 +7,7 @@ import type { ApiTokenAction } from '@suzubase/shared-types';
 export { and, eq, inArray, or, isNull, lte, gt, sql } from 'drizzle-orm';
 export {
   apiTokens, apps, appCounters, autoNumberCounters, issuedAutoNumbers, appVersions, csvJobs, permissionAudit, fields, fileReferences, files, outbox, recordCreateKeys, recordEvents, recordSearchValues, recordUniqueValues, records, recordReferences, recordTableRows, runtimeIndexes,
+  recordComments, commentMentions,
   workflowDefinitions, workflowStates, workflowActions, recordWorkflowState, workflowAssignments, workflowEvents,
   groupMembers, loginCredentials, memberGroups, organizations, tenantMembers, tenants, users,
 } from './schema';

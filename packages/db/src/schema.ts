@@ -93,6 +93,7 @@ export const apps = pgTable('apps', {
   attachmentMaxCount: integer('attachment_max_count').notNull().default(5),
   attachmentTypes: jsonb('attachment_types').$type<string[]>().notNull().default(sql`'["image/png","image/jpeg","application/pdf"]'::jsonb`),
   localDrafts: boolean('local_drafts').notNull().default(true),
+  commentsEnabled: boolean('comments_enabled').notNull().default(true),
   workflowEnabled: boolean('workflow_enabled').notNull().default(false),
   adminMemo: text('admin_memo').notNull().default(''),
   archivedAt: time('archived_at'),
@@ -346,6 +347,52 @@ export const recordReferences = pgTable('record_references', {
   }),
 ]);
 
+export const recordComments = pgTable('record_comments', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  recordId: uuid('record_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  authorId: uuid('author_id').notNull(),
+  body: text().notNull(),
+  createdAt: time('created_at').notNull().defaultNow(),
+  deletedAt: time('deleted_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.recordId, t.id] }),
+  foreignKey({
+    name: 'record_comments_record_fk',
+    columns: [t.tenantId, t.appId, t.recordId],
+    foreignColumns: [records.tenantId, records.appId, records.id],
+  }),
+  foreignKey({
+    name: 'record_comments_author_fk',
+    columns: [t.tenantId, t.authorId],
+    foreignColumns: [tenantMembers.tenantId, tenantMembers.userId],
+  }),
+  index('record_comments_page_idx').on(t.tenantId, t.appId, t.recordId, t.createdAt.desc(), t.id.desc()),
+]);
+
+export const commentMentions = pgTable('comment_mentions', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  recordId: uuid('record_id').notNull(),
+  commentId: uuid('comment_id').notNull(),
+  userId: uuid('user_id').notNull(),
+  offset: integer().notNull(),
+  length: integer().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.recordId, t.commentId, t.offset] }),
+  foreignKey({
+    name: 'comment_mentions_comment_fk',
+    columns: [t.tenantId, t.appId, t.recordId, t.commentId],
+    foreignColumns: [recordComments.tenantId, recordComments.appId, recordComments.recordId, recordComments.id],
+  }),
+  foreignKey({
+    name: 'comment_mentions_user_fk',
+    columns: [t.tenantId, t.userId],
+    foreignColumns: [tenantMembers.tenantId, tenantMembers.userId],
+  }),
+]);
+
 export const recordEvents = pgTable('record_events', {
   tenantId: tenantId(),
   appId: uuid('app_id').notNull(),
@@ -356,6 +403,8 @@ export const recordEvents = pgTable('record_events', {
   actorId: uuid('actor_id').notNull(),
   source: text().notNull(),
   kind: text().notNull(),
+  objectType: text('object_type').notNull().default('record'),
+  objectId: uuid('object_id'),
   occurredAt: time('occurred_at').notNull().defaultNow(),
   changes: jsonb().$type<FieldChange[]>().notNull(),
 }, (t) => [

@@ -9,6 +9,7 @@ import { useSelectorOptions } from './selector-options';
 import { RecycleBin } from './recycle-bin';
 import { Settings } from './settings';
 import { Directory } from './directory';
+import { Comments } from './comments';
 import { Tasks, WorkflowDetail } from './workflow-runtime';
 import { AccountSecurity } from './account-security';
 import './style.css';
@@ -244,6 +245,8 @@ function Records({ appId, initialRecord, session, narrow, leave }: { appId: stri
         record={form.record} session={session} refresh={() => void open(form.record.id)} />}
       <RecordValues fields={form.fields} layout={form.formLayout} record={form.record} session={session} app={app} directory={selectors.options}
         onRefresh={!app.archivedAt && app.can.edit && form.can.edit ? (record) => void open(record.id) : undefined} />
+      {app.commentsEnabled && <Comments key={form.record.id} appId={app.id} recordId={form.record.id} session={session}
+        archived={!!app.archivedAt} refresh={() => void open(form.record.id)} />}
       <div className="inline">
         <button onClick={() => void api<History>(root + '/' + form.record.id + '/history', token)
           .then(setHistory).catch((error) => setError(message(error)))}>Show history</button>
