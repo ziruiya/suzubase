@@ -1,20 +1,24 @@
-import { outbox, recordEvents, TenantContext, TenantTransaction } from '@suzubase/db';
+import { outbox, recordEvents, recordWorkflowState, TenantContext, TenantTransaction } from '@suzubase/db';
+import { workStateScope } from './workflow-data';
 import { FieldChange, RecordData, RecordResponse } from '@suzubase/shared-types';
 
 export async function writeRecordEvent(
   tx: TenantTransaction,
   context: TenantContext,
   record: RecordResponse,
-  kind: 'created' | 'updated' | 'lookup-refetched' | 'deleted' | 'restored' | 'schema-migrated',
+  kind: 'created' | 'updated' | 'lookup-refetched' | 'deleted' | 'restored' | 'schema-migrated' | 'workflow-action' | 'workflow-reassigned',
   changes: FieldChange[],
   source: 'api' | 'import' | 'migration' = 'api',
-): Promise<void> {
+): Promise<string> {
   const scope = { tenantId: context.tenantId, appId: record.appId };
   const [{ eventId }] = await tx.insert(recordEvents).values({
     ...scope, recordId: record.id, recordRevision: record.revision, schemaVersion: record.schemaVersion,
     actorId: context.userId, source, kind, changes,
   }).returning({ eventId: recordEvents.eventId });
+  if (kind !== 'created') await tx.update(recordWorkflowState).set({ revision: record.revision })
+    .where(workStateScope({ ...scope, recordId: record.id }));
   await tx.insert(outbox).values({ ...scope, eventId, topic: `record.${kind}` });
+  return eventId;
 }
 
 export function fieldChanges(before: RecordData, after: RecordData): FieldChange[] {

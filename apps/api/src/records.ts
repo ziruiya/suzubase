@@ -20,6 +20,7 @@ import { FileService, fileIds } from './files';
 import { SearchService, searchInput } from './search';
 import { projectSearchValues } from './search-projection';
 import { prepareTableRows, replaceTableRows, tableRowScope } from './table-rows';
+import { attachInitialWorkflow, initialWorkflow } from './workflow-data';
 import { uniqueKey } from './schema-preflight';
 import { calculateFields } from './formula';
 import { normalizeValue } from './field-values';
@@ -203,8 +204,9 @@ export class RecordService {
     calculateFields(fields, data);
     const [counter] = await tx.update(appCounters).set({ lastValue: sql`${appCounters.lastValue} + 1` })
       .where(counterScope).returning({ recordNo: appCounters.lastValue });
+    const initial = app.workflowEnabled ? await initialWorkflow(tx, identity) : undefined;
     const [row] = await tx.insert(records).values({
-      ...identity, recordNo: counter.recordNo, schemaVersion, data,
+      ...identity, recordNo: counter.recordNo, schemaVersion, data, status: initial?.state.code,
       createdBy: context.userId, updatedBy: context.userId,
     }).returning();
     const record = serializeRecord(row);
@@ -213,7 +215,8 @@ export class RecordService {
     await this.reserveUniqueValues(tx, context, record);
     await this.reconcileFiles(tx, context, record);
     await projectSearchValues(tx, context, record, fields);
-    await writeRecordEvent(tx, context, record, 'created', [...fieldChanges({}, data), ...tables.changes], source);
+    const eventId = await writeRecordEvent(tx, context, record, 'created', [...fieldChanges({}, data), ...tables.changes], source);
+    if (initial) await attachInitialWorkflow(tx, context.tenantId, record, initial, eventId);
     if (key !== undefined) {
       await tx.insert(recordCreateKeys).values({
         ...identity, userId: context.userId, key, recordId: record.id,

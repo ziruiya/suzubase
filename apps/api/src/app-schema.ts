@@ -20,7 +20,7 @@ import { retireChangedIndexes } from './runtime-index-state';
 import { fieldChanges, serializeRecord, writeRecordEvent } from './record-events';
 import { projectSearchValues } from './search-projection';
 import { normalizeReferencePresentation, referencePresentation } from './reference-config';
-import { copyWorkflow } from './workflow-graph';
+import { copyWorkflow, publishedWorkflowStates } from './workflow-graph';
 import { conditions, viewInput } from './view-input';
 import { identifier, parseInput, postgresErrorCode } from './validation';
 
@@ -266,6 +266,7 @@ export class AppSchemaService {
             columns: view.columns.map(remap), conditions: view.conditions.map(remap),
             aggregateFields: view.aggregateFields?.map((id) => fieldMapping.get(id)!),
             sort: view.sort && remap(view.sort),
+            pastDateFieldId: view.pastDateFieldId && fieldMapping.get(view.pastDateFieldId),
           })),
         };
         const formLayout = (await this.layout(tx, context, appId, source.publishedSchemaVersion)).map((row) => ({
@@ -309,7 +310,9 @@ export class AppSchemaService {
         titleFieldId: app.titleFieldId && this.authorization.fieldDecision(access, app.titleFieldId, 'view').allowed
           ? app.titleFieldId : null,
         formLayout: this.visibleLayout(await this.layout(tx, context, appId, app.publishedSchemaVersion), definitions),
-        archivedAt: app.archivedAt, localDrafts: app.localDrafts, can, schemaVersion: app.publishedSchemaVersion, fields: definitions, ...views };
+        archivedAt: app.archivedAt, localDrafts: app.localDrafts, can,
+        workflowStates: await publishedWorkflowStates(tx, { tenantId: context.tenantId, appId }),
+        schemaVersion: app.publishedSchemaVersion, fields: definitions, ...views };
     });
   }
 
@@ -362,9 +365,10 @@ export class AppSchemaService {
   }
 
   visibleViews(configuration: ViewConfiguration, access: RecordAccess) {
-    const visible = (fieldId: string) => this.authorization.fieldDecision(access, fieldId, 'view').allowed;
+    const visible = (fieldId: string) => access.types.has(fieldId) && this.authorization.fieldDecision(access, fieldId, 'view').allowed;
     const views = configuration.views.filter((view) =>
-      view.conditions.every(({ fieldId }) => visible(fieldId)) && (!view.sort || visible(view.sort.fieldId)),
+      view.conditions.every(({ fieldId }) => visible(fieldId)) && (!view.sort || visible(view.sort.fieldId)) &&
+        (!view.pastDateFieldId || visible(view.pastDateFieldId)),
     ).map((view) => ({
       ...view, columns: view.columns.filter(({ fieldId }) => visible(fieldId)),
       aggregateFields: view.aggregateFields?.filter(visible),
@@ -722,6 +726,11 @@ export class AppSchemaService {
         const fields = await this.getFields(tx, context, appId, current);
         const input = change.value;
         const definitions = new Map(fields.map((field) => [field.fieldId, field]));
+        if (input.pastDateFieldId && definitions.get(input.pastDateFieldId)?.type !== 'date') {
+          throw new BadRequestException('An overdue filter requires a date field');
+        }
+        if (input.workflowState && !(await publishedWorkflowStates(tx, { tenantId: context.tenantId, appId }))
+          .some(({ code }) => code === input.workflowState)) throw new BadRequestException('Unknown workflow state');
         const columnsValid = input.columns.every(({ fieldId }) => definitions.has(fieldId) && definitions.get(fieldId)!.type !== 'layout');
         const sortField = input.sort && definitions.get(input.sort.fieldId);
         if (input.aggregateFields?.some((id) => {

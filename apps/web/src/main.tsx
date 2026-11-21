@@ -9,10 +9,11 @@ import { useSelectorOptions } from './selector-options';
 import { RecycleBin } from './recycle-bin';
 import { Settings } from './settings';
 import { Directory } from './directory';
+import { Tasks, WorkflowDetail } from './workflow-runtime';
 import { AccountSecurity } from './account-security';
 import './style.css';
 
-type Item = Pick<RecordResponse, 'id' | 'recordNo' | 'data' | 'revision' | 'schemaVersion'>;
+type Item = Pick<RecordResponse, 'id' | 'recordNo' | 'data' | 'revision' | 'schemaVersion'> & { status?: string };
 type RecordForm = { record: RecordResponse; fields: Field[]; formLayout: FormLayout; can: { edit: boolean; delete: boolean } };
 type Search = { field: string; mode: string; query: string };
 type Archive = { data: Record<string, string>; definitions: Record<string, Field> };
@@ -80,10 +81,11 @@ function Login({ onLogin, notice }: { onLogin: (session: Session) => void; notic
   </main>;
 }
 
-function Portal({ session, navigate, narrow }: { session: Session; navigate: (id: string) => void; narrow: boolean }) {
+function Portal({ session, navigate, narrow }: { session: Session; navigate: (id: string, recordId?: string) => void; narrow: boolean }) {
   const [apps, setApps] = useState<AppSummary[]>([]);
   const [error, setError] = useState('');
   const [creating, setCreating] = useState(false);
+  const [tasks, setTasks] = useState(false);
   const { profile, token } = session;
   useEffect(() => { void api<AppSummary[]>('/apps', token).then(setApps).catch((error) => setError(message(error))); }, []);
   async function create(event: FormEvent<HTMLFormElement>) {
@@ -102,6 +104,8 @@ function Portal({ session, navigate, narrow }: { session: Session; navigate: (id
     <div className="inline spread"><h1>Applications</h1>
       {!narrow && (profile.isAdmin || profile.canCreateApps || profile.allowAppCreation) &&
         <button className="primary" onClick={() => setCreating(!creating)}>{creating ? 'Cancel' : 'New application'}</button>}</div>
+    <button type="button" aria-expanded={tasks} onClick={() => setTasks(!tasks)}>My tasks</button>
+    {tasks && <Tasks token={token} apps={apps} open={navigate} />}
     {error && <p className="error" role="alert">{error}</p>}
     {creating && <form className="panel stack" onSubmit={(event) => void create(event)}>
       <label>Name <input name="name" required /></label>
@@ -118,7 +122,7 @@ function Portal({ session, navigate, narrow }: { session: Session; navigate: (id
   </div>;
 }
 
-function Records({ appId, session, narrow, leave }: { appId: string; session: Session; narrow: boolean; leave: () => void }) {
+function Records({ appId, initialRecord, session, narrow, leave }: { appId: string; initialRecord?: string; session: Session; narrow: boolean; leave: () => void }) {
   const [app, setApp] = useState<App>();
   const selectors = useSelectorOptions(app, session);
   const [view, setView] = useState<string>();
@@ -129,7 +133,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
   const [form, setForm] = useState<RecordForm>();
   const [history, setHistory] = useState<History>();
   const [archive, setArchive] = useState<Archive>();
-  const [screen, setScreen] = useState<'list' | 'detail' | 'edit' | 'new' | 'settings' | 'recycle'>('list');
+  const [screen, setScreen] = useState<'list' | 'detail' | 'edit' | 'new' | 'settings' | 'recycle' | 'tasks' | 'unassigned'>('list');
   const [search, setSearch] = useState<Search>();
   const [searchField, setSearchField] = useState('');
   const [feedback, setFeedback] = useState('');
@@ -188,6 +192,8 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
       setError(message(error));
     }
   }
+  useEffect(() => { if (initialRecord) void open(initialRecord); }, [initialRecord]);
+
   function back() {
     setScreen('list'); setError(''); setForm(undefined); setConfirm(false);
   }
@@ -208,6 +214,8 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
       {screen !== 'list' && <button onClick={back}>{app.name}</button>}</nav>
     {feedback && <p className="banner" role="status">{feedback}</p>}
     {error && <p role="alert" className="error">{error}</p>}
+    {(screen === 'tasks' || screen === 'unassigned') && <Tasks token={token} appId={app.id} unassigned={screen === 'unassigned'}
+      open={(_, recordId) => void open(recordId)} />}
     {screen === 'recycle' && <RecycleBin path={root} session={session} back={back} />}
     {screen === 'settings' && app.can.manage && (!narrow || session.profile.isAdmin) &&
       <Settings app={app} session={session} narrow={narrow} onClose={back} reload={reload} />}
@@ -232,6 +240,8 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
             json('DELETE', { revision: form.record.revision })).then(() => { back(); setFeedback('Record moved to the recycle bin'); })
             .catch((error) => setError(message(error))); }}>Confirm move</button></div>
       </section>}
+      {app.workflowStates.length > 0 && <WorkflowDetail key={form.record.id + ':' + form.record.revision}
+        record={form.record} session={session} refresh={() => void open(form.record.id)} />}
       <RecordValues fields={form.fields} layout={form.formLayout} record={form.record} session={session} app={app} directory={selectors.options}
         onRefresh={!app.archivedAt && app.can.edit && form.can.edit ? (record) => void open(record.id) : undefined} />
       <div className="inline">
@@ -267,6 +277,10 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
       </section>}
     </section>}
     {screen === 'list' && <>
+      {app.workflowStates.length > 0 && <div className="inline">
+        <button type="button" onClick={() => setScreen('tasks')}>My tasks</button>
+        {app.can.manage && <button type="button" onClick={() => setScreen('unassigned')}>Records without active assignees</button>}
+      </div>}
       <div className="heading inline spread">
         <div><h1>{app.name}</h1>{app.description && <p className="muted">{app.description}</p>}</div>
         <div className="inline">
@@ -316,6 +330,8 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
       {items.length > 0 ? <section aria-label="Records" className="record-grid">{items.map((record) =>
         <article className="record-card" key={record.id}>
           <button className="record-link" onClick={() => { setFeedback(''); void open(record.id); }}>Record {record.recordNo}</button>
+          {record.status && app.workflowStates.some(({ code }) => code === record.status) &&
+            <p>State · {app.workflowStates.find(({ code }) => code === record.status)?.name}</p>}
           <dl className={selectedView?.columns.length ? 'view-columns' : undefined}>{columns.map((field) => <div key={field.fieldId}
             style={selectedView?.columns.length ? { flexBasis: selectedView.columns.find(({ fieldId }) => fieldId === field.fieldId)?.width } : undefined}>
             <dt>{field.name}</dt>
@@ -338,7 +354,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
 
 function Root() {
   const [session, setSession] = useState<Session>();
-  const [current, setCurrent] = useState<string>();
+  const [current, setCurrent] = useState<{ appId: string; recordId?: string }>();
   const [security, setSecurity] = useState(false);
   const [directory, setDirectory] = useState(false);
   const [notice, setNotice] = useState('');
@@ -364,8 +380,8 @@ function Root() {
       {directory ? <Directory session={session} back={() => setDirectory(false)} /> : security ? <AccountSecurity token={session.token} close={() => setSecurity(false)} signInAgain={() => {
         setNotice('Two-factor settings changed. Sign in again to continue.');
         void logout();
-      }} /> : current ? <Records key={current} appId={current} session={session} narrow={narrow} leave={() => setCurrent(undefined)} />
-        : <Portal session={session} narrow={narrow} navigate={setCurrent} />}
+      }} /> : current ? <Records key={current.appId + (current.recordId ?? '')} appId={current.appId} initialRecord={current.recordId} session={session} narrow={narrow} leave={() => setCurrent(undefined)} />
+        : <Portal session={session} narrow={narrow} navigate={(appId, recordId) => setCurrent({ appId, recordId })} />}
     </main>
   </> : <Login notice={notice} onLogin={(value) => { setSession(value); setNotice(''); }} />;
 }

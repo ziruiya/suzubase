@@ -15,5 +15,8 @@ export const viewInput = z.strictObject({
     .refine((columns) => new Set(columns.map(({ fieldId }) => fieldId)).size === columns.length),
   aggregateFields: z.array(identifier).max(10).refine((ids) => new Set(ids).size === ids.length).optional(),
   conditions,
+  workflowState: z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/).optional(),
+  assignedToMe: z.boolean().optional(),
+  pastDateFieldId: identifier.optional(),
   sort: z.strictObject({ fieldId: identifier, direction: z.enum(['asc', 'desc']) }).optional(),
 });

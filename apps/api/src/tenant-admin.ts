@@ -5,7 +5,7 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, appVersions, eq, groupMembers, isNull, loginCredentials, memberGroups, organizations, records,
-  sql, tenantMembers, tenants, users, type TenantContext, type TenantTransaction, withTenantTransaction,
+  sql, tenantMembers, tenants, users, workflowAssignments, type TenantContext, type TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
 import { z } from 'zod';
 import { AppSchemaService } from './app-schema';
@@ -149,19 +149,55 @@ export class TenantAdminService {
     });
   }
 
+  private async disablePlan(tx: TenantTransaction, context: TenantContext, id: string) {
+    const memberScope = and(eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, id));
+    const [member] = await tx.select({ id: tenantMembers.userId }).from(tenantMembers).where(memberScope).for('update');
+    if (!member) throw new NotFoundException();
+    const created = await tx.select({
+      id: records.id, appId: records.appId, recordNo: sql<string>`${records.recordNo}::text`,
+    }).from(records).where(and(
+      eq(records.tenantId, context.tenantId), eq(records.createdBy, id), isNull(records.deletedAt),
+    ));
+    const assignment = and(eq(workflowAssignments.tenantId, context.tenantId), eq(workflowAssignments.userId, id),
+      eq(workflowAssignments.active, true));
+    const recordLink = and(eq(records.tenantId, workflowAssignments.tenantId), eq(records.appId, workflowAssignments.appId),
+      eq(records.id, workflowAssignments.recordId), isNull(records.deletedAt));
+    const affectedApps = await tx.selectDistinct({
+      appId: workflowAssignments.appId,
+    }).from(workflowAssignments).innerJoin(records, recordLink).where(assignment);
+    const assignments = [];
+    let restricted = false;
+    for (const { appId } of affectedApps) {
+      const grant = await this.schema.access(tx, context, appId, 'view').catch((error: unknown) => {
+        if (error instanceof NotFoundException) return undefined;
+        throw error;
+      });
+      if (!grant) { restricted = true; continue; }
+      const [total] = await tx.select({ count: sql<string>`count(*)::text` }).from(workflowAssignments)
+        .innerJoin(records, recordLink).where(and(assignment, eq(workflowAssignments.appId, appId)));
+      const visible = await tx.select({
+        id: records.id, appId: records.appId, recordNo: sql<string>`${records.recordNo}::text`, revision: records.revision,
+        state: records.status,
+      }).from(workflowAssignments).innerJoin(records, recordLink).where(and(assignment, eq(workflowAssignments.appId, appId),
+        this.authorization.recordScope(grant.access, 'view'), this.authorization.recordScope(grant.access, 'edit')));
+      if (BigInt(visible.length) !== BigInt(total.count)) restricted = true;
+      assignments.push(...visible.map((row) => ({ ...row, appName: grant.app.name })));
+    }
+    if (restricted) throw new ForbiddenException('无权限');
+    return { records: created, assignments };
+  }
+
+  disablePreview(context: TenantContext, id: string) {
+    return this.run(context, (tx) => this.disablePlan(tx, context, id));
+  }
+
   disable(context: TenantContext, id: string) {
     return this.run(context, async (tx) => {
       if (id === context.userId) throw new ConflictException('Cannot disable the current administrator');
-      const [member] = await tx.select().from(tenantMembers).where(and(
-        eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, id),
-      )).for('update');
-      if (!member) throw new NotFoundException();
-      const affected = await tx.select({
-        id: records.id, appId: records.appId, recordNo: sql<string>`${records.recordNo}::text`,
-      }).from(records).where(and(
-        eq(records.tenantId, context.tenantId), eq(records.createdBy, id), isNull(records.deletedAt),
-      ));
-      if (affected.length) throw new ConflictException({ message: 'Transfer records before disabling', records: affected });
+      const plan = await this.disablePlan(tx, context, id);
+      if (plan.records.length || plan.assignments.length) {
+        throw new ConflictException({ message: plan.assignments.length ? 'Transfer workflow assignments before disabling' : 'Transfer records before disabling', ...plan });
+      }
       await tx.update(tenantMembers).set({ disabledAt: new Date().toISOString() }).where(and(
         eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, id),
       ));
@@ -336,6 +372,11 @@ export class TenantAdminController {
   reset(@AuthenticatedTenant() context: TenantContext, @Param('id') id: string, @Body() body: unknown) {
     const input = parseInput(resetInput, body);
     return this.admin.resetPassword(context, parseInput(identifier, id), input.password);
+  }
+
+  @Get('users/:id/disable')
+  disablePreview(@AuthenticatedTenant() context: TenantContext, @Param('id') id: string) {
+    return this.admin.disablePreview(context, parseInput(identifier, id));
   }
 
   @Post('users/:id/disable')

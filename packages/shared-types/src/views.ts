@@ -7,6 +7,9 @@ export interface SavedView {
   name: string;
   columns: { fieldId: string; width: number }[];
   conditions: ViewCondition[];
+  workflowState?: string;
+  assignedToMe?: boolean;
+  pastDateFieldId?: string;
   aggregateFields?: string[];
   sort?: { fieldId: string; direction: 'asc' | 'desc' };
 }

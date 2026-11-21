@@ -143,3 +143,7 @@ dd { white-space: pre-wrap; }
     border-radius: 0;
   }
 }
+
+.workflow-confirm { width: min(36rem, calc(100% - 2rem)); border: 1px solid #667085; border-radius: .7rem; }
+.workflow-confirm::backdrop { background: rgb(15 23 42 / .55); }
+.workflow-actions { position: sticky; bottom: 0; z-index: 2; background: #fff; padding: .5rem 0; }

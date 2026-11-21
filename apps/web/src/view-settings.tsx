@@ -5,8 +5,8 @@ import { Conditions } from './conditions';
 
 const blank: Omit<SavedView, 'id'> = { name: '', columns: [], conditions: [] };
 
-export function ViewSettings({ configuration, fields, path, session, refresh }: {
-  configuration: ViewConfiguration; fields: Field[]; path: string; session: Session; refresh: () => Promise<void>;
+export function ViewSettings({ configuration, fields, workflowStates, path, session, refresh }: {
+  configuration: ViewConfiguration; fields: Field[]; workflowStates: { code: string; name: string }[]; path: string; session: Session; refresh: () => Promise<void>;
 }) {
   const [selected, setSelected] = useState('');
   const [view, setView] = useState(blank);
@@ -20,7 +20,8 @@ export function ViewSettings({ configuration, fields, path, session, refresh }: 
     const saved = views.find((entry) => entry.id === id);
     setSelected(id);
     setRemove(false);
-    setView(saved ? { name: saved.name, columns: saved.columns, sort: saved.sort, conditions: saved.conditions, aggregateFields: saved.aggregateFields } : blank);
+    setView(saved ? { name: saved.name, columns: saved.columns, sort: saved.sort, conditions: saved.conditions, aggregateFields: saved.aggregateFields, workflowState: saved.workflowState, assignedToMe: saved.assignedToMe,
+      pastDateFieldId: saved.pastDateFieldId } : blank);
   }
 
   async function run(action: () => Promise<void>) {
@@ -46,6 +47,20 @@ export function ViewSettings({ configuration, fields, path, session, refresh }: 
     <form className="stack" onSubmit={submit}>
       <label>View name <input value={view.name} onChange={(event) => setView({ ...view, name: event.target.value })} maxLength={120} required /></label>
       <Conditions fields={fields} conditions={view.conditions} onChange={(conditions) => setView({ ...view, conditions })} />
+      {!!workflowStates.length && <div className="inline">
+        <label>Workflow state <select value={view.workflowState ?? ''} onChange={(event) =>
+          setView({ ...view, workflowState: event.target.value || undefined })}>
+          <option value="">Any state</option>
+          {workflowStates.map(({ code, name }) => <option key={code} value={code}>{name}</option>)}
+        </select></label>
+        <label className="option"><input type="checkbox" checked={!!view.assignedToMe} onChange={(event) =>
+          setView({ ...view, assignedToMe: event.target.checked || undefined })} /> Assigned to me</label>
+      </div>}
+      {fields.some(({ type }) => type === 'date') && <label>Overdue date field <select value={view.pastDateFieldId ?? ''} onChange={(event) =>
+        setView({ ...view, pastDateFieldId: event.target.value || undefined })}>
+        <option value="">Any date</option>
+        {fields.filter(({ type }) => type === 'date').map(({ fieldId, name }) => <option key={fieldId} value={fieldId}>{name}</option>)}
+      </select></label>}
       <div className="inline">
         <label>Sort field <select value={view.sort?.fieldId ?? ''} onChange={(event) => setView({ ...view,
           sort: event.target.value ? { fieldId: event.target.value, direction: view.sort?.direction ?? 'asc' } : undefined })}>

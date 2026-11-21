@@ -43,6 +43,7 @@ export interface Field {
 
 export interface App extends AppSummary, ViewConfiguration {
   schemaVersion: number;
+  workflowStates: { code: string; name: string }[];
   localDrafts: boolean;
   fields: Field[];
   formLayout: FormLayout;

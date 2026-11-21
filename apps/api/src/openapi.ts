@@ -8,6 +8,7 @@ import { fileHttp } from './files';
 import { recordHttp } from './records';
 import { indexHttp } from './runtime-indexes';
 import { tenantHttp } from './tenant-admin';
+import { workflowRuntimeHttp } from './workflow-runtime';
 import { workflowHttp } from './workflow-definitions';
 import { tokenHttp } from './api-tokens';
 import { formulaInput } from './formula';
@@ -67,6 +68,7 @@ const publishConflict = z.looseObject({
 });
 const publishedApp = appSummary.omit({ deletedAt: true }).extend({
   icon: text.nullable(), themeColor: text.nullable(), titleFieldId: nullableId, localDrafts: flag, schemaVersion: integer,
+  workflowStates: z.array(z.object({ code: text, name: text })),
   fields: z.array(formField), formLayout: appHttp.formLayoutInput,
   can: z.object({ edit: flag, delete: flag, create: flag, manage: flag, export: flag }),
   ...viewConfiguration.shape,
@@ -215,6 +217,12 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/publish']: { post: { body: appHttp.publishInput, optionalBody: true,
     reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text) }), conflict: publishConflict } },
   [records]: { get: { query: recordHttp.pageInput, reply: page(record) }, post: { body: recordHttp.createInput, reply: record, conflict: errorSchema } },
+  [entry + '/workflow']: { get: { reply: z.object({ workflow: workflowRuntimeHttp.runtimeSummary.nullable() }) } },
+  [entry + '/workflow/actions']: { post: { body: workflowRuntimeHttp.executeInput, reply: workflowRuntimeHttp.mutation, conflict: errorSchema } },
+  [entry + '/workflow/reassign']: { post: { body: workflowRuntimeHttp.reassignInput, reply: workflowRuntimeHttp.mutation, conflict: errorSchema } },
+  [entry + '/workflow/handoff']: { post: { body: workflowRuntimeHttp.handoffInput, reply: workflowRuntimeHttp.mutation, conflict: errorSchema } },
+  '/workflow/tasks': { get: { query: workflowRuntimeHttp.taskQuery, reply: workflowRuntimeHttp.taskPage } },
+  '/workflow/unassigned': { get: { query: workflowRuntimeHttp.taskQuery, reply: workflowRuntimeHttp.taskPage } },
   [entry + '/related/{fieldId}']: { get: { query: recordHttp.relatedQuery, reply: z.object({
     columns: z.array(z.object({ fieldId: id, name: text })), items: z.array(data), next: recordNo.nullable(), count: text,
   }) } },
@@ -252,7 +260,10 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [tenant + '/users']: { post: { body: tenantHttp.newUser, reply: tenantId.extend(user.shape), conflict: errorSchema } },
   [tenant + '/users/{id}']: { patch: { body: tenantHttp.userPatch, reply: tenantId.extend(user.shape) } },
   [tenant + '/users/{id}/password']: { put: { body: tenantHttp.resetInput, reply: result('updated') } },
-  [tenant + '/users/{id}/disable']: { post: { reply: result('disabled'), conflict: errorSchema } },
+  [tenant + '/users/{id}/disable']: { get: { reply: z.object({
+    records: z.array(z.object({ id, appId: id, recordNo })),
+    assignments: z.array(z.object({ id, appId: id, recordNo, revision: integer, state: text, appName: text })),
+  }) }, post: { reply: result('disabled'), conflict: errorSchema } },
   [tenant + '/organizations']: { post: { body: tenantHttp.organization, reply: organization, conflict: errorSchema } },
   [tenant + '/organizations/{id}']: {
     put: { body: tenantHttp.organization, reply: organization, conflict: errorSchema },

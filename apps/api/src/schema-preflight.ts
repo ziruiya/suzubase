@@ -48,6 +48,7 @@ export function referencesPreflight(published: FieldDefinition[], draft: FieldDe
       const field = next.get(fieldId);
       if (!field || changed(fieldId) || !fieldContract[field.type].aggregate) add(fieldId, 'view-aggregate', view.id);
     }
+    if (view.pastDateFieldId && changed(view.pastDateFieldId)) add(view.pastDateFieldId, 'view-overdue-date', view.id);
     if (view.sort && changed(view.sort.fieldId)) add(view.sort.fieldId, 'view-sort', view.id);
     for (const condition of view.conditions) {
       if (invalidCondition(condition)) add(condition.fieldId, 'view-filter', view.id);

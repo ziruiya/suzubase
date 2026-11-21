@@ -61,3 +61,12 @@ export async function copyWorkflow(tx: TenantTransaction, source: Identity, targ
   });
 }
 
+export async function publishedWorkflowStates(tx: TenantTransaction, identity: Identity) {
+  const rows = await tx.selectDistinctOn([workflowStates.code], { code: workflowStates.code, name: workflowStates.name })
+    .from(workflowDefinitions)
+    .innerJoin(workflowStates, and(eq(workflowStates.tenantId, workflowDefinitions.tenantId),
+      eq(workflowStates.appId, workflowDefinitions.appId), eq(workflowStates.workflowId, workflowDefinitions.id)))
+    .where(and(workflowScope(identity), eq(workflowDefinitions.status, 'published')))
+    .orderBy(workflowStates.code, sql`${workflowDefinitions.version} DESC`);
+  return rows;
+}

@@ -140,7 +140,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
       <details><summary>Field help</summary><p>Dropdowns do not replace categories. They have no parent-child hierarchy,
         cannot classify a record under multiple nodes, and cannot filter by hierarchy.</p></details>
     </>}
-    {active === 'Views' && <ViewSettings configuration={draft ?? app} fields={definitions} path={path}
+    {active === 'Views' && <ViewSettings workflowStates={app.workflowStates} configuration={draft ?? app} fields={definitions} path={path}
       session={session} refresh={refreshDraft} />}
     {active === 'Workflow' && <WorkflowSettings app={app} token={token} fields={definitions} />}
     {active === 'Notifications' && <p>Notifications are not yet enabled.</p>}

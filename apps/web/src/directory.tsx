@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { api, ApiError, json, message, type Session } from './api';
+import { api, appPath, ApiError, json, message, type Session } from './api';
 
 interface DirectoryMember {
   id: string;
@@ -35,11 +35,22 @@ function Form({ onSubmit, children, reset = false }: {
   return <form className="stack" onSubmit={submit}>{children}</form>;
 }
 
-function MemberEditor({ member, organizations, token, run, current }: {
-  member: DirectoryMember; organizations: DirectoryData['organizations']; token: string; run: Run; current: string;
+type DisablePlan = {
+  records: { id: string; appId: string; recordNo: string }[];
+  assignments: { id: string; appId: string; appName: string; recordNo: string; revision: number; state: string }[];
+};
+
+function MemberEditor({ member, members, organizations, token, run, current }: {
+  member: DirectoryMember; members: DirectoryMember[]; organizations: DirectoryData['organizations']; token: string; run: Run; current: string;
 }) {
-  const [confirm, setConfirm] = useState(false);
+  const [plan, setPlan] = useState<DisablePlan>();
+  const [error, setError] = useState('');
   const path = '/tenant/users/' + member.id;
+  async function preview() {
+    setError('');
+    try { setPlan(await api<DisablePlan>(path + '/disable', token)); }
+    catch (error) { setError(message(error)); }
+  }
   return <details className="panel">
     <summary>{member.label}{member.isAdmin ? ' · Administrator' : ''}</summary>
     <div className="stack">
@@ -62,11 +73,34 @@ function MemberEditor({ member, organizations, token, run, current }: {
           <label>New password <input type="password" name="password" required autoComplete="new-password" /></label>
           <button>Reset password</button>
         </Form>
-        {confirm ? <div className="inline">
-          <button onClick={() => void run(() => api(path + '/disable', token, json('POST'))).catch(() => undefined)}>
-            Confirm disable {member.label}
-          </button><button onClick={() => setConfirm(false)}>Cancel</button>
-        </div> : <button onClick={() => setConfirm(true)}>Disable {member.label}</button>}
+        {error && <p role="alert">{error}</p>}
+        {plan ? <section aria-label="Disable member" className="stack">
+          {plan.records.length > 0 && <div>
+            <p>Created records requiring handoff</p>
+            <ul>{plan.records.map((record) => <li key={record.id}>Record {record.recordNo} · application {record.appId}</li>)}</ul>
+          </div>}
+          {plan.assignments.map((record) => <Form key={record.id} onSubmit={(data) => run(async () => {
+            await api(appPath(record.appId) + '/records/' + record.id + '/workflow/handoff', token, json('POST', {
+              revision: record.revision, fromUserId: member.id, toUserId: data.get('recipient'),
+            }));
+            await preview();
+          })}>
+            <p>{record.appName} · Record {record.recordNo} · {record.state}</p>
+            <label>Transfer to <select name="recipient" required>
+              <option value="">Choose a member</option>
+              {members.filter(({ id, disabledAt }) => id !== member.id && !disabledAt).map(({ id, label }) =>
+                <option key={id} value={id}>{label}</option>)}
+            </select></label>
+            <button type="submit">Transfer assignment</button>
+          </Form>)}
+          <div className="inline">
+            <button disabled={!!(plan.records.length || plan.assignments.length)}
+              onClick={() => void run(() => api(path + '/disable', token, json('POST'))).catch(() => undefined)}>
+              Confirm disable {member.label}
+            </button>
+            <button onClick={() => setPlan(undefined)}>Cancel</button>
+          </div>
+        </section> : <button onClick={() => void preview()}>Disable {member.label}</button>}
       </>}
     </div>
   </details>;
@@ -125,7 +159,7 @@ export function Directory({ session, back }: { session: Session; back: () => voi
             <button>Create member</button>
           </Form>
         </details>
-        {directory.members.map((member) => <MemberEditor key={member.id} member={member} organizations={organizations}
+        {directory.members.map((member) => <MemberEditor key={member.id} member={member} members={directory.members} organizations={organizations}
           token={token} run={run} current={session.profile.userId} />)}
       </>}
       {tab === 'Organizations' && <>

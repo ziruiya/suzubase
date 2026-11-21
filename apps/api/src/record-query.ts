@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import {
-  and, eq, gt, isNull, or, records, recordUniqueValues, sql, TenantContext, TenantTransaction, withTenantTransaction,
+  and, eq, gt, isNull, or, records, recordUniqueValues, recordWorkflowState, sql, tenants, workflowAssignments, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
 import { fieldContract, AppAction, LookupConfiguration, RecordData, RelatedConfiguration, ReferencePresentation } from '@suzubase/shared-types';
 import { AppSchemaService } from './app-schema';
@@ -28,6 +28,18 @@ export class RecordQueryService {
     const where = and(
       eq(records.tenantId, context.tenantId), eq(records.appId, appId), isNull(records.deletedAt),
       this.authorization.recordScope(access, 'view'),
+      view?.workflowState ? and(eq(records.status, view.workflowState), sql`EXISTS (
+        SELECT 1 FROM ${recordWorkflowState} WHERE ${recordWorkflowState.tenantId} = ${records.tenantId}
+          AND ${recordWorkflowState.appId} = ${records.appId} AND ${recordWorkflowState.recordId} = ${records.id}
+      )`) : undefined,
+      view?.assignedToMe ? sql`EXISTS (
+        SELECT 1 FROM ${workflowAssignments} WHERE ${workflowAssignments.tenantId} = ${records.tenantId}
+          AND ${workflowAssignments.appId} = ${records.appId} AND ${workflowAssignments.recordId} = ${records.id}
+          AND ${workflowAssignments.userId} = ${context.userId} AND ${workflowAssignments.active}
+      )` : undefined,
+      view?.pastDateFieldId ? sql`NULLIF(${records.data}->>${view.pastDateFieldId}::text, '') <
+        (SELECT ((CURRENT_TIMESTAMP AT TIME ZONE ${tenants.timeZone})::date)::text FROM ${tenants}
+          WHERE ${tenants.id} = ${context.tenantId})` : undefined,
       ...view?.conditions.map((condition) => this.authorization.condition(context, condition, access.types.get(condition.fieldId))) ?? [],
     );
     return { where, sort, sortValue, numericSort, descending, view, fields, data: this.authorization.projection(access), access };

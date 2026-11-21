@@ -11,6 +11,7 @@ import { CsvController, CsvService } from './csv';
 import { RuntimeIndexController, RuntimeIndexService } from './runtime-indexes';
 import { SearchService } from './search';
 import { RecordQueryService } from './record-query';
+import { WorkflowRuntimeController, WorkflowRuntimeService } from './workflow-runtime';
 import { WorkflowDefinitionController, WorkflowDefinitionService } from './workflow-definitions';
 import { RecordService, RecordsController } from './records';
 import { Controller, Get, Module, ServiceUnavailableException } from '@nestjs/common';
@@ -41,8 +42,8 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, WorkflowDefinitionController, TenantAdminController, FileController, CsvController, ApiTokenController, RuntimeIndexController],
-  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, WorkflowDefinitionService, TenantAdminService, FileService, SearchService, CsvService, ApiTokenService, RuntimeIndexService],
+  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, WorkflowDefinitionController, WorkflowRuntimeController, TenantAdminController, FileController, CsvController, ApiTokenController, RuntimeIndexController],
+  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, WorkflowDefinitionService, WorkflowRuntimeService, TenantAdminService, FileService, SearchService, CsvService, ApiTokenService, RuntimeIndexService],
 })
 class AppModule {}
 
