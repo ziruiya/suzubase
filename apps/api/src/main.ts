@@ -5,6 +5,7 @@ import { SessionController, SessionGuard } from './identity';
 import { TenantAdminController, TenantAdminService } from './tenant-admin';
 import { AuthorizationService } from './authorization';
 import { AppSchemaController, AppSchemaService } from './app-schema';
+import { RecordQueryService } from './record-query';
 import { RecordService, RecordsController } from './records';
 import { Controller, Get, Module, ServiceUnavailableException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
@@ -34,7 +35,7 @@ class HealthController {
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
   controllers: [HealthController, SessionController, AppSchemaController, RecordsController, TenantAdminController],
-  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, TenantAdminService],
+  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, TenantAdminService],
 })
 class AppModule {}
 

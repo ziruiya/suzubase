@@ -12,6 +12,7 @@ import { z } from 'zod';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
+import { RecordQueryService } from './record-query';
 import { writeRecordEvent } from './record-events';
 import { normalizeValue } from './field-values';
 import { identifier, parseInput } from './validation';
@@ -21,6 +22,7 @@ const createInput = z.strictObject({ data: dataInput });
 const updateInput = z.strictObject({ data: dataInput, revision: z.int().min(1).max(2147483647) });
 const revisionInput = updateInput.pick({ revision: true });
 const pageInput = z.strictObject({
+  view: identifier.optional(),
   after: z.string().regex(/^[0-9]{1,19}$/).refine((value) => BigInt(value) <= 9223372036854775807n).optional(),
   limit: z.string().regex(/^[1-9][0-9]{0,2}$/).transform(Number).pipe(z.number().max(100)).optional(),
 });
@@ -53,6 +55,7 @@ export class RecordService {
   constructor(
     private readonly appSchema: AppSchemaService,
     private readonly authorization: AuthorizationService,
+    private readonly query: RecordQueryService,
   ) {}
 
   private async normalizeData(
@@ -210,14 +213,27 @@ export class RecordService {
     }
   }
 
-  async list(context: TenantContext, appId: string, { after, limit = 50 }: z.infer<typeof pageInput>) {
+  async list(context: TenantContext, appId: string, { after, limit = 50, view }: z.infer<typeof pageInput>) {
     return withTenantTransaction(context, async (tx) => {
-      const [app] = await tx.select({ id: apps.id }).from(apps).where(this.authorization.appScope(context, appId));
-      if (!app) throw new NotFoundException();
-      const rows = await tx.select().from(records).where(and(
-        eq(records.tenantId, context.tenantId), eq(records.appId, appId), isNull(records.deletedAt),
-        after === undefined ? undefined : gt(records.recordNo, BigInt(after)),
-      )).orderBy(records.recordNo).limit(limit + 1);
+      const { where, sort, sortValue, numericSort, descending } = await this.query.scope(tx, context, appId, view);
+      let afterCondition = after === undefined ? undefined : gt(records.recordNo, BigInt(after));
+      if (after !== undefined && sort) {
+        const [cursor] = await tx.select({ value: sortValue! }).from(records)
+          .where(and(where, eq(records.recordNo, BigInt(after))));
+        if (!cursor) throw new BadRequestException('Cursor no longer belongs to this view');
+        const tieBreaker = afterCondition;
+        const value = numericSort ? sql`${cursor.value}::numeric` : sql`${cursor.value}::text`;
+        afterCondition = cursor.value === null
+          ? sql`(${sort} IS NULL AND ${tieBreaker})`
+          : sql`(
+            ${sort} ${descending ? sql`<` : sql`>`} ${value}
+            OR (${sort} = ${value} AND ${tieBreaker})
+            OR ${sort} IS NULL
+          )`;
+      }
+      const order = sort ? [sql`${sort} ${descending ? sql`DESC` : sql`ASC`} NULLS LAST`, records.recordNo]
+        : [records.recordNo];
+      const rows = await tx.select().from(records).where(and(where, afterCondition)).orderBy(...order).limit(limit + 1);
       return {
         items: rows.slice(0, limit).map(serializeRecord),
         nextCursor: rows.length > limit ? rows[limit - 1].recordNo.toString() : null,

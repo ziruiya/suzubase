@@ -21,3 +21,4 @@ export interface FieldChange {
   oldValue: string | null;
   newValue: string | null;
 }
+export * from './views';

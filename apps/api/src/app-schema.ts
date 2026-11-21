@@ -1,15 +1,18 @@
+import { randomUUID } from 'node:crypto';
 import {
-  Body, ConflictException, Controller, ForbiddenException, Get, Injectable, NotFoundException,
-  Delete, Param, Patch, Post, Query, UseGuards,
+  BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Injectable, NotFoundException,
+  Delete, Param, Patch, Post, Put, Query, UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, recordReferences, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { fieldContract, fieldTypes, optionFieldTypes } from '@suzubase/shared-types';
+import { fieldContract, fieldTypes, optionFieldTypes, SavedView, ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AuthorizationService } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
+import { normalizeValue } from './field-values';
+import { viewInput } from './view-input';
 import { identifier, parseInput, postgresErrorCode } from './validation';
 
 const codePattern = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -143,12 +146,28 @@ export class AppSchemaService {
         await tx.insert(appVersions).values({ ...identity, version: 1 });
         await tx.insert(appCounters).values(identity);
         const definitions = await this.getFields(tx, context, appId, source.publishedSchemaVersion);
+        const fieldMapping = new Map<string, string>();
         for (const { fieldId, code, name, type, required, uniqueValue, options } of definitions) {
           const [field] = await tx.insert(fields).values({ ...identity, code, name, type, required, uniqueValue, options, introducedIn: 1 }).returning();
+          fieldMapping.set(fieldId, field.fieldId);
           if (source.titleFieldId === fieldId) copy.titleFieldId = field.fieldId;
         }
         if (copy.titleFieldId) await tx.update(apps).set({ titleFieldId: copy.titleFieldId })
           .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, copy.id)));
+        const sourceViews = await this.getViews(tx, context, appId, source.publishedSchemaVersion);
+        const viewMapping = new Map(sourceViews.views.map(({ id }) => [id, randomUUID()]));
+        const remap = <T extends { fieldId: string }>(value: T): T => ({
+          ...value, fieldId: fieldMapping.get(value.fieldId)!,
+        });
+        const viewConfiguration: ViewConfiguration = {
+          defaultId: sourceViews.defaultId ? viewMapping.get(sourceViews.defaultId)! : null,
+          views: sourceViews.views.map((view) => ({
+            ...view, id: viewMapping.get(view.id)!,
+            columns: view.columns.map(remap), conditions: view.conditions.map(remap),
+            sort: view.sort && remap(view.sort),
+          })),
+        };
+        await tx.update(appVersions).set({ viewConfiguration }).where(this.versionScope(context, copy.id, 1));
         return copy;
       });
     } catch (error) {
@@ -168,8 +187,9 @@ export class AppSchemaService {
     return withTenantTransaction(context, async (tx) => {
       const app = await this.findApp(tx, context, appId);
       const definitions = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
+      const views = await this.getViews(tx, context, appId, app.publishedSchemaVersion);
       return { id: app.id, name: app.name, code: app.code, description: app.description, icon: app.icon,
-        themeColor: app.themeColor, titleFieldId: app.titleFieldId, archivedAt: app.archivedAt, schemaVersion: app.publishedSchemaVersion, fields: definitions };
+        themeColor: app.themeColor, titleFieldId: app.titleFieldId, archivedAt: app.archivedAt, schemaVersion: app.publishedSchemaVersion, fields: definitions, ...views };
     });
   }
 
@@ -187,7 +207,8 @@ export class AppSchemaService {
         const version = app.draftSchemaVersion ?? app.publishedSchemaVersion + 1;
         const identity = { tenantId: context.tenantId, appId };
         if (app.draftSchemaVersion === null) {
-          await tx.insert(appVersions).values({ ...identity, version });
+          const viewConfiguration = await this.getViews(tx, context, appId, app.publishedSchemaVersion);
+          await tx.insert(appVersions).values({ ...identity, version, viewConfiguration });
         }
         await tx.update(apps).set({ draftSchemaVersion: version, draftStatus: 'editing' })
           .where(this.authorization.appScope(context, appId));
@@ -204,7 +225,11 @@ export class AppSchemaService {
     return withTenantTransaction(context, async (tx) => {
       const app = await this.managedApp(tx, context, appId);
       const version = app.draftSchemaVersion;
-      return { version, status: app.draftStatus, fields: version === null ? [] : await this.getFields(tx, context, appId, version) };
+      return {
+        version, status: app.draftStatus,
+        fields: version === null ? [] : await this.getFields(tx, context, appId, version),
+        ...await this.getViews(tx, context, appId, version ?? app.publishedSchemaVersion),
+      };
     });
   }
 
@@ -230,6 +255,9 @@ export class AppSchemaService {
       const [addition] = await tx.select({ fieldId: fields.fieldId }).from(fields).where(and(
         eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), eq(fields.introducedIn, version),
       )).limit(1);
+      const draftViews = await this.getViews(tx, context, appId, version);
+      const publishedViews = await this.getViews(tx, context, appId, app.publishedSchemaVersion);
+      const changedViews = JSON.stringify(draftViews) !== JSON.stringify(publishedViews);
       const requireFields = await tx.select({ fieldId: fields.fieldId, name: fields.name }).from(fields).where(and(
         eq(fields.tenantId, context.tenantId), eq(fields.appId, appId),
         eq(fields.introducedIn, version), eq(fields.required, true),
@@ -241,11 +269,11 @@ export class AppSchemaService {
         eq(fields.introducedIn, version), eq(fields.required, true),
       )).where(and(eq(records.tenantId, context.tenantId), eq(records.appId, appId),
         sql`COALESCE(${records.data} ->> ${fields.fieldId}::text, '') IN ('', '[]')`)) : [];
-      if (version !== app.publishedSchemaVersion + 1 || !addition || missing.length) {
+      if (version !== app.publishedSchemaVersion + 1 || (!addition && !changedViews) || missing.length) {
         await tx.update(apps).set({ draftStatus: 'validation-failed' })
           .where(this.authorization.appScope(context, appId));
         return { failure: {
-          appId, version, message: missing.length ? 'Existing records are missing required values' : 'Expected one or more new fields',
+          appId, version, message: missing.length ? 'Existing records are missing required values' : 'Draft has no changes',
           problems: missing.map((problem) => ({ ...problem, value: null, reason: 'required' })),
           skippedDependencies: ['workflow', 'lookup'],
         } };
@@ -258,6 +286,72 @@ export class AppSchemaService {
     });
     if (result.failure) throw new ConflictException(result.failure);
     return result.published;
+  }
+
+  private versionScope(context: TenantContext, appId: string, version: number) {
+    return and(eq(appVersions.tenantId, context.tenantId), eq(appVersions.appId, appId), eq(appVersions.version, version));
+  }
+
+  async getViews(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
+    const [snapshot] = await tx.select({ configuration: appVersions.viewConfiguration }).from(appVersions)
+      .where(this.versionScope(context, appId, version));
+    if (!snapshot) throw new NotFoundException();
+    return snapshot.configuration;
+  }
+
+  async editView(
+    context: TenantContext, appId: string,
+    change: { action: 'save'; id?: string; value: z.infer<typeof viewInput> }
+      | { action: 'delete'; id: string } | { action: 'default'; id: string | null },
+  ) {
+    return withTenantTransaction(context, async (tx) => {
+      const app = await this.managedApp(tx, context, appId);
+      const current = app.draftSchemaVersion ?? app.publishedSchemaVersion;
+      const configuration = await this.getViews(tx, context, appId, current);
+      const view = configuration.views.find(({ id }) => id === change.id);
+      if (change.id && !view) throw new NotFoundException();
+      if (change.action === 'save') {
+        const fields = await this.getFields(tx, context, appId, current);
+        const input = change.value;
+        const definitions = new Map(fields.map((field) => [field.fieldId, field]));
+        const columnsValid = input.columns.every(({ fieldId }) => definitions.has(fieldId));
+        const sortField = input.sort && definitions.get(input.sort.fieldId);
+        if (!columnsValid || (input.sort && (!sortField || !fieldContract[sortField.type].sort))) {
+          throw new BadRequestException('Unsupported view column or sort');
+        }
+        const conditions = input.conditions.map((condition) => {
+          const field = definitions.get(condition.fieldId);
+          if (!field || !fieldContract[field.type].filter ||
+            (condition.operator === 'current-user' && field.type !== 'user') ||
+            (condition.operator === 'current-user-group' && field.type !== 'group')) {
+            throw new BadRequestException('Unsupported view condition');
+          }
+          if ('value' in condition) {
+            const value = normalizeValue(field.type, condition.value, field.options);
+            if (value === undefined) throw new BadRequestException('Invalid view condition value');
+            return { ...condition, value };
+          }
+          return condition;
+        });
+        const saved: SavedView = { ...input, id: change.id ?? randomUUID(), conditions };
+        if (view) Object.assign(view, saved);
+        else configuration.views.push(saved);
+      } else if (change.action === 'delete') {
+        configuration.views = configuration.views.filter(({ id }) => id !== change.id);
+        if (configuration.defaultId === change.id) configuration.defaultId = null;
+      } else {
+        configuration.defaultId = change.id;
+      }
+      const version = app.draftSchemaVersion ?? app.publishedSchemaVersion + 1;
+      if (app.draftSchemaVersion === null) {
+        await tx.insert(appVersions).values({ tenantId: context.tenantId, appId, version, viewConfiguration: configuration });
+      } else {
+        await tx.update(appVersions).set({ viewConfiguration: configuration }).where(this.versionScope(context, appId, version));
+      }
+      await tx.update(apps).set({ draftSchemaVersion: version, draftStatus: 'editing' })
+        .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
+      return { version, ...configuration };
+    });
   }
 
   async publishedVersion(tx: TenantTransaction, context: TenantContext, appId: string) {
@@ -337,6 +431,30 @@ export class AppSchemaController {
     @Param('fieldId') fieldId: string, @Body() body: unknown) {
     const { required } = parseInput(z.strictObject({ required: z.boolean() }), body);
     return this.schemas.setDraftRequired(context, parseInput(identifier, id), parseInput(identifier, fieldId), required);
+  }
+
+  @Post(':appId/draft/views')
+  createView(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
+    return this.schemas.editView(context, parseInput(identifier, id), { action: 'save', value: parseInput(viewInput, body) });
+  }
+
+  @Put(':appId/draft/views/default')
+  defaultView(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
+    const { viewId } = parseInput(z.strictObject({ viewId: identifier.nullable() }), body);
+    return this.schemas.editView(context, parseInput(identifier, id), { action: 'default', id: viewId });
+  }
+
+  @Put(':appId/draft/views/:viewId')
+  updateView(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string,
+    @Param('viewId') viewId: string, @Body() body: unknown) {
+    return this.schemas.editView(context, parseInput(identifier, id), {
+      action: 'save', id: parseInput(identifier, viewId), value: parseInput(viewInput, body),
+    });
+  }
+
+  @Delete(':appId/draft/views/:viewId')
+  deleteView(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Param('viewId') viewId: string) {
+    return this.schemas.editView(context, parseInput(identifier, id), { action: 'delete', id: parseInput(identifier, viewId) });
   }
 
   @Post(':appId/publish')

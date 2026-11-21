@@ -1,4 +1,4 @@
-import { fieldTypes, type FieldChange, type FieldOption, type RecordData, type RecordResponse } from '@suzubase/shared-types';
+import { fieldTypes, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -98,6 +98,7 @@ export const appVersions = pgTable('app_versions', {
   tenantId: tenantId(),
   appId: uuid('app_id').notNull(),
   version: integer().notNull(),
+  viewConfiguration: jsonb('view_configuration').$type<ViewConfiguration>().notNull().default(sql`'{"views":[],"defaultId":null}'::jsonb`),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.version] }),
   foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
