@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import {
   Body, ConflictException, Controller, Delete, Get, Injectable, NotFoundException, Param, Post, UseGuards,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiCreatedResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { and, apiTokenHash, apiTokens, eq, isNull, sql, TenantContext, withTenantTransaction } from '@suzubase/db';
 import { apiTokenActions } from '@suzubase/shared-types';
 import { z } from 'zod';
@@ -15,6 +15,8 @@ const issueInput = z.strictObject({
   actions: z.array(z.enum(apiTokenActions)).min(1).max(apiTokenActions.length)
     .refine((actions) => new Set(actions).size === actions.length),
 });
+
+export const tokenHttp = { issueInput };
 
 const publicFields = {
   id: apiTokens.id,
@@ -73,12 +75,6 @@ export class ApiTokenController {
   constructor(private readonly tokens: ApiTokenService) {}
 
   @Post()
-  @ApiBody({ schema: {
-    type: 'object', additionalProperties: false, required: ['label', 'actions'],
-    properties: { label: { type: 'string', maxLength: 120 },
-      actions: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', enum: [...apiTokenActions] } } },
-  } })
-  @ApiCreatedResponse({ description: 'Token metadata and the bearer secret. The secret is visible only in this response.' })
   issue(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown) {
     return this.tokens.issue(context, parseInput(identifier, appId), parseInput(issueInput, body));
   }

@@ -34,6 +34,15 @@ const policy = z.strictObject({
   allowAppCreation: z.boolean(), passwordMinimum: z.number().int().min(8).max(128), passwordComplexity: z.boolean(),
 });
 
+const userPatch = z.strictObject({
+  displayName: name.optional(), organizationId: identifier.nullable().optional(),
+  canManageRecycleBin: z.boolean().optional(), canReadArchivedFields: z.boolean().optional(),
+});
+const resetInput = z.strictObject({ password });
+const groupInput = z.strictObject({ name });
+const membershipInput = z.strictObject({ included: z.boolean() });
+export const tenantHttp = { policy, newUser, userPatch, resetInput, organization, groupInput, membershipInput };
+
 @Injectable()
 export class TenantAdminService {
   constructor(private readonly schema: AppSchemaService, private readonly authorization: AuthorizationService) {}
@@ -320,14 +329,12 @@ export class TenantAdminController {
 
   @Patch('users/:id')
   updateUser(@AuthenticatedTenant() context: TenantContext, @Param('id') id: string, @Body() body: unknown) {
-    return this.admin.updateUser(context, parseInput(identifier, id), parseInput(z.strictObject({
-      displayName: name.optional(), organizationId: identifier.nullable().optional(), canManageRecycleBin: z.boolean().optional(), canReadArchivedFields: z.boolean().optional(),
-    }), body));
+    return this.admin.updateUser(context, parseInput(identifier, id), parseInput(userPatch, body));
   }
 
   @Put('users/:id/password')
   reset(@AuthenticatedTenant() context: TenantContext, @Param('id') id: string, @Body() body: unknown) {
-    const input = parseInput(z.strictObject({ password }), body);
+    const input = parseInput(resetInput, body);
     return this.admin.resetPassword(context, parseInput(identifier, id), input.password);
   }
 
@@ -353,12 +360,12 @@ export class TenantAdminController {
 
   @Post('groups')
   createGroup(@AuthenticatedTenant() context: TenantContext, @Body() body: unknown) {
-    return this.admin.createGroup(context, parseInput(z.strictObject({ name }), body).name);
+    return this.admin.createGroup(context, parseInput(groupInput, body).name);
   }
 
   @Patch('groups/:id')
   renameGroup(@AuthenticatedTenant() context: TenantContext, @Param('id') id: string, @Body() body: unknown) {
-    return this.admin.renameGroup(context, parseInput(identifier, id), parseInput(z.strictObject({ name }), body).name);
+    return this.admin.renameGroup(context, parseInput(identifier, id), parseInput(groupInput, body).name);
   }
 
   @Delete('groups/:id')
@@ -372,6 +379,6 @@ export class TenantAdminController {
     @Param('userId') userId: string, @Body() body: unknown,
   ) {
     return this.admin.setGroupMember(context, parseInput(identifier, id), parseInput(identifier, userId),
-      parseInput(z.strictObject({ included: z.boolean() }), body).included);
+      parseInput(membershipInput, body).included);
   }
 }

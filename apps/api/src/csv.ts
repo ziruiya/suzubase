@@ -3,7 +3,7 @@ import {
   BadRequestException, Body, ConflictException, Controller, Get, HttpException, Injectable,
   NotFoundException, Param, Post, Query, ServiceUnavailableException, StreamableFile, UseGuards,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiProduces, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiProduces, ApiTags } from '@nestjs/swagger';
 import { and, csvJobs, eq, records, sql, TenantContext, TenantTransaction, withTenantTransaction } from '@suzubase/db';
 import { RecordData } from '@suzubase/shared-types';
 import { parse } from 'csv-parse/sync';
@@ -28,6 +28,7 @@ const exportQuery = z.union([
   searchInput.extend({ attachments: attachmentQuery }),
 ]);
 const batchInput = z.strictObject({ offset: z.int().min(0).max(1000), size: z.int().min(1).max(50).default(50) });
+export const csvHttp = { preflightInput, batchInput, exportQuery };
 type Job = typeof csvJobs.$inferSelect;
 
 class PreflightRollback extends Error {}
@@ -236,10 +237,6 @@ export class CsvController {
   constructor(private readonly csv: CsvService) {}
 
   @Post('preflight')
-  @ApiBody({ schema: {
-    type: 'object', required: ['csv', 'mapping'],
-    properties: { csv: { type: 'string' }, mapping: { type: 'object', additionalProperties: { type: 'string', nullable: true } } },
-  } })
   preflight(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown) {
     return this.csv.preflight(context, parseInput(identifier, appId), parseInput(preflightInput, body));
   }

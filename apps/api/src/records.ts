@@ -2,7 +2,7 @@ import {
   BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Injectable,
   NotFoundException, Param, Patch, Post, Put, Query, StreamableFile, UseGuards,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiConflictResponse, ApiHeader, ApiProduces, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiHeader, ApiProduces, ApiTags } from '@nestjs/swagger';
 import {
   and, appCounters, eq, gt, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordUniqueValues, records, sql, TenantContext,
   TenantTransaction, users, withTenantTransaction,
@@ -38,13 +38,19 @@ const pageInput = z.strictObject({
   after: z.string().regex(/^[0-9]{1,19}$/).refine((value) => BigInt(value) <= 9223372036854775807n).optional(),
   limit: z.string().regex(/^[1-9][0-9]{0,2}$/).transform(Number).pipe(z.number().max(100)).optional(),
 });
+const aggregateQuery = z.strictObject({
+  view: identifier.optional(),
+  fields: z.string().max(369).transform((value) => value.split(','))
+    .pipe(z.array(identifier).max(10).refine((values) => new Set(values).size === values.length)).optional(),
+});
+const recycleQuery = pageInput.omit({ view: true });
+const batchCreateInput = z.strictObject({ items: z.array(createInput).min(1).max(100) });
+const historyExportQuery = z.strictObject({ includeArchived: z.enum(['true', 'false']).optional() });
+export const recordHttp = { createInput, updateInput, revisionInput, batchUpdateInput, batchCreateInput,
+  pageInput, searchInput, aggregateQuery, recycleQuery, historyExportQuery };
+
 const keyPattern = /^[!-~]{1,128}$/;
 const createKey = z.string().regex(keyPattern).optional();
-const dataSchema = {
-  type: 'object',
-  description: 'Keys are field UUIDs. Numbers are decimal strings such as "-12.50", stored as "-12.5".',
-  additionalProperties: { type: 'string' },
-};
 
 @Injectable()
 export class RecordService {
@@ -567,9 +573,6 @@ export class RecordsController {
     description: 'Scoped to tenant, user, app and record creation. Retained until physical deletion of the record. A replay returns the original 201 response.',
     schema: { type: 'string', pattern: keyPattern.source },
   })
-  @ApiBody({ schema: {
-    type: 'object', required: ['data'], additionalProperties: false, properties: { data: dataSchema },
-  } })
   create(
     @AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Body() body: unknown, @Headers('idempotency-key') key: unknown,
@@ -592,23 +595,19 @@ export class RecordsController {
   @Get('aggregates')
   @AllowApiToken('view')
   aggregate(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
-    const { view, fields } = parseInput(z.strictObject({
-      view: identifier.optional(),
-      fields: z.string().max(369).transform((value) => value.split(','))
-        .pipe(z.array(identifier).max(10).refine((values) => new Set(values).size === values.length)).optional(),
-    }), query);
+    const { view, fields } = parseInput(aggregateQuery, query);
     return this.queries.aggregate(context, parseInput(identifier, appId), view, fields ?? []);
   }
 
   @Get('recycle')
   recycle(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
-    return this.service.recycleBin(context, parseInput(identifier, appId), parseInput(pageInput.omit({ view: true }), query));
+    return this.service.recycleBin(context, parseInput(identifier, appId), parseInput(recycleQuery, query));
   }
 
   @Post('batch')
   @AllowApiToken('create')
   batch(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown) {
-    const { items } = parseInput(z.strictObject({ items: z.array(createInput).min(1).max(100) }), body);
+    const { items } = parseInput(batchCreateInput, body);
     return this.service.batchCreate(context, parseInput(identifier, appId), items);
   }
 
@@ -649,7 +648,7 @@ export class RecordsController {
   @ApiProduces('application/json')
   exportHistory(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Param('recordId') id: string, @Query() query: unknown) {
-    const { includeArchived } = parseInput(z.strictObject({ includeArchived: z.enum(['true', 'false']).optional() }), query);
+    const { includeArchived } = parseInput(historyExportQuery, query);
     return this.service.historyExport(context, parseInput(identifier, appId), parseInput(identifier, id), includeArchived === 'true');
   }
 
@@ -667,11 +666,6 @@ export class RecordsController {
 
   @Put(':recordId')
   @AllowApiToken('edit')
-  @ApiBody({ schema: {
-    type: 'object', required: ['data', 'revision'], additionalProperties: false,
-    properties: { data: { ...dataSchema, description: 'Complete replacement field map.' }, revision: { type: 'integer', minimum: 1 } },
-  } })
-  @ApiConflictResponse({ description: 'REVISION_CONFLICT with the current record when the supplied revision is stale.' })
   update(
     @AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Param('recordId') id: string, @Body() body: unknown,

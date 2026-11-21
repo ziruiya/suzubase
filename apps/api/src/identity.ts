@@ -3,7 +3,7 @@ import {
   Get, Injectable, Post, SetMetadata, UnauthorizedException, UseGuards,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { ApiBearerAuth, ApiBody, ApiOkResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { and, eq, tenantMembers, tenants, users, sql, TenantContext, verifyApiToken, verifyLogin, withTenantTransaction } from '@suzubase/db';
 import { z } from 'zod';
 import { ApiTokenAction } from '@suzubase/shared-types';
@@ -19,6 +19,10 @@ const loginInput = z.strictObject({
   password: passwordInput,
   factor: factorInput.optional(),
 }).refine(({ email, loginName }) => Boolean(email) !== Boolean(loginName));
+
+const enrollTotpInput = z.strictObject({ password: passwordInput });
+const changeTotpInput = enrollTotpInput.extend({ factor: factorInput });
+export const authHttp = { loginInput, enrollTotpInput, changeTotpInput };
 
 const sessionClaims = z.object({ tenantId: identifier, sub: identifier, sessionVersion: z.number().int() });
 
@@ -41,13 +45,6 @@ export class SessionController {
   @Post('login')
   @Header('Cache-Control', 'no-store')
   @HttpCode(200)
-  @ApiBody({
-    schema: {
-      type: 'object', required: ['password'], additionalProperties: false,
-      properties: { loginName: { type: 'string' }, factor: { type: 'string' }, email: { type: 'string', format: 'email' }, password: { type: 'string', format: 'password' } },
-    },
-  })
-  @ApiOkResponse({ description: 'Returns a one-hour session, or secondFactorRequired when a code must be supplied.' })
   async login(@Body() body: unknown) {
     const { email, loginName, password, factor } = parseInput(loginInput, body);
     const identity = await verifyLogin((email ?? loginName!).toLowerCase(), password);
@@ -131,21 +128,21 @@ export class SessionProfileController {
   @Post('totp/enrollment')
   @Header('Cache-Control', 'no-store')
   enroll(@AuthenticatedTenant() context: TenantContext, @Body() body: unknown) {
-    const { password } = parseInput(z.strictObject({ password: passwordInput }), body);
+    const { password } = parseInput(enrollTotpInput, body);
     return this.changeTotp(context, 'begin', password);
   }
 
   @Post('totp/enable')
   @Header('Cache-Control', 'no-store')
   enable(@AuthenticatedTenant() context: TenantContext, @Body() body: unknown) {
-    const { password, factor } = parseInput(z.strictObject({ password: passwordInput, factor: factorInput }), body);
+    const { password, factor } = parseInput(changeTotpInput, body);
     return this.changeTotp(context, 'enable', password, factor);
   }
 
   @Post('totp/disable')
   @Header('Cache-Control', 'no-store')
   disable(@AuthenticatedTenant() context: TenantContext, @Body() body: unknown) {
-    const { password, factor } = parseInput(z.strictObject({ password: passwordInput, factor: factorInput }), body);
+    const { password, factor } = parseInput(changeTotpInput, body);
     return this.changeTotp(context, 'disable', password, factor);
   }
 

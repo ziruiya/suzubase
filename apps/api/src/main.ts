@@ -17,6 +17,7 @@ import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
+import { completeOpenApi } from './openapi';
 import { checkDatabase } from '@suzubase/db';
 
 @Controller()
@@ -51,7 +52,7 @@ async function main() {
     (_request, body, done) => done(null, body));
   const config = new DocumentBuilder().setTitle('SuzuBase').setVersion('1')
     .addBearerAuth({ type: 'http', scheme: 'bearer', description: 'Send a session JWT or an app token on supported app routes. Token administration requires a session.' }).build();
-  SwaggerModule.setup('docs', app, () => SwaggerModule.createDocument(app, config));
+  SwaggerModule.setup('docs', app, () => completeOpenApi(SwaggerModule.createDocument(app, config)));
   await app.listen(Number(process.env.PORT ?? 3000), '0.0.0.0');
 }
 

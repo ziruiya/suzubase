@@ -15,6 +15,8 @@ const indexInput = z.strictObject({
   reason: z.string().trim().min(1).max(250).refine((value) => !/[\x00\p{Surrogate}]/u.test(value)),
 });
 
+export const indexHttp = { indexInput };
+
 @Injectable()
 export class RuntimeIndexService {
   constructor(private readonly schema: AppSchemaService, private readonly auth: AuthorizationService) {}

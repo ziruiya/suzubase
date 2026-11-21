@@ -3,7 +3,7 @@ import {
   BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Injectable, NotFoundException,
   Delete, Param, Patch, Post, Put, Query, ServiceUnavailableException, UseGuards,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, memberGroups, organizations, recordReferences, recordUniqueValues, sql, tenantMembers, users, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
@@ -67,10 +67,19 @@ const fieldInput = fieldProperties.refine(({ options, type }) => optionFieldType
   .refine(({ type, formula, layoutElement, required }) => (type === 'calculation') === Boolean(formula) &&
     (type === 'layout') === Boolean(layoutElement) && (!required || isRecordInput(type)), { path: ['type'] })
   .refine(({ type, searchMode }) => !searchMode || type === 'text', { path: ['searchMode'] });
-const metadataProperties = {
-  code: { type: 'string', pattern: codePattern.source },
-  name: { type: 'string', minLength: 1, maxLength: 120 },
+const lifecycleInput = z.strictObject({ action: z.enum(['archive', 'activate', 'restore']) });
+const defaultViewInput = z.strictObject({ viewId: identifier.nullable() });
+const previewInput = z.strictObject({
+  userId: identifier, recordId: identifier.optional(), conditions: conditions.min(1).optional(),
+}).refine((input) => !(input.recordId && input.conditions));
+const publishInput = z.strictObject({ migration: migrationInput.optional() });
+const binQuery = z.enum(['true', 'false']).optional();
+
+export const appHttp = {
+  createAppInput, appInput, settingsInput, lifecycleInput, fieldInput, fieldPatch, layoutInput, option, numbering,
+  formLayoutInput, viewInput, defaultViewInput, aclInput, previewInput, publishInput, binQuery,
 };
+
 
 @Injectable()
 export class AppSchemaService {
@@ -738,16 +747,13 @@ export class AppSchemaController {
   constructor(private readonly schemas: AppSchemaService) {}
 
   @Post()
-  @ApiBody({ schema: {
-    type: 'object', required: ['code', 'name'], additionalProperties: false, properties: metadataProperties,
-  } })
   create(@AuthenticatedTenant() context: TenantContext, @Body() body: unknown) {
     return this.schemas.createApp(context, parseInput(createAppInput, body));
   }
 
   @Get()
   list(@AuthenticatedTenant() context: TenantContext, @Query('bin') bin: unknown) {
-    return this.schemas.list(context, parseInput(z.enum(['true', 'false']).optional(), bin) === 'true');
+    return this.schemas.list(context, parseInput(binQuery, bin) === 'true');
   }
 
   @Get(':appId/settings')
@@ -765,7 +771,7 @@ export class AppSchemaController {
   @Post(':appId/lifecycle')
   @AllowApiToken('manage')
   lifecycle(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
-    const { action } = parseInput(z.strictObject({ action: z.enum(['archive', 'activate', 'restore']) }), body);
+    const { action } = parseInput(lifecycleInput, body);
     return this.schemas.changeLifecycle(context, parseInput(identifier, id), action);
   }
 
@@ -793,10 +799,6 @@ export class AppSchemaController {
 
   @Post(':appId/fields')
   @AllowApiToken('manage')
-  @ApiBody({ schema: {
-    type: 'object', required: ['code', 'name', 'type'], additionalProperties: false,
-    properties: { ...metadataProperties, type: { type: 'string', enum: [...fieldTypes] } },
-  } })
   addField(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
     return this.schemas.addField(context, parseInput(identifier, id), parseInput(fieldInput, body));
   }
@@ -841,7 +843,7 @@ export class AppSchemaController {
   @Put(':appId/draft/views/default')
   @AllowApiToken('manage')
   defaultView(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
-    const { viewId } = parseInput(z.strictObject({ viewId: identifier.nullable() }), body);
+    const { viewId } = parseInput(defaultViewInput, body);
     return this.schemas.editView(context, parseInput(identifier, id), { action: 'default', id: viewId });
   }
 
@@ -874,16 +876,14 @@ export class AppSchemaController {
 
   @Post(':appId/permissions/preview')
   preview(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
-    const { userId, ...selection } = parseInput(z.strictObject({
-      userId: identifier, recordId: identifier.optional(), conditions: conditions.min(1).optional(),
-    }).refine((input) => !(input.recordId && input.conditions)), body);
+    const { userId, ...selection } = parseInput(previewInput, body);
     return this.schemas.previewPermissions(context, parseInput(identifier, id), userId, selection);
   }
 
   @Post(':appId/publish')
   @AllowApiToken('manage')
   publish(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
-    const { migration } = parseInput(z.strictObject({ migration: migrationInput.optional() }), body ?? {});
+    const { migration } = parseInput(publishInput, body ?? {});
     return this.schemas.publish(context, parseInput(identifier, id), migration);
   }
 }

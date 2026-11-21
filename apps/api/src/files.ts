@@ -2,7 +2,7 @@ import {
   BadRequestException, Body, Controller, Get, Injectable, NotFoundException, Param, Post, Query,
   StreamableFile, UseGuards,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiConsumes, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, eq, inArray, fileReferences, files, isNull, records, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
@@ -20,6 +20,8 @@ const uploadInput = z.strictObject({
   name: z.string().min(1).max(240).refine((name) => !/[\x00-\x1f\x7f/\\\p{Surrogate}]/u.test(name)),
   type: z.enum(attachmentTypes),
 });
+
+export const fileHttp = { uploadInput };
 
 function hasSignature(type: (typeof attachmentTypes)[number], data: Buffer) {
   const signature = {
@@ -167,7 +169,6 @@ export class FileController {
 
   @Post()
   @ApiConsumes('application/octet-stream')
-  @ApiBody({ schema: { type: 'string', format: 'binary' } })
   upload(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Query() query: unknown, @Body() body: Buffer) {
     return this.files.upload(context, parseInput(identifier, appId), parseInput(uploadInput, query), body);
