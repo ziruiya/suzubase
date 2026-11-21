@@ -3,7 +3,9 @@ import { drizzle, NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
 
 export { and, eq, isNull, lte, sql } from 'drizzle-orm';
-export * from './schema';
+export {
+  apps, appCounters, appVersions, fields, records, recordReferences, tenantMembers, tenants, users,
+} from './schema';
 
 export interface TenantContext {
   readonly tenantId: string;
@@ -15,12 +17,22 @@ export type TenantTransaction = Parameters<Parameters<NodePgDatabase['transactio
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   connectionTimeoutMillis: 3000,
+  allowExitOnIdle: true,
+
 });
 const db = drizzle(pool);
 const uuid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 
 export async function checkDatabase(): Promise<void> {
   await pool.query('SELECT 1');
+}
+
+// This credential verifier returns an identity only after the password matches.
+export async function verifyLogin(email: string, password: string): Promise<TenantContext | undefined> {
+  const result = await db.execute<{ tenantId: string; userId: string }>(
+    sql`SELECT tenant_id AS "tenantId", user_id AS "userId" FROM authentication.verify_login(${email}, ${password})`,
+  );
+  return result.rows[0];
 }
 
 export async function withTenantTransaction<T>(

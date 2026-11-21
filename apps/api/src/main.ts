@@ -1,4 +1,8 @@
 import 'reflect-metadata';
+import { randomBytes } from 'node:crypto';
+import { JwtModule } from '@nestjs/jwt';
+import { SessionController, SessionGuard } from './identity';
+import { AuthorizationService } from './authorization';
 import { Controller, Get, Module, ServiceUnavailableException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
@@ -20,7 +24,15 @@ class HealthController {
   }
 }
 
-@Module({ controllers: [HealthController] })
+@Module({
+  imports: [JwtModule.register({
+    secret: process.env.SESSION_SECRET ?? randomBytes(32).toString('hex'),
+    signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
+    verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
+  })],
+  controllers: [HealthController, SessionController],
+  providers: [AuthorizationService, SessionGuard],
+})
 class AppModule {}
 
 async function main() {

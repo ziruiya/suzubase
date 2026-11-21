@@ -1,6 +1,6 @@
 import { sql } from 'drizzle-orm';
 import {
-  bigint, check, foreignKey, integer, jsonb, pgEnum, pgTable, primaryKey,
+  bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
   text, timestamp, unique, uuid,
 } from 'drizzle-orm/pg-core';
 
@@ -24,9 +24,24 @@ export const users = pgTable('users', {
 export const tenantMembers = pgTable('tenant_members', {
   tenantId: tenantId(),
   userId: uuid('user_id').notNull(),
+  canCreateApps: boolean('can_create_apps').notNull().default(false),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.userId] }),
   foreignKey({ columns: [t.tenantId, t.userId], foreignColumns: [users.tenantId, users.id] }),
+]);
+
+export const authentication = pgSchema('authentication');
+
+export const loginCredentials = authentication.table('login_credentials', {
+  tenantId: tenantId(),
+  userId: uuid('user_id').notNull(),
+  email: text().notNull(),
+  passwordHash: text('password_hash').notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.userId] }),
+  unique().on(t.tenantId, t.email),
+  index().on(t.email),
+  foreignKey({ columns: [t.tenantId, t.userId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
 ]);
 
 export const draftStatus = pgEnum('draft_status', ['editing', 'validation-failed', 'publishable']);

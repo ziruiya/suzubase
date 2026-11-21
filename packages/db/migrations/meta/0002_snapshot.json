@@ -1,0 +1,982 @@
+{
+  "id": "aee0635c-f418-42e8-923e-3037bfe507ae",
+  "prevId": "50428c72-5d31-43ea-84fa-67ba1c00380a",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.app_counters": {
+      "name": "app_counters",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "last_value": {
+          "name": "last_value",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "app_counters_tenant_id_tenants_id_fk": {
+          "name": "app_counters_tenant_id_tenants_id_fk",
+          "tableFrom": "app_counters",
+          "tableTo": "tenants",
+          "columnsFrom": [
+            "tenant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "app_counters_tenant_id_app_id_apps_tenant_id_id_fk": {
+          "name": "app_counters_tenant_id_app_id_apps_tenant_id_id_fk",
+          "tableFrom": "app_counters",
+          "tableTo": "apps",
+          "columnsFrom": [
+            "tenant_id",
+            "app_id"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "app_counters_tenant_id_app_id_pk": {
+          "name": "app_counters_tenant_id_app_id_pk",
+          "columns": [
+            "tenant_id",
+            "app_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.app_versions": {
+      "name": "app_versions",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "version": {
+          "name": "version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "app_versions_tenant_id_tenants_id_fk": {
+          "name": "app_versions_tenant_id_tenants_id_fk",
+          "tableFrom": "app_versions",
+          "tableTo": "tenants",
+          "columnsFrom": [
+            "tenant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "app_versions_tenant_id_app_id_apps_tenant_id_id_fk": {
+          "name": "app_versions_tenant_id_app_id_apps_tenant_id_id_fk",
+          "tableFrom": "app_versions",
+          "tableTo": "apps",
+          "columnsFrom": [
+            "tenant_id",
+            "app_id"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "app_versions_tenant_id_app_id_version_pk": {
+          "name": "app_versions_tenant_id_app_id_version_pk",
+          "columns": [
+            "tenant_id",
+            "app_id",
+            "version"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.apps": {
+      "name": "apps",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "code": {
+          "name": "code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_by": {
+          "name": "created_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "published_schema_version": {
+          "name": "published_schema_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "draft_schema_version": {
+          "name": "draft_schema_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "draft_status": {
+          "name": "draft_status",
+          "type": "draft_status",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "apps_tenant_id_tenants_id_fk": {
+          "name": "apps_tenant_id_tenants_id_fk",
+          "tableFrom": "apps",
+          "tableTo": "tenants",
+          "columnsFrom": [
+            "tenant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "apps_tenant_id_created_by_tenant_members_tenant_id_user_id_fk": {
+          "name": "apps_tenant_id_created_by_tenant_members_tenant_id_user_id_fk",
+          "tableFrom": "apps",
+          "tableTo": "tenant_members",
+          "columnsFrom": [
+            "tenant_id",
+            "created_by"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "user_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "apps_tenant_id_id_pk": {
+          "name": "apps_tenant_id_id_pk",
+          "columns": [
+            "tenant_id",
+            "id"
+          ]
+        }
+      },
+      "uniqueConstraints": {
+        "apps_tenant_id_code_unique": {
+          "name": "apps_tenant_id_code_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "tenant_id",
+            "code"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "apps_draft_pair": {
+          "name": "apps_draft_pair",
+          "value": "(\"apps\".\"draft_schema_version\" is null) = (\"apps\".\"draft_status\" is null)"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.fields": {
+      "name": "fields",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "field_id": {
+          "name": "field_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "introduced_in": {
+          "name": "introduced_in",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "code": {
+          "name": "code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "type": {
+          "name": "type",
+          "type": "field_type",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "fields_tenant_id_tenants_id_fk": {
+          "name": "fields_tenant_id_tenants_id_fk",
+          "tableFrom": "fields",
+          "tableTo": "tenants",
+          "columnsFrom": [
+            "tenant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "fields_tenant_id_app_id_introduced_in_app_versions_tenant_id_app_id_version_fk": {
+          "name": "fields_tenant_id_app_id_introduced_in_app_versions_tenant_id_app_id_version_fk",
+          "tableFrom": "fields",
+          "tableTo": "app_versions",
+          "columnsFrom": [
+            "tenant_id",
+            "app_id",
+            "introduced_in"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "app_id",
+            "version"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "fields_tenant_id_app_id_field_id_pk": {
+          "name": "fields_tenant_id_app_id_field_id_pk",
+          "columns": [
+            "tenant_id",
+            "app_id",
+            "field_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {
+        "fields_tenant_id_app_id_code_unique": {
+          "name": "fields_tenant_id_app_id_code_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "tenant_id",
+            "app_id",
+            "code"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "authentication.login_credentials": {
+      "name": "login_credentials",
+      "schema": "authentication",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "email": {
+          "name": "email",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "password_hash": {
+          "name": "password_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "login_credentials_email_index": {
+          "name": "login_credentials_email_index",
+          "columns": [
+            {
+              "expression": "email",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "login_credentials_tenant_id_tenants_id_fk": {
+          "name": "login_credentials_tenant_id_tenants_id_fk",
+          "tableFrom": "login_credentials",
+          "tableTo": "tenants",
+          "columnsFrom": [
+            "tenant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "login_credentials_tenant_id_user_id_tenant_members_tenant_id_user_id_fk": {
+          "name": "login_credentials_tenant_id_user_id_tenant_members_tenant_id_user_id_fk",
+          "tableFrom": "login_credentials",
+          "tableTo": "tenant_members",
+          "columnsFrom": [
+            "tenant_id",
+            "user_id"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "user_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "login_credentials_tenant_id_user_id_pk": {
+          "name": "login_credentials_tenant_id_user_id_pk",
+          "columns": [
+            "tenant_id",
+            "user_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {
+        "login_credentials_tenant_id_email_unique": {
+          "name": "login_credentials_tenant_id_email_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "tenant_id",
+            "email"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.record_references": {
+      "name": "record_references",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "record_id": {
+          "name": "record_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "field_id": {
+          "name": "field_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "target_app_id": {
+          "name": "target_app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "target_record_id": {
+          "name": "target_record_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "record_references_tenant_id_tenants_id_fk": {
+          "name": "record_references_tenant_id_tenants_id_fk",
+          "tableFrom": "record_references",
+          "tableTo": "tenants",
+          "columnsFrom": [
+            "tenant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "record_references_tenant_id_app_id_field_id_fields_tenant_id_app_id_field_id_fk": {
+          "name": "record_references_tenant_id_app_id_field_id_fields_tenant_id_app_id_field_id_fk",
+          "tableFrom": "record_references",
+          "tableTo": "fields",
+          "columnsFrom": [
+            "tenant_id",
+            "app_id",
+            "field_id"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "app_id",
+            "field_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "record_references_tenant_id_app_id_record_id_records_tenant_id_app_id_id_fk": {
+          "name": "record_references_tenant_id_app_id_record_id_records_tenant_id_app_id_id_fk",
+          "tableFrom": "record_references",
+          "tableTo": "records",
+          "columnsFrom": [
+            "tenant_id",
+            "app_id",
+            "record_id"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "app_id",
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "record_references_target_fk": {
+          "name": "record_references_target_fk",
+          "tableFrom": "record_references",
+          "tableTo": "records",
+          "columnsFrom": [
+            "tenant_id",
+            "target_app_id",
+            "target_record_id"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "app_id",
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "record_references_tenant_id_app_id_record_id_field_id_pk": {
+          "name": "record_references_tenant_id_app_id_record_id_field_id_pk",
+          "columns": [
+            "tenant_id",
+            "app_id",
+            "record_id",
+            "field_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.records": {
+      "name": "records",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "record_no": {
+          "name": "record_no",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "data": {
+          "name": "data",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "schema_version": {
+          "name": "schema_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'active'"
+        },
+        "created_by": {
+          "name": "created_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_by": {
+          "name": "updated_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "deleted_by": {
+          "name": "deleted_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "records_tenant_id_tenants_id_fk": {
+          "name": "records_tenant_id_tenants_id_fk",
+          "tableFrom": "records",
+          "tableTo": "tenants",
+          "columnsFrom": [
+            "tenant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "records_tenant_id_app_id_schema_version_app_versions_tenant_id_app_id_version_fk": {
+          "name": "records_tenant_id_app_id_schema_version_app_versions_tenant_id_app_id_version_fk",
+          "tableFrom": "records",
+          "tableTo": "app_versions",
+          "columnsFrom": [
+            "tenant_id",
+            "app_id",
+            "schema_version"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "app_id",
+            "version"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "records_tenant_id_created_by_tenant_members_tenant_id_user_id_fk": {
+          "name": "records_tenant_id_created_by_tenant_members_tenant_id_user_id_fk",
+          "tableFrom": "records",
+          "tableTo": "tenant_members",
+          "columnsFrom": [
+            "tenant_id",
+            "created_by"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "user_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "records_tenant_id_updated_by_tenant_members_tenant_id_user_id_fk": {
+          "name": "records_tenant_id_updated_by_tenant_members_tenant_id_user_id_fk",
+          "tableFrom": "records",
+          "tableTo": "tenant_members",
+          "columnsFrom": [
+            "tenant_id",
+            "updated_by"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "user_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "records_tenant_id_deleted_by_tenant_members_tenant_id_user_id_fk": {
+          "name": "records_tenant_id_deleted_by_tenant_members_tenant_id_user_id_fk",
+          "tableFrom": "records",
+          "tableTo": "tenant_members",
+          "columnsFrom": [
+            "tenant_id",
+            "deleted_by"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "user_id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "records_tenant_id_app_id_id_pk": {
+          "name": "records_tenant_id_app_id_id_pk",
+          "columns": [
+            "tenant_id",
+            "app_id",
+            "id"
+          ]
+        }
+      },
+      "uniqueConstraints": {
+        "records_tenant_id_app_id_record_no_unique": {
+          "name": "records_tenant_id_app_id_record_no_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "tenant_id",
+            "app_id",
+            "record_no"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "records_data_object": {
+          "name": "records_data_object",
+          "value": "jsonb_typeof(\"records\".\"data\") = 'object'"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.tenant_members": {
+      "name": "tenant_members",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "can_create_apps": {
+          "name": "can_create_apps",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "tenant_members_tenant_id_tenants_id_fk": {
+          "name": "tenant_members_tenant_id_tenants_id_fk",
+          "tableFrom": "tenant_members",
+          "tableTo": "tenants",
+          "columnsFrom": [
+            "tenant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "tenant_members_tenant_id_user_id_users_tenant_id_id_fk": {
+          "name": "tenant_members_tenant_id_user_id_users_tenant_id_id_fk",
+          "tableFrom": "tenant_members",
+          "tableTo": "users",
+          "columnsFrom": [
+            "tenant_id",
+            "user_id"
+          ],
+          "columnsTo": [
+            "tenant_id",
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "tenant_members_tenant_id_user_id_pk": {
+          "name": "tenant_members_tenant_id_user_id_pk",
+          "columns": [
+            "tenant_id",
+            "user_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.tenants": {
+      "name": "tenants",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.users": {
+      "name": "users",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "email": {
+          "name": "email",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "users_tenant_id_tenants_id_fk": {
+          "name": "users_tenant_id_tenants_id_fk",
+          "tableFrom": "users",
+          "tableTo": "tenants",
+          "columnsFrom": [
+            "tenant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "users_tenant_id_id_pk": {
+          "name": "users_tenant_id_id_pk",
+          "columns": [
+            "tenant_id",
+            "id"
+          ]
+        }
+      },
+      "uniqueConstraints": {
+        "users_tenant_id_email_unique": {
+          "name": "users_tenant_id_email_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "tenant_id",
+            "email"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {
+    "public.draft_status": {
+      "name": "draft_status",
+      "schema": "public",
+      "values": [
+        "editing",
+        "validation-failed",
+        "publishable"
+      ]
+    },
+    "public.field_type": {
+      "name": "field_type",
+      "schema": "public",
+      "values": [
+        "text",
+        "number"
+      ]
+    }
+  },
+  "schemas": {
+    "authentication": "authentication"
+  },
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}
