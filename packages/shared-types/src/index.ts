@@ -31,3 +31,5 @@ export interface FieldChange {
 }
 export * from './views';
 export * from './acl';
+
+export * from './workflow';

@@ -20,6 +20,7 @@ import { retireChangedIndexes } from './runtime-index-state';
 import { fieldChanges, serializeRecord, writeRecordEvent } from './record-events';
 import { projectSearchValues } from './search-projection';
 import { normalizeReferencePresentation, referencePresentation } from './reference-config';
+import { copyWorkflow } from './workflow-graph';
 import { conditions, viewInput } from './view-input';
 import { identifier, parseInput, postgresErrorCode } from './validation';
 
@@ -160,7 +161,7 @@ export class AppSchemaService {
     });
   }
 
-  private async managedApp(tx: TenantTransaction, context: TenantContext, appId: string, deleted = false) {
+  async managedApp(tx: TenantTransaction, context: TenantContext, appId: string, deleted = false) {
     const [app] = await tx.select().from(apps).where(and(
       this.authorization.appManagementScope(context), eq(apps.id, appId),
       deleted ? sql`${apps.deletedAt} IS NOT NULL` : isNull(apps.deletedAt),
@@ -272,6 +273,7 @@ export class AppSchemaService {
           ...(row.groupFieldId && { groupFieldId: fieldMapping.get(row.groupFieldId)! }),
         }));
         await tx.update(appVersions).set({ viewConfiguration, formLayout }).where(this.versionScope(context, copy.id, 1));
+        await copyWorkflow(tx, { tenantId: context.tenantId, appId }, identity, fieldMapping);
         return copy;
       });
     } catch (error) {
@@ -315,18 +317,22 @@ export class AppSchemaService {
     return withTenantTransaction(context, async (tx) => {
       const { fields, access } = await this.access(tx, context, appId, 'view');
       const visible = new Set(fields.filter(({ fieldId }) => this.authorization.fieldDecision(access, fieldId, 'view').allowed)
-        .map(({ type }) => type));
-      const user = visible.has('user') ? await tx.select({
-        id: users.id, name: sql<string>`COALESCE(${users.displayName}, ${users.loginName}, ${users.email})`,
-        disabled: sql<boolean>`${tenantMembers.disabledAt} IS NOT NULL`,
-      }).from(users).innerJoin(tenantMembers, and(eq(users.tenantId, tenantMembers.tenantId), eq(users.id, tenantMembers.userId)))
-        .where(eq(users.tenantId, context.tenantId)).orderBy(sql`2`, users.id) : [];
-      const organization = visible.has('organization') ? await tx.select({ id: organizations.id, name: organizations.name })
-        .from(organizations).where(eq(organizations.tenantId, context.tenantId)).orderBy(organizations.name, organizations.id) : [];
-      const group = visible.has('group') ? await tx.select({ id: memberGroups.id, name: memberGroups.name })
-        .from(memberGroups).where(eq(memberGroups.tenantId, context.tenantId)).orderBy(memberGroups.name, memberGroups.id) : [];
-      return { user, organization, group };
+        .flatMap(({ type, table }) => [type, ...table?.fields.map((field) => field.type) ?? []]));
+      return this.directoryOptions(tx, context, visible);
     });
+  }
+
+  async directoryOptions(tx: TenantTransaction, context: TenantContext, visible: ReadonlySet<string>) {
+    const user = visible.has('user') ? await tx.select({
+      id: users.id, name: sql<string>`COALESCE(${users.displayName}, ${users.loginName}, ${users.email})`,
+      disabled: sql<boolean>`${tenantMembers.disabledAt} IS NOT NULL`,
+    }).from(users).innerJoin(tenantMembers, and(eq(users.tenantId, tenantMembers.tenantId), eq(users.id, tenantMembers.userId)))
+      .where(eq(users.tenantId, context.tenantId)).orderBy(sql`2`, users.id) : [];
+    const organization = visible.has('organization') ? await tx.select({ id: organizations.id, name: organizations.name })
+      .from(organizations).where(eq(organizations.tenantId, context.tenantId)).orderBy(organizations.name, organizations.id) : [];
+    const group = visible.has('group') ? await tx.select({ id: memberGroups.id, name: memberGroups.name })
+      .from(memberGroups).where(eq(memberGroups.tenantId, context.tenantId)).orderBy(memberGroups.name, memberGroups.id) : [];
+    return { user, organization, group };
   }
 
   visibleLayout(layout: FormLayout, fields: FieldDefinition[]) {

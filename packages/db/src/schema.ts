@@ -1,7 +1,7 @@
-import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type LookupConfiguration, type RelatedConfiguration, type TableConfiguration, type ViewCondition } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type LookupConfiguration, type RelatedConfiguration, type TableConfiguration, type WorkflowCondition, type AssigneeSource, type ViewCondition } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
-  bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
+  bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey, uniqueIndex,
   text, timestamp, unique, uuid,
 } from 'drizzle-orm/pg-core';
 
@@ -93,6 +93,7 @@ export const apps = pgTable('apps', {
   attachmentMaxCount: integer('attachment_max_count').notNull().default(5),
   attachmentTypes: jsonb('attachment_types').$type<string[]>().notNull().default(sql`'["image/png","image/jpeg","application/pdf"]'::jsonb`),
   localDrafts: boolean('local_drafts').notNull().default(true),
+  workflowEnabled: boolean('workflow_enabled').notNull().default(false),
   adminMemo: text('admin_memo').notNull().default(''),
   archivedAt: time('archived_at'),
   deletedAt: time('deleted_at'),
@@ -188,6 +189,115 @@ export const records = pgTable('records', {
   foreignKey({ columns: [t.tenantId, t.deletedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
 ]);
 
+export const workflowDefinitions = pgTable('workflow_definitions', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  version: integer().notNull(),
+  status: text().$type<'draft' | 'published'>().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  unique().on(t.tenantId, t.appId, t.version),
+  unique().on(t.tenantId, t.appId, t.id, t.version),
+  uniqueIndex('workflow_one_draft').on(t.tenantId, t.appId).where(sql`${t.status} = 'draft'`),
+  check('workflow_definition_status', sql`${t.status} IN ('draft', 'published')`),
+  foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
+]);
+
+export const workflowStates = pgTable('workflow_states', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  workflowId: uuid('workflow_id').notNull(),
+  id: uuid().notNull(),
+  code: text().notNull(),
+  name: text().notNull(),
+  terminal: boolean().notNull(),
+  initial: boolean().notNull(),
+  assignees: jsonb().$type<AssigneeSource[]>().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.workflowId, t.id] }),
+  unique().on(t.tenantId, t.appId, t.workflowId, t.code),
+  foreignKey({
+    name: 'workflow_states_definition_fk',
+    columns: [t.tenantId, t.appId, t.workflowId],
+    foreignColumns: [workflowDefinitions.tenantId, workflowDefinitions.appId, workflowDefinitions.id],
+  }),
+]);
+
+export const workflowActions = pgTable('workflow_actions', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  workflowId: uuid('workflow_id').notNull(),
+  id: uuid().notNull(),
+  name: text().notNull(),
+  fromStateId: uuid('from_state_id').notNull(),
+  toStateId: uuid('to_state_id').notNull(),
+  conditions: jsonb('condition_expr').$type<WorkflowCondition[]>().notNull(),
+  assignees: jsonb('assignee_rule').$type<AssigneeSource[]>().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.workflowId, t.id] }),
+  foreignKey({
+    name: 'workflow_actions_from_state_fk',
+    columns: [t.tenantId, t.appId, t.workflowId, t.fromStateId],
+    foreignColumns: [workflowStates.tenantId, workflowStates.appId, workflowStates.workflowId, workflowStates.id],
+  }),
+  foreignKey({
+    name: 'workflow_actions_to_state_fk',
+    columns: [t.tenantId, t.appId, t.workflowId, t.toStateId],
+    foreignColumns: [workflowStates.tenantId, workflowStates.appId, workflowStates.workflowId, workflowStates.id],
+  }),
+]);
+
+export const recordWorkflowState = pgTable('record_workflow_state', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  recordId: uuid('record_id').notNull(),
+  workflowId: uuid('workflow_id').notNull(),
+  workflowVersion: integer('workflow_version').notNull(),
+  stateId: uuid('state_id').notNull(),
+  revision: integer().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.recordId] }),
+  foreignKey({
+    name: 'record_workflow_state_record_fk',
+    columns: [t.tenantId, t.appId, t.recordId],
+    foreignColumns: [records.tenantId, records.appId, records.id],
+  }),
+  foreignKey({
+    name: 'record_workflow_state_version_fk',
+    columns: [t.tenantId, t.appId, t.workflowId, t.workflowVersion],
+    foreignColumns: [workflowDefinitions.tenantId, workflowDefinitions.appId, workflowDefinitions.id, workflowDefinitions.version],
+  }),
+  foreignKey({
+    name: 'record_workflow_state_state_fk',
+    columns: [t.tenantId, t.appId, t.workflowId, t.stateId],
+    foreignColumns: [workflowStates.tenantId, workflowStates.appId, workflowStates.workflowId, workflowStates.id],
+  }),
+  index('record_workflow_state_state_idx').on(t.tenantId, t.appId, t.stateId),
+]);
+
+export const workflowAssignments = pgTable('workflow_assignments', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  recordId: uuid('record_id').notNull(),
+  userId: uuid('user_id').notNull(),
+  role: text().notNull(),
+  active: boolean().notNull().default(true),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.recordId, t.userId] }),
+  foreignKey({
+    name: 'workflow_assignments_record_state_fk',
+    columns: [t.tenantId, t.appId, t.recordId],
+    foreignColumns: [recordWorkflowState.tenantId, recordWorkflowState.appId, recordWorkflowState.recordId],
+  }),
+  foreignKey({
+    name: 'workflow_assignments_user_fk',
+    columns: [t.tenantId, t.userId],
+    foreignColumns: [tenantMembers.tenantId, tenantMembers.userId],
+  }),
+  index('workflow_assignments_active_user_idx').on(t.tenantId, t.userId).where(sql`${t.active}`),
+]);
+
 export const recordTableRows = pgTable('record_table_rows', {
   tenantId: tenantId(),
   appId: uuid('app_id').notNull(),
@@ -260,6 +370,40 @@ export const recordEvents = pgTable('record_events', {
     foreignColumns: [appVersions.tenantId, appVersions.appId, appVersions.version],
   }),
   foreignKey({ columns: [t.tenantId, t.actorId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
+export const workflowEvents = pgTable('workflow_events', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  eventId: uuid('event_id').notNull(),
+  workflowId: uuid('workflow_id').notNull(),
+  actionId: uuid('action_id'),
+  fromStateId: uuid('from_state_id'),
+  toStateId: uuid('to_state_id').notNull(),
+  reason: text(),
+  assigneeIds: jsonb('assignee_ids').$type<string[]>().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.eventId] }),
+  foreignKey({
+    name: 'workflow_events_record_event_fk',
+    columns: [t.tenantId, t.appId, t.eventId],
+    foreignColumns: [recordEvents.tenantId, recordEvents.appId, recordEvents.eventId],
+  }),
+  foreignKey({
+    name: 'workflow_events_action_fk',
+    columns: [t.tenantId, t.appId, t.workflowId, t.actionId],
+    foreignColumns: [workflowActions.tenantId, workflowActions.appId, workflowActions.workflowId, workflowActions.id],
+  }),
+  foreignKey({
+    name: 'workflow_events_from_state_fk',
+    columns: [t.tenantId, t.appId, t.workflowId, t.fromStateId],
+    foreignColumns: [workflowStates.tenantId, workflowStates.appId, workflowStates.workflowId, workflowStates.id],
+  }),
+  foreignKey({
+    name: 'workflow_events_to_state_fk',
+    columns: [t.tenantId, t.appId, t.workflowId, t.toStateId],
+    foreignColumns: [workflowStates.tenantId, workflowStates.appId, workflowStates.workflowId, workflowStates.id],
+  }),
 ]);
 
 export const outbox = pgTable('outbox', {

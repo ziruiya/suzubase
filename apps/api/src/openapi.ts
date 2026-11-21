@@ -8,6 +8,7 @@ import { fileHttp } from './files';
 import { recordHttp } from './records';
 import { indexHttp } from './runtime-indexes';
 import { tenantHttp } from './tenant-admin';
+import { workflowHttp } from './workflow-definitions';
 import { tokenHttp } from './api-tokens';
 import { formulaInput } from './formula';
 import { identifier } from './validation';
@@ -205,6 +206,12 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/draft/acl']: { get: { reply: acl }, put: { body: appHttp.aclInput, reply: acl } },
   [applications + '/permissions/preview']: { post: { body: appHttp.previewInput, reply: preview,
     description: 'Evaluate a published record, a bounded set of matching records, or application permissions. Preview calls are audited.' } },
+  [applications + '/workflow/directory']: { get: { reply: selectors } },
+  [applications + '/workflow']: { get: { reply: workflowHttp.settings } },
+  [applications + '/workflow/versions/{version}']: { get: { reply: workflowHttp.definition } },
+  [applications + '/workflow/draft']: { put: { body: workflowHttp.graphInput, reply: workflowHttp.definition } },
+  [applications + '/workflow/publish']: { post: { reply: workflowHttp.definition, conflict: errorSchema } },
+  [applications + '/workflow/enabled']: { patch: { body: workflowHttp.enabledInput, reply: workflowHttp.enabledInput, conflict: errorSchema } },
   [applications + '/publish']: { post: { body: appHttp.publishInput, optionalBody: true,
     reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text) }), conflict: publishConflict } },
   [records]: { get: { query: recordHttp.pageInput, reply: page(record) }, post: { body: recordHttp.createInput, reply: record, conflict: errorSchema } },
@@ -301,7 +308,8 @@ function apply(path: string, method: Method, operation: OperationObject) {
   const queries = contract.query ? queryParameters(contract.query) : [];
   operation.parameters = [...configured.filter((parameter) => '$ref' in parameter || parameter.in !== 'query'), ...queries];
   for (const parameter of operation.parameters) {
-    if (!('$ref' in parameter) && parameter.in === 'path') parameter.schema = { type: 'string', format: 'uuid' };
+    if (!('$ref' in parameter) && parameter.in === 'path') parameter.schema = parameter.name === 'version'
+      ? { type: 'integer', minimum: 1, maximum: 2147483647 } : { type: 'string', format: 'uuid' };
   }
   const binary: SchemaObject = { type: 'string', format: 'binary' };
   if (contract.body || contract.binaryBody) {

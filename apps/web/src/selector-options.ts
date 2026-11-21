@@ -13,7 +13,7 @@ export function useSelectorOptions(app: App | undefined, session: Session) {
   const [error, setError] = useState('');
   const id = app?.id;
   const version = app?.schemaVersion;
-  const needsOptions = app?.fields.some(({ type }) => directoryType(type));
+  const needsOptions = app?.fields.some(({ type, table }) => directoryType(type) || table?.fields.some((field) => directoryType(field.type)));
   useEffect(() => {
     setOptions(undefined); setError('');
     if (!id || !needsOptions) return;
