@@ -8,6 +8,13 @@
       "when": 1795264868701,
       "tag": "0000_foundation",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1795264928508,
+      "tag": "0001_tenant_security",
+      "breakpoints": true
     }
   ]
 }

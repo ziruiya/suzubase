@@ -4,16 +4,15 @@ import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
-import { createHealthCheck } from '@suzubase/db';
+import { checkDatabase } from '@suzubase/db';
 
 @Controller()
 class HealthController {
-  private readonly checkDatabase = createHealthCheck(process.env.DATABASE_URL!);
 
   @Get('health')
   async health() {
     try {
-      await this.checkDatabase();
+      await checkDatabase();
       return { status: 'ok', database: 'connected' };
     } catch {
       throw new ServiceUnavailableException('Database unavailable');

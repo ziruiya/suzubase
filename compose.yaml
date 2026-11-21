@@ -32,7 +32,7 @@ services:
     <<: *workspace
     command: pnpm --filter @suzubase/api start
     environment:
-      DATABASE_URL: postgres://suzubase:suzubase-dev@postgres:5432/suzubase
+      DATABASE_URL: postgres://suzubase_runtime:suzubase-runtime-dev@postgres:5432/suzubase
     depends_on:
       migrate:
         condition: service_completed_successfully
