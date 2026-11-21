@@ -5,15 +5,19 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
 import {
-  and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, recordReferences, sql, TenantContext, TenantTransaction, withTenantTransaction,
+  and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, recordReferences, recordUniqueValues, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, SavedView, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
+import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, type FieldDefinition, type FormLayout, SavedView, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
-import { AuthorizationService, RecordAccess } from './authorization';
+import { AuthorizationService, formulaReferences, RecordAccess } from './authorization';
 import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
 import { aclInput } from './acl-input';
-import { formulaInput, formulaProblems } from './formula';
+import { formulaInput } from './formula';
 import { normalizeValue } from './field-values';
+import { dataPreflight, formLayoutInput, isDestructive, migrationInput, referencesPreflight, uniqueKey,
+  validLayout, withoutLayoutField, type MigrationStrategy } from './schema-preflight';
+import { fieldChanges, serializeRecord, writeRecordEvent } from './record-events';
+import { projectSearchValues } from './search-projection';
 import { viewInput } from './view-input';
 import { identifier, parseInput, postgresErrorCode } from './validation';
 
@@ -47,9 +51,13 @@ const numbering = z.strictObject({
   enabled: z.boolean(),
 });
 const layoutInput = z.strictObject({ kind: z.enum(layoutKinds), text: metadata.name.optional().default('') });
-const fieldInput = z.strictObject({
+const fieldProperties = z.strictObject({
   ...metadata, type: z.enum(fieldTypes), formula: formulaInput.optional(), layoutElement: layoutInput.optional(), autoNumber: numbering.optional(), searchMode: z.enum(textSearchModes).optional(), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
-}).refine(({ options, type }) => optionFieldTypes.has(type) === (options.length > 0)
+});
+const fieldPatch = fieldProperties.extend({
+  required: z.boolean(), uniqueValue: z.boolean(), options: z.array(option).max(200),
+}).partial().refine((value) => Object.keys(value).length > 0);
+const fieldInput = fieldProperties.refine(({ options, type }) => optionFieldTypes.has(type) === (options.length > 0)
   && new Set(options.map(({ value }) => value)).size === options.length, { path: ['options'] })
   .refine(({ type, uniqueValue }) => !uniqueValue || fieldContract[type].unique, { path: ['uniqueValue'] })
   .refine(({ type, autoNumber, required }) => (type === 'autoNumber') === Boolean(autoNumber) &&
@@ -192,7 +200,11 @@ export class AppSchemaService {
             sort: view.sort && remap(view.sort),
           })),
         };
-        await tx.update(appVersions).set({ viewConfiguration }).where(this.versionScope(context, copy.id, 1));
+        const formLayout = (await this.layout(tx, context, appId, source.publishedSchemaVersion)).map((row) => ({
+          ...row, id: randomUUID(), cells: row.cells.map(remap),
+          ...(row.groupFieldId && { groupFieldId: fieldMapping.get(row.groupFieldId)! }),
+        }));
+        await tx.update(appVersions).set({ viewConfiguration, formLayout }).where(this.versionScope(context, copy.id, 1));
         return copy;
       });
     } catch (error) {
@@ -212,8 +224,7 @@ export class AppSchemaService {
     const principal = await this.authorization.principal(tx, context);
     const access: RecordAccess = {
       acl, principal, types: new Map(fields.map(({ fieldId, type }) => [fieldId, type])),
-      formulaRefs: new Map(fields.filter(({ formula }) => formula).map(({ fieldId, formula }) =>
-        [fieldId, formula!.flatMap((token) => token.kind === 'field' ? [token.fieldId] : [])])),
+      formulaRefs: formulaReferences(fields),
     };
     return { app, fields, access };
   }
@@ -228,8 +239,17 @@ export class AppSchemaService {
         themeColor: app.themeColor,
         titleFieldId: app.titleFieldId && this.authorization.fieldDecision(access, app.titleFieldId, 'view').allowed
           ? app.titleFieldId : null,
+        formLayout: this.visibleLayout(await this.layout(tx, context, appId, app.publishedSchemaVersion), definitions),
         archivedAt: app.archivedAt, localDrafts: app.localDrafts, can, schemaVersion: app.publishedSchemaVersion, fields: definitions, ...views };
     });
+  }
+
+  visibleLayout(layout: FormLayout, fields: FieldDefinition[]) {
+    const visible = new Set(fields.map(({ fieldId }) => fieldId));
+    return layout.map(({ id, groupFieldId, cells }) => ({
+      id, ...(groupFieldId && visible.has(groupFieldId) && { groupFieldId }),
+      cells: cells.filter(({ fieldId }) => visible.has(fieldId)),
+    })).filter(({ cells }) => cells.length);
   }
 
   formFields(fields: Awaited<ReturnType<AppSchemaService['getFields']>>, access: RecordAccess) {
@@ -256,28 +276,63 @@ export class AppSchemaService {
     return { views, defaultId: views.some(({ id }) => id === configuration.defaultId) ? configuration.defaultId : null };
   }
 
-  getFields(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
-    return tx.select({ fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required, uniqueValue: fields.uniqueValue, autoNumber: fields.autoNumber, searchMode: fields.searchMode, options: fields.options, formula: fields.formula, layoutElement: fields.layoutElement })
-      .from(fields).where(and(
-        eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), lte(fields.introducedIn, version),
-      )).orderBy(fields.introducedIn, fields.code);
+  async getFields(tx: TenantTransaction, context: TenantContext, appId: string, version: number): Promise<FieldDefinition[]> {
+    const definitionRows = await tx.select({
+      fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required,
+      uniqueValue: fields.uniqueValue, autoNumber: fields.autoNumber, searchMode: fields.searchMode,
+      options: fields.options, formula: fields.formula, layoutElement: fields.layoutElement,
+    }).from(fields).where(and(
+      eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), lte(fields.introducedIn, version),
+    )).orderBy(fields.introducedIn, fields.code);
+    const snapshot = await this.getVersion(tx, context, appId, version);
+    return definitionRows.flatMap((field) => {
+      const edited = snapshot.fieldEdits[field.fieldId];
+      return edited === null ? [] : [edited ?? field];
+    });
+  }
+
+  async layout(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
+    return (await this.getVersion(tx, context, appId, version)).formLayout;
+  }
+
+  async archivedDefinitions(tx: TenantTransaction, context: TenantContext, appId: string, version: number, ids: string[]) {
+    const definitions = new Map<string, FieldDefinition>();
+    const wanted = new Set(ids);
+    for (let prior = version - 1; prior > 0 && wanted.size; prior--) {
+      for (const field of await this.getFields(tx, context, appId, prior)) {
+        if (wanted.delete(field.fieldId)) definitions.set(field.fieldId, field);
+      }
+    }
+    return Object.fromEntries(definitions);
+  }
+
+  private async getVersion(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
+    const [snapshot] = await tx.select().from(appVersions).where(this.versionScope(context, appId, version));
+    if (!snapshot) throw new NotFoundException();
+    return snapshot;
+  }
+
+  private async beginDraft(tx: TenantTransaction, context: TenantContext, app: typeof apps.$inferSelect) {
+    const appId = app.id;
+    const version = app.draftSchemaVersion ?? app.publishedSchemaVersion + 1;
+    if (app.draftSchemaVersion === null) {
+      const { aclConfiguration, viewConfiguration, fieldEdits, formLayout } = await this.getVersion(tx, context, appId, app.publishedSchemaVersion);
+      await tx.insert(appVersions).values({ tenantId: context.tenantId, appId, version, aclConfiguration, viewConfiguration, fieldEdits, formLayout });
+    }
+    await tx.update(apps).set({ draftSchemaVersion: version, draftStatus: 'editing' })
+      .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
+    return version;
   }
 
   async addField(context: TenantContext, appId: string, input: z.infer<typeof fieldInput>) {
     try {
       return await withTenantTransaction(context, async (tx) => {
         const app = await this.managedApp(tx, context, appId);
-        const version = app.draftSchemaVersion ?? app.publishedSchemaVersion + 1;
+        const version = await this.beginDraft(tx, context, app);
         const identity = { tenantId: context.tenantId, appId };
-        if (app.draftSchemaVersion === null) {
-          const viewConfiguration = await this.getViews(tx, context, appId, app.publishedSchemaVersion);
-          const aclConfiguration = await this.authorization.configuration(tx, context, appId, app.publishedSchemaVersion);
-          await tx.insert(appVersions).values({ ...identity, version, viewConfiguration, aclConfiguration });
-        }
-        await tx.update(apps).set({ draftSchemaVersion: version, draftStatus: 'editing' })
-          .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
+        const definitions = await this.getFields(tx, context, appId, version);
+        if (definitions.some((field) => field.code === input.code)) throw new ConflictException('Field code already in use');
         if (input.autoNumber?.scopeFieldId) {
-          const definitions = await this.getFields(tx, context, appId, version);
           const scope = definitions.find(({ fieldId }) => fieldId === input.autoNumber!.scopeFieldId);
           if (!scope || !fieldContract[scope.type].sort || scope.type === 'autoNumber') {
             throw new BadRequestException('Automatic numbering requires a scalar scope field');
@@ -299,71 +354,188 @@ export class AppSchemaService {
       return {
         version, status: app.draftStatus, autoNumberHelp,
         fields: version === null ? [] : await this.getFields(tx, context, appId, version),
+        formLayout: (await this.getVersion(tx, context, appId, version ?? app.publishedSchemaVersion)).formLayout,
         ...await this.getViews(tx, context, appId, version ?? app.publishedSchemaVersion),
       };
     });
   }
 
-  async setDraftRequired(context: TenantContext, appId: string, fieldId: string, required: boolean) {
+  async editField(context: TenantContext, appId: string, fieldId: string, patch: z.infer<typeof fieldPatch> | null) {
     return withTenantTransaction(context, async (tx) => {
       const app = await this.managedApp(tx, context, appId);
-      if (app.draftSchemaVersion === null) throw new ConflictException('No draft to edit');
-      const scope = and(eq(fields.tenantId, context.tenantId), eq(fields.appId, appId),
-        eq(fields.fieldId, fieldId), eq(fields.introducedIn, app.draftSchemaVersion));
-      const [field] = await tx.update(fields).set({ required }).where(scope).returning();
+      const current = app.draftSchemaVersion ?? app.publishedSchemaVersion;
+      const definitions = await this.getFields(tx, context, appId, current);
+      const field = definitions.find((entry) => entry.fieldId === fieldId);
       if (!field) throw new NotFoundException();
-      await tx.update(apps).set({ draftStatus: 'editing' })
-        .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
-      return field;
+      let edited: FieldDefinition | null = null;
+      if (patch) {
+        const { fieldId: id, ...before } = field;
+        const type = patch.type ?? before.type;
+        const sameType = type === before.type;
+        if (!sameType && (!isRecordInput(type) || type === 'attachment' || before.type === 'attachment' || before.type === 'autoNumber')) {
+          throw new BadRequestException('Create a separate field when changing attachment, layout or generated value types');
+        }
+        const input = parseInput(fieldInput, {
+          ...before, ...patch, type,
+          formula: patch.formula ?? (sameType ? before.formula ?? undefined : undefined),
+          autoNumber: patch.autoNumber ?? (sameType ? before.autoNumber ?? undefined : undefined),
+          layoutElement: patch.layoutElement ?? (sameType ? before.layoutElement ?? undefined : undefined),
+          searchMode: patch.searchMode ?? (sameType ? before.searchMode ?? undefined : undefined),
+          options: patch.options ?? (sameType ? before.options : []),
+        });
+        if (definitions.some((entry) => entry.fieldId !== id && entry.code === input.code)) {
+          throw new ConflictException('Field code already in use');
+        }
+        if (sameType && field.options.some((option) => !input.options.some((entry) =>
+          entry.value === option.value && (!option.disabled || entry.disabled)))) {
+          throw new BadRequestException('Existing option values must be retained. Deactivate an option to stop new selections.');
+        }
+        if (sameType && type === 'autoNumber' && JSON.stringify(input.autoNumber) !== JSON.stringify(before.autoNumber)) {
+          throw new BadRequestException('An established automatic-number sequence cannot be reconfigured here');
+        }
+        edited = { ...input, fieldId: id, autoNumber: input.autoNumber ?? null, formula: input.formula ?? null,
+          layoutElement: input.layoutElement ?? null, searchMode: input.searchMode ?? null };
+      }
+      const version = await this.beginDraft(tx, context, app);
+      const { fieldEdits, formLayout } = await this.getVersion(tx, context, appId, version);
+      fieldEdits[fieldId] = edited;
+      await tx.update(appVersions).set({
+        fieldEdits, formLayout: patch ? formLayout : withoutLayoutField(formLayout, fieldId),
+      }).where(this.versionScope(context, appId, version));
+      return edited ?? { fieldId, deleted: true };
     });
   }
 
-  async publish(context: TenantContext, appId: string) {
+  async saveLayout(context: TenantContext, appId: string, formLayout: FormLayout) {
+    return withTenantTransaction(context, async (tx) => {
+      const app = await this.managedApp(tx, context, appId);
+      const version = await this.beginDraft(tx, context, app);
+      if (!validLayout(formLayout, await this.getFields(tx, context, appId, version))) {
+        throw new BadRequestException('Layout contains an unknown field, duplicate references or an overfilled row');
+      }
+      await tx.update(appVersions).set({ formLayout }).where(this.versionScope(context, appId, version));
+      return { version, formLayout };
+    });
+  }
+
+  async rollbackDisplay(context: TenantContext, appId: string) {
+    const result = await withTenantTransaction(context, async (tx) => {
+      const app = await this.managedApp(tx, context, appId);
+      if (app.draftSchemaVersion !== null || app.publishedSchemaVersion < 2) {
+        throw new ConflictException('Rollback requires a prior published version and no open draft');
+      }
+      const previous = await this.getVersion(tx, context, appId, app.publishedSchemaVersion - 1);
+      const current = await this.getVersion(tx, context, appId, app.publishedSchemaVersion);
+      if (JSON.stringify(previous.formLayout) === JSON.stringify(current.formLayout) &&
+          JSON.stringify(previous.viewConfiguration) === JSON.stringify(current.viewConfiguration)) {
+        throw new ConflictException('There are no previous layout or view changes to restore');
+      }
+      const fields = await this.getFields(tx, context, appId, current.version);
+      const earlierFields = await this.getFields(tx, context, appId, previous.version);
+      const problems = referencesPreflight(earlierFields, fields, previous.viewConfiguration, current.aclConfiguration, app.titleFieldId);
+      if (problems.length || !validLayout(previous.formLayout, fields)) {
+        throw new ConflictException({ message: 'Previous display configuration is incompatible', problems });
+      }
+      const version = current.version + 1;
+      await tx.insert(appVersions).values({
+        tenantId: context.tenantId, appId, version, fieldEdits: current.fieldEdits, aclConfiguration: current.aclConfiguration,
+        formLayout: previous.formLayout, viewConfiguration: previous.viewConfiguration,
+      });
+      const [published] = await tx.update(apps).set({ publishedSchemaVersion: version }).where(and(
+        eq(apps.tenantId, context.tenantId), eq(apps.id, appId),
+      )).returning();
+      return published;
+    });
+    return result;
+  }
+
+  async publish(context: TenantContext, appId: string, migration?: MigrationStrategy) {
     const result = await withTenantTransaction(context, async (tx) => {
       const app = await this.managedApp(tx, context, appId);
       const version = app.draftSchemaVersion;
       if (version === null) throw new ConflictException('No draft to publish');
-      const [addition] = await tx.select({ fieldId: fields.fieldId }).from(fields).where(and(
-        eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), eq(fields.introducedIn, version),
-      )).limit(1);
-      const draftViews = await this.getViews(tx, context, appId, version);
-      const publishedViews = await this.getViews(tx, context, appId, app.publishedSchemaVersion);
-      const draftAcl = await this.authorization.configuration(tx, context, appId, version);
-      const publishedAcl = await this.authorization.configuration(tx, context, appId, app.publishedSchemaVersion);
-      const dependencyProblems = formulaProblems(
-        await this.getFields(tx, context, appId, version),
-        await this.getFields(tx, context, appId, app.publishedSchemaVersion),
-      );
-      const changedAcl = JSON.stringify(draftAcl) !== JSON.stringify(publishedAcl);
-      const changedViews = JSON.stringify(draftViews) !== JSON.stringify(publishedViews);
-      const requireFields = await tx.select({ fieldId: fields.fieldId, name: fields.name }).from(fields).where(and(
-        eq(fields.tenantId, context.tenantId), eq(fields.appId, appId),
-        eq(fields.introducedIn, version), eq(fields.required, true),
-      ));
-      const missing = requireFields.length ? await tx.select({
-        recordNo: sql<string>`${records.recordNo}::text`, fieldId: fields.fieldId, field: fields.name,
-      }).from(records).innerJoin(fields, and(
-        eq(fields.tenantId, records.tenantId), eq(fields.appId, records.appId),
-        eq(fields.introducedIn, version), eq(fields.required, true),
-      )).where(and(eq(records.tenantId, context.tenantId), eq(records.appId, appId),
-        sql`COALESCE(${records.data} ->> ${fields.fieldId}::text, '') IN ('', '[]')`)) : [];
-      if (version !== app.publishedSchemaVersion + 1 || (!addition && !changedViews && !changedAcl) || missing.length || dependencyProblems.length) {
-        await tx.update(apps).set({ draftStatus: 'validation-failed' })
-          .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
+      const previous = await this.getVersion(tx, context, appId, app.publishedSchemaVersion);
+      const draft = await this.getVersion(tx, context, appId, version);
+      const currentFields = await this.getFields(tx, context, appId, app.publishedSchemaVersion);
+      const draftFields = await this.getFields(tx, context, appId, version);
+      const dependencyProblems = referencesPreflight(currentFields, draftFields, draft.viewConfiguration, draft.aclConfiguration, app.titleFieldId);
+      if (!validLayout(draft.formLayout, draftFields)) {
+        dependencyProblems.push({ fieldId: '', dependency: 'layout', reason: 'Update invalid layout references' });
+      }
+      const existing = new Map(currentFields.map((field) => [field.fieldId, field]));
+      const destructive = isDestructive(currentFields, draftFields) || draftFields.some(({ fieldId, formula, searchMode }) => {
+        const old = existing.get(fieldId);
+        return old && (JSON.stringify(old.formula) !== JSON.stringify(formula) || old.searchMode !== searchMode);
+      });
+      const { issues, repaired, plan } = await dataPreflight(tx, context, appId, currentFields, draftFields, destructive, migration, !dependencyProblems.some(({ dependency }) => dependency === 'formula'));
+      if (app.archivedAt && plan.length) throw new ConflictException('Application is archived');
+      const disclose = async (items: typeof issues) => {
+        if (!items.length) return [];
+        const { access } = await this.access(tx, context, appId, 'view').catch((error) => {
+          if (error instanceof NotFoundException) return { access: undefined };
+          throw error;
+        });
+        if (!access) return [{ reason: 'Incompatible values require review by a user with record access' }];
+        const recordRule = this.authorization.recordScope(access, 'view');
+        const visible = recordRule ? new Set((await tx.select({ number: records.recordNo }).from(records).where(and(
+          eq(records.tenantId, context.tenantId), eq(records.appId, appId), recordRule,
+        ))).map(({ number }) => number.toString())) : undefined;
+        const details = items.filter(({ recordNo, fieldId }) => (!visible || visible.has(recordNo)) &&
+          this.authorization.fieldDecision(access, fieldId, 'view').allowed);
+        return details.length === items.length ? details : [...details, { reason: 'Additional incompatible values require authorized review' }];
+      };
+      const disclosedIssues = await disclose(issues);
+      const disclosedRepairs = await disclose(repaired);
+      const changes = JSON.stringify([draftFields, draft.formLayout, draft.viewConfiguration, draft.aclConfiguration]) !==
+        JSON.stringify([currentFields, previous.formLayout, previous.viewConfiguration, previous.aclConfiguration]);
+      const scope = and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId));
+      const needsMigration = destructive && plan.length > 0 && !migration;
+      if (version !== app.publishedSchemaVersion + 1 || !changes || issues.length || dependencyProblems.length || needsMigration) {
+        await tx.update(apps).set({ draftStatus: 'validation-failed' }).where(scope);
         return { failure: {
-          appId, version, message: missing.length ? 'Existing records are missing required values' : dependencyProblems.length ? 'Formula dependency check failed' : 'Draft has no changes',
-          problems: [...missing.map((problem) => ({ ...problem, value: null, reason: 'required' })), ...dependencyProblems],
-          skippedDependencies: ['workflow', 'lookup'],
+          appId, version,
+          message: issues.length ? 'Existing records are incompatible' : dependencyProblems.length ? 'Dependency check failed' :
+            needsMigration ? 'Choose an explicit data migration strategy' : 'Draft has no changes',
+          problems: [...disclosedIssues, ...dependencyProblems], migrationRequired: needsMigration, skippedDependencies: ['workflow', 'lookup'],
         } };
       }
-      await tx.update(apps).set({ draftStatus: 'publishable' }).where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
+      await tx.update(apps).set({ draftStatus: 'publishable' }).where(scope);
       const [published] = await tx.update(apps).set({
         publishedSchemaVersion: version, draftSchemaVersion: null, draftStatus: null,
-      }).where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId))).returning();
-      return { published };
+      }).where(scope).returning();
+      if (!plan.length) return { published };
+      const report = await this.applyMigration(tx, context, appId, version, draftFields, plan, disclosedRepairs, migration!);
+      return { published: { ...published, migrationReport: report } };
     });
     if (result.failure) throw new ConflictException(result.failure);
     return result.published;
+  }
+
+  private async applyMigration(tx: TenantTransaction, context: TenantContext, appId: string, version: number,
+    definitions: FieldDefinition[], plan: Awaited<ReturnType<typeof dataPreflight>>['plan'],
+    repaired: { reason: string }[], strategy: MigrationStrategy) {
+    const identity = { tenantId: context.tenantId, appId };
+    await tx.delete(recordUniqueValues).where(and(eq(recordUniqueValues.tenantId, context.tenantId), eq(recordUniqueValues.appId, appId)));
+    const uniqueFields = definitions.filter((field) => field.uniqueValue);
+    for (const { row, data, archive } of plan) {
+      const [updated] = await tx.update(records).set({
+        data, archivedData: archive, schemaVersion: version, revision: sql`${records.revision} + 1`,
+        updatedBy: context.userId, updatedAt: sql`clock_timestamp()`,
+      }).where(and(eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, row.id))).returning();
+      if (!row.deletedAt) {
+        const values = uniqueFields.filter(({ fieldId }) => data[fieldId]).map(({ fieldId }) => ({
+          ...identity, fieldId, recordId: row.id, normalizedValue: uniqueKey(data[fieldId]),
+        }));
+        if (values.length) await tx.insert(recordUniqueValues).values(values);
+      }
+      const record = serializeRecord(updated);
+      await projectSearchValues(tx, context, record, definitions);
+      await writeRecordEvent(tx, context, record, 'schema-migrated', fieldChanges(row.data, data), 'migration');
+    }
+    const report = { strategy, actorId: context.userId, occurredAt: new Date().toISOString(),
+      migrated: plan.length, failed: 0, incompatibleValues: repaired };
+    await tx.update(appVersions).set({ migrationReport: report }).where(this.versionScope(context, appId, version));
+    return report;
   }
 
   private versionScope(context: TenantContext, appId: string, version: number) {
@@ -420,15 +592,8 @@ export class AppSchemaService {
       } else {
         configuration.defaultId = change.id;
       }
-      const version = app.draftSchemaVersion ?? app.publishedSchemaVersion + 1;
-      if (app.draftSchemaVersion === null) {
-        const aclConfiguration = await this.authorization.configuration(tx, context, appId, current);
-        await tx.insert(appVersions).values({ tenantId: context.tenantId, appId, version, viewConfiguration: configuration, aclConfiguration });
-      } else {
-        await tx.update(appVersions).set({ viewConfiguration: configuration }).where(this.versionScope(context, appId, version));
-      }
-      await tx.update(apps).set({ draftSchemaVersion: version, draftStatus: 'editing' })
-        .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
+      const version = await this.beginDraft(tx, context, app);
+      await tx.update(appVersions).set({ viewConfiguration: configuration }).where(this.versionScope(context, appId, version));
       return { version, ...configuration };
     });
   }
@@ -468,15 +633,8 @@ export class AppSchemaService {
           }),
         })),
       };
-      const version = app.draftSchemaVersion ?? app.publishedSchemaVersion + 1;
-      if (app.draftSchemaVersion === null) {
-        const viewConfiguration = await this.getViews(tx, context, appId, current);
-        await tx.insert(appVersions).values({ tenantId: context.tenantId, appId, version, viewConfiguration, aclConfiguration });
-      } else {
-        await tx.update(appVersions).set({ aclConfiguration }).where(this.versionScope(context, appId, version));
-      }
-      await tx.update(apps).set({ draftSchemaVersion: version, draftStatus: 'editing' })
-        .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
+      const version = await this.beginDraft(tx, context, app);
+      await tx.update(appVersions).set({ aclConfiguration }).where(this.versionScope(context, appId, version));
       return aclConfiguration;
     });
   }
@@ -573,8 +731,25 @@ export class AppSchemaController {
   @AllowApiToken('manage')
   editDraft(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string,
     @Param('fieldId') fieldId: string, @Body() body: unknown) {
-    const { required } = parseInput(z.strictObject({ required: z.boolean() }), body);
-    return this.schemas.setDraftRequired(context, parseInput(identifier, id), parseInput(identifier, fieldId), required);
+    return this.schemas.editField(context, parseInput(identifier, id), parseInput(identifier, fieldId), parseInput(fieldPatch, body));
+  }
+
+  @Delete(':appId/draft/fields/:fieldId')
+  @AllowApiToken('manage')
+  deleteField(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Param('fieldId') fieldId: string) {
+    return this.schemas.editField(context, parseInput(identifier, id), parseInput(identifier, fieldId), null);
+  }
+
+  @Put(':appId/draft/layout')
+  @AllowApiToken('manage')
+  layout(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
+    return this.schemas.saveLayout(context, parseInput(identifier, id), parseInput(formLayoutInput, body));
+  }
+
+  @Post(':appId/rollback-display')
+  @AllowApiToken('manage')
+  rollbackDisplay(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
+    return this.schemas.rollbackDisplay(context, parseInput(identifier, id));
   }
 
   @Post(':appId/draft/views')
@@ -625,7 +800,8 @@ export class AppSchemaController {
 
   @Post(':appId/publish')
   @AllowApiToken('manage')
-  publish(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
-    return this.schemas.publish(context, parseInput(identifier, id));
+  publish(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
+    const { migration } = parseInput(z.strictObject({ migration: migrationInput.optional() }), body ?? {});
+    return this.schemas.publish(context, parseInput(identifier, id), migration);
   }
 }

@@ -11,12 +11,14 @@ import { FieldChange, multiOptionFieldTypes, RecordAction, RecordData, RecordRes
 import { z } from 'zod';
 import { assignAutoNumber, numberScope } from './auto-number';
 import { AppSchemaService } from './app-schema';
-import { AuthorizationService, RecordAccess } from './authorization';
+import { AuthorizationService, formulaReferences, RecordAccess } from './authorization';
 import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
 import { RecordQueryService } from './record-query';
-import { writeRecordEvent } from './record-events';
+import { fieldChanges, serializeRecord, writeRecordEvent } from './record-events';
 import { FileService, fileIds } from './files';
 import { SearchService, searchInput } from './search';
+import { projectSearchValues } from './search-projection';
+import { uniqueKey } from './schema-preflight';
 import { calculateFields } from './formula';
 import { normalizeValue } from './field-values';
 import { identifier, parseInput } from './validation';
@@ -38,22 +40,6 @@ const dataSchema = {
   additionalProperties: { type: 'string' },
 };
 
-function serializeRecord(row: typeof records.$inferSelect): RecordResponse {
-  const { id, appId, recordNo, data, schemaVersion, revision, status, createdBy, createdAt, updatedBy, updatedAt } = row;
-  return { id, appId, recordNo: recordNo.toString(), data, schemaVersion, revision, status, createdBy, createdAt, updatedBy, updatedAt };
-}
-
-function fieldChanges(before: RecordData, after: RecordData): FieldChange[] {
-  const ids = new Set([...Object.keys(before), ...Object.keys(after)]);
-  const changes: FieldChange[] = [];
-  for (const fieldId of ids) {
-    const oldValue = before[fieldId] ?? null;
-    const newValue = after[fieldId] ?? null;
-    if (oldValue !== newValue) changes.push({ fieldId, oldValue, newValue });
-  }
-  return changes;
-}
-
 @Injectable()
 export class RecordService {
   constructor(
@@ -61,11 +47,11 @@ export class RecordService {
     private readonly authorization: AuthorizationService,
     private readonly query: RecordQueryService,
     private readonly files: FileService,
-    private readonly search: SearchService,
   ) {}
 
   private async normalizeData(
     tx: TenantTransaction, context: TenantContext, appId: string, version: number, data: RecordData,
+    existing?: { data: RecordData; fields: Awaited<ReturnType<AppSchemaService['getFields']>> },
   ): Promise<RecordData> {
     const definitions = await this.appSchema.getFields(tx, context, appId, version);
     const fields = new Map(definitions.map((field) => [field.fieldId, field]));
@@ -90,7 +76,12 @@ export class RecordService {
           normalized = undefined;
         }
       } else {
-        normalized = value === '' && field.type !== 'number' ? '' : normalizeValue(field.type, value, field.options);
+        const current = existing?.fields.find((entry) => entry.fieldId === fieldId);
+        const options = current?.options ?? field.options;
+        const previous = existing?.data[fieldId];
+        const priorChoices: string[] = previous && multiOptionFieldTypes.has(field.type) ? JSON.parse(previous) : previous ? [previous] : [];
+        const allowed = options.map((option) => ({ ...option, disabled: option.disabled && !priorChoices.includes(option.value) }));
+        normalized = value === '' && field.type !== 'number' ? '' : normalizeValue(field.type, value, allowed);
       }
       if (normalized === undefined || !await this.validDirectoryValue(tx, context, field.type, normalized)) {
         errors.push({ field: fieldId, message: `Invalid ${field.type} value` });
@@ -99,8 +90,9 @@ export class RecordService {
       }
     }
     for (const field of definitions) {
+      const required = existing?.fields.find((entry) => entry.fieldId === field.fieldId)?.required ?? field.required;
       const value = normalizedData[field.fieldId];
-      if (field.required && (!value || ((multiOptionFieldTypes.has(field.type) || field.type === 'attachment') && value === '[]'))) {
+      if (required && (!value || ((multiOptionFieldTypes.has(field.type) || field.type === 'attachment') && value === '[]'))) {
         errors.push({ field: field.fieldId, message: 'Required field' });
       }
     }
@@ -158,7 +150,8 @@ export class RecordService {
       ));
       if (previous) {
         await this.findRecord(tx, context, appId, previous.response.id);
-        return this.visibleRecord(access, previous.response);
+        const oldFields = await this.appSchema.getFields(tx, context, appId, previous.response.schemaVersion);
+        return this.visibleRecord({ ...access, formulaRefs: formulaReferences(oldFields) }, previous.response);
       }
     }
 
@@ -191,7 +184,7 @@ export class RecordService {
     const record = serializeRecord(row);
     await this.reserveUniqueValues(tx, context, record);
     await this.reconcileFiles(tx, context, record);
-    await this.search.project(tx, context, record, fields);
+    await projectSearchValues(tx, context, record, fields);
     await writeRecordEvent(tx, context, record, 'created', fieldChanges({}, data), source);
     if (key !== undefined) {
       await tx.insert(recordCreateKeys).values({
@@ -238,7 +231,7 @@ export class RecordService {
 
   private visibleRecord(access: RecordAccess, record: RecordResponse): RecordResponse {
     return { ...record, data: Object.fromEntries(Object.entries(record.data).filter(([id]) =>
-      this.authorization.fieldDecision(access, id, 'view').allowed)) };
+      access.types.has(id) && this.authorization.fieldDecision(access, id, 'view').allowed)) };
   }
 
   private assertEditable(access: RecordAccess, data: RecordData) {
@@ -249,13 +242,13 @@ export class RecordService {
 
   async update(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof updateInput>) {
     return withTenantTransaction(context, async (tx) => {
-      const { access } = await this.appSchema.writable(tx, context, appId, 'edit');
+      const { access, fields } = await this.appSchema.writable(tx, context, appId, 'edit');
       const current = await this.findRecord(tx, context, appId, recordId, 'edit', false, true);
       if (current.revision !== input.revision) this.rejectRevision(this.visibleRecord(access, current));
       this.assertEditable(access, input.data);
       const retained = Object.fromEntries(Object.entries(current.data).filter(([id]) =>
         !this.authorization.editable(access, id) && access.types.get(id) !== 'autoNumber' && access.types.get(id) !== 'calculation'));
-      const data = await this.normalizeData(tx, context, appId, current.schemaVersion, { ...retained, ...input.data });
+      const data = await this.normalizeData(tx, context, appId, current.schemaVersion, { ...retained, ...input.data }, { data: current.data, fields });
       for (const [id, value] of Object.entries(current.data)) {
         if (access.types.get(id) === 'autoNumber') data[id] = value;
       }
@@ -272,7 +265,7 @@ export class RecordService {
       await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, recordId));
       await this.reserveUniqueValues(tx, context, updated);
       await this.reconcileFiles(tx, context, updated);
-      await this.search.project(tx, context, updated, definitions);
+      await projectSearchValues(tx, context, updated, definitions);
       await writeRecordEvent(tx, context, updated, 'updated', fieldChanges(current.data, data));
       return this.findRecord(tx, context, appId, recordId);
     });
@@ -296,7 +289,7 @@ export class RecordService {
     for (const field of definitions) {
       const value = record.data[field.fieldId];
       if (!field.uniqueValue || !value) continue;
-      const normalizedValue = value.normalize('NFKC').toLowerCase();
+      const normalizedValue = uniqueKey(value);
       // Bound the indexed key in bytes for PostgreSQL's btree entry size.
       if (Buffer.byteLength(normalizedValue) > 1000) {
         throw new BadRequestException([{ field: field.fieldId, message: 'Unique value is too long' }]);
@@ -393,14 +386,35 @@ export class RecordService {
 
   async form(context: TenantContext, appId: string, id: string) {
     return withTenantTransaction(context, async (tx) => {
-      const { access } = await this.appSchema.access(tx, context, appId, 'view');
+      const { access, app, fields: published } = await this.appSchema.access(tx, context, appId, 'view');
       const record = await this.findRecord(tx, context, appId, id);
       const fields = await this.appSchema.getFields(tx, context, appId, record.schemaVersion);
       const matchingActions = await tx.select({
         edit: sql<boolean>`COALESCE(${this.authorization.recordScope(access, 'edit') ?? sql`true`}, false)`,
         delete: sql<boolean>`COALESCE(${this.authorization.recordScope(access, 'delete') ?? sql`true`}, false)`,
       }).from(records).where(and(eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, id)));
-      return { record, fields: this.appSchema.formFields(fields, access), can: matchingActions[0] };
+      const visible = this.appSchema.formFields(fields.filter(({ fieldId }) => access.types.has(fieldId)).map((field) => ({
+        ...field, options: published.find(({ fieldId }) => fieldId === field.fieldId)?.options ?? field.options,
+      })), access);
+      const formLayout = this.appSchema.visibleLayout(await this.appSchema.layout(tx, context, appId, app.publishedSchemaVersion), visible);
+      return { record, fields: visible, formLayout, can: matchingActions[0] };
+    });
+  }
+
+  async readArchive(context: TenantContext, appId: string, id: string) {
+    return withTenantTransaction(context, async (tx) => {
+      const [grant] = await tx.select({ allowed: tenantMembers.canReadArchivedFields }).from(tenantMembers).where(and(
+        eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, context.userId), isNull(tenantMembers.disabledAt),
+      ));
+      if (!grant?.allowed) throw new NotFoundException('无权限');
+      const { app, access } = await this.appSchema.access(tx, context, appId, 'view');
+      const [row] = await tx.select({ data: records.archivedData }).from(records).where(and(
+        eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, id),
+        isNull(records.deletedAt), this.authorization.recordScope(access, 'view'),
+      ));
+      if (!row) throw new NotFoundException('无权限');
+      const definitions = await this.appSchema.archivedDefinitions(tx, context, appId, app.publishedSchemaVersion, Object.keys(row.data));
+      return { data: row.data, definitions };
     });
   }
 
@@ -408,11 +422,33 @@ export class RecordService {
     return withTenantTransaction(context, async (tx) => {
       await this.findRecord(tx, context, appId, id);
       const { access } = await this.appSchema.access(tx, context, appId, 'view');
-      const visible = [...access.types.keys()].filter((id) => this.authorization.fieldDecision(access, id, 'view').allowed);
-      const visibleChanges = visible.length ? sql<FieldChange[]>`COALESCE((
+      const eventScope = and(eq(recordEvents.tenantId, context.tenantId), eq(recordEvents.appId, appId), eq(recordEvents.recordId, id));
+      const versions = await tx.selectDistinct({ version: recordEvents.schemaVersion }).from(recordEvents).where(eventScope);
+      const schemas = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
+      const filters = [];
+      const versionFields = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
+      for (const { version } of versions) {
+        versionFields.set(version, await this.appSchema.getFields(tx, context, appId, version));
+      }
+      const restrictedOldCalculations = new Set([...versionFields.values()].flatMap((fields) => {
+        const refs = formulaReferences(fields);
+        return [...refs.keys()].filter((fieldId) => !this.authorization.fieldDecision({ ...access, formulaRefs: refs }, fieldId, 'view').allowed);
+      }));
+      for (const [version, fields] of versionFields) {
+        const historic = { ...access, formulaRefs: formulaReferences(fields) };
+        const allowed = fields.filter(({ fieldId }) => access.types.has(fieldId) &&
+          this.authorization.fieldDecision(historic, fieldId, 'view').allowed);
+        schemas.set(version, allowed);
+        const oldCalculations = allowed.filter(({ fieldId }) => restrictedOldCalculations.has(fieldId));
+        const hideMigrationValues = oldCalculations.length ? sql`AND (${recordEvents.source} <> 'migration' OR
+          change.value->>'fieldId' NOT IN (${sql.join(oldCalculations.map(({ fieldId }) => sql`${fieldId}`), sql`,`)}))` : sql``;
+        if (allowed.length) filters.push(sql`(${recordEvents.schemaVersion} = ${version} AND change.value->>'fieldId' IN
+          (${sql.join(allowed.map(({ fieldId }) => sql`${fieldId}`), sql`,`)}) ${hideMigrationValues})`);
+      }
+      const visibleChanges = filters.length ? sql<FieldChange[]>`COALESCE((
         SELECT jsonb_agg(change.value ORDER BY change.position)
         FROM jsonb_array_elements(${recordEvents.changes}) WITH ORDINALITY AS change(value, position)
-        WHERE change.value->>'fieldId' IN (${sql.join(visible.map((id) => sql`${id}`), sql`,`)})
+        WHERE ${sql.join(filters, sql` OR `)}
       ), '[]'::jsonb)` : sql<FieldChange[]>`'[]'::jsonb`;
       const events = await tx.select({
         event: {
@@ -424,16 +460,7 @@ export class RecordService {
         eq(users.tenantId, recordEvents.tenantId), eq(users.id, recordEvents.actorId),
       )).innerJoin(tenantMembers, and(
         eq(tenantMembers.tenantId, users.tenantId), eq(tenantMembers.userId, users.id),
-      )).where(and(
-        eq(recordEvents.tenantId, context.tenantId), eq(recordEvents.appId, appId), eq(recordEvents.recordId, id),
-      )).orderBy(recordEvents.recordRevision);
-      const schemas = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
-      for (const { event } of events) {
-        if (!schemas.has(event.schemaVersion)) {
-          schemas.set(event.schemaVersion, (await this.appSchema.getFields(tx, context, appId, event.schemaVersion))
-            .filter(({ fieldId }) => visible.includes(fieldId)));
-        }
-      }
+      )).where(eventScope).orderBy(recordEvents.recordRevision);
       return {
         events: events.map(({ event, name, email, disabledAt }) => ({
           ...event, actorLabel: (name ?? email) + (disabledAt ? '（已停用）' : ''),
@@ -525,6 +552,11 @@ export class RecordsController {
   @AllowApiToken('view')
   form(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') id: string) {
     return this.service.form(context, parseInput(identifier, appId), parseInput(identifier, id));
+  }
+
+  @Get(':recordId/archived-fields')
+  archivedFields(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') id: string) {
+    return this.service.readArchive(context, parseInput(identifier, appId), parseInput(identifier, id));
   }
 
   @Get(':recordId/history')

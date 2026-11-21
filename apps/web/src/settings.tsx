@@ -1,8 +1,9 @@
-import { autoNumberHelp, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, type FieldType } from '@suzubase/shared-types';
+import { autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, type FieldType, type FormLayout } from '@suzubase/shared-types';
 import { useEffect, useState, type FormEvent } from 'react';
-import { api, appPath, download, json, message, type App, type Field, type Session } from './api';
+import { LayoutDesigner } from './form-layout';
+import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
 
-type Draft = { version: number | null; status: string | null; fields: Field[] };
+type Draft = { version: number | null; status: string | null; fields: Field[]; formLayout: FormLayout };
 const tabs = ['Form', 'Views', 'Workflow', 'Notifications', 'Permissions', 'General', 'Import / export'] as const;
 
 export function Settings({ app, session, narrow, onClose, reload }: {
@@ -16,6 +17,11 @@ export function Settings({ app, session, narrow, onClose, reload }: {
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [preflight, setPreflight] = useState<unknown>();
+  const [migration, setMigration] = useState('');
+  const [editing, setEditing] = useState<Field>();
+  const definitions = draft?.version ? draft.fields : app.fields;
+  const layout = draft?.formLayout ?? app.formLayout;
   async function refreshDraft() {
     setDraft(await api<Draft>(path + '/draft', token));
   }
@@ -64,8 +70,24 @@ export function Settings({ app, session, narrow, onClose, reload }: {
     {notice && <p role="status">{notice}</p>}{error && <p className="error" role="alert">{error}</p>}
     {active === 'Form' && <>
       <p className="muted">Draft status · {draft?.status ?? 'No draft'}</p>
-      <ul className="plain">{(draft?.version ? draft.fields : app.fields).map((field) =>
-        <li key={field.fieldId}>{field.name} <span className="muted">· {field.type}</span></li>)}</ul>
+      <ul className="plain">{definitions.map((field) =>
+        <li className="inline" key={field.fieldId}>{field.name} <span className="muted">· {field.type}</span>
+          {!narrow && <button type="button" disabled={busy} onClick={() => setEditing(field)}>Edit {field.name}</button>}
+        </li>)}</ul>
+      {editing && !narrow && <FieldEditor key={editing.fieldId} field={editing} busy={busy} close={() => setEditing(undefined)}
+        save={(patch) => void run(async () => {
+          await api(path + '/draft/fields/' + editing.fieldId, token, patch ? json('PATCH', patch) : json('DELETE'));
+          setEditing(undefined); await refreshDraft();
+        })} />}
+      {!narrow && <LayoutDesigner key={definitions.map(({ fieldId }) => fieldId).join(':')} fields={definitions} saved={layout}
+        save={async (value) => {
+          await api(path + '/draft/layout', token, json('PUT', value));
+          await refreshDraft(); setNotice('Layout saved to the schema draft.');
+        }} />}
+      {!narrow && !draft?.version && app.schemaVersion > 1 && <button disabled={busy} type="button" onClick={() => void run(async () => {
+        await api(path + '/rollback-display', token, json('POST'));
+        await reload(); await refreshDraft(); setNotice('Previous layout and views restored.');
+      })}>Restore previous layout and views</button>}
       <form className="stack" onSubmit={add}>
         <label>Field name <input name="name" required maxLength={120} /></label>
         <label>Field code <input name="code" required pattern="[a-z][a-z0-9_\-]{0,63}" /></label>
@@ -144,11 +166,92 @@ export function Settings({ app, session, narrow, onClose, reload }: {
     {active === 'Import / export' && <CsvSettings app={app} session={session} />}
     {(active === 'Form' || active === 'Views' || active === 'Permissions') && draft?.version && <div className="inline">
       <button className="primary" disabled={busy} onClick={() => void run(async () => {
-        await api(path + '/publish', token, json('POST'));
-        await refreshDraft(); await reload(); setNotice('Draft preflight passed and the schema was published.');
+        setPreflight(undefined);
+        try {
+          const result = await api<{ migrationReport?: unknown }>(path + '/publish', token,
+            json('POST', migration ? { migration: { incompatible: migration } } : undefined));
+          setPreflight(result.migrationReport);
+          setMigration('');
+          await refreshDraft(); await reload(); setNotice('Draft preflight passed and the schema was published.');
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 409) {
+            setPreflight(error.body);
+            await refreshDraft();
+          }
+          throw error;
+        }
       })}>Preflight and publish</button>
+      {!narrow && <label>Data migration <select value={migration} onChange={(event) => setMigration(event.target.value)}>
+        <option value="">None selected</option>
+        <option value="reject">Migrate compatible values</option>
+        <option value="clear-optional">Clear incompatible optional values and save a report</option>
+      </select></label>}
     </div>}
+    {preflight !== undefined && <details open><summary>Publication report</summary><pre>{JSON.stringify(preflight, null, 2)}</pre></details>}
   </section>;
+}
+
+function FieldEditor({ field, busy, close, save }: {
+  field: Field; busy: boolean; close: () => void; save: (patch: Record<string, unknown> | null) => void;
+}) {
+  const [type, setType] = useState(field.type);
+  const [confirm, setConfirm] = useState(false);
+  const [error, setError] = useState('');
+  return <form className="stack" onSubmit={(event) => {
+    event.preventDefault();
+    const values = new FormData(event.currentTarget);
+    try {
+      const options = field.type === type ? field.options.map((option) => ({
+        ...option, label: values.get('label:' + option.value), disabled: values.has('disabled:' + option.value) || option.disabled,
+      })) : [];
+      if (optionFieldTypes.has(type)) {
+        for (const entry of String(values.get('newOptions')).split('\n').filter(Boolean)) {
+          const separator = entry.indexOf('=');
+          options.push({ value: separator < 0 ? entry : entry.slice(0, separator),
+            label: separator < 0 ? entry : entry.slice(separator + 1), disabled: false });
+        }
+      }
+      save({ name: values.get('name'), code: values.get('code'), type, required: values.has('required'), options,
+        uniqueValue: values.has('unique'),
+        ...(type === 'calculation' && { formula: JSON.parse(String(values.get('formula'))) }),
+        ...(type === 'layout' && { layoutElement: { kind: values.get('kind'), ...(values.get('layoutText') && { text: values.get('layoutText') }) } }),
+      });
+    } catch (error) {
+      setError(message(error));
+    }
+  }}>
+    <h3>Edit {field.name}</h3>
+    <label>Name <input name="name" defaultValue={field.name} required /></label>
+    <label>Code <input name="code" defaultValue={field.code} required /></label>
+    <label>Type <select value={type} onChange={(event) => setType(event.target.value as FieldType)}>
+      {fieldTypes.filter((type) => type === field.type || (isRecordInput(type) && type !== 'attachment' &&
+        !['attachment', 'autoNumber'].includes(field.type))).map((type) => <option key={type}>{type}</option>)}
+    </select></label>
+    {isRecordInput(type) && <label className="option"><input type="checkbox" name="required" defaultChecked={field.required} /> Required</label>}
+    {fieldContract[type].unique && <label className="option"><input type="checkbox" name="unique" defaultChecked={field.uniqueValue} /> Unique</label>}
+    {type === 'calculation' && <label>Formula tokens <textarea name="formula" defaultValue={JSON.stringify(field.formula, null, 2)} required /></label>}
+    {type === 'layout' && field.layoutElement && <>
+      <label>Element <select name="kind" defaultValue={field.layoutElement.kind}>
+        {layoutKinds.map((kind) => <option key={kind}>{kind}</option>)}</select></label>
+      <label>Display text <input name="layoutText" defaultValue={field.layoutElement.text} /></label>
+    </>}
+    {optionFieldTypes.has(type) && <>
+      {type === field.type && field.options.map((option) => <fieldset key={option.value}>
+        <legend>{option.value}</legend>
+        <label>Label <input name={'label:' + option.value} defaultValue={option.label} required /></label>
+        <label className="option"><input type="checkbox" name={'disabled:' + option.value}
+          defaultChecked={option.disabled} disabled={option.disabled} /> Deactivate</label>
+      </fieldset>)}
+      <label>Add options, one value=label per line <textarea name="newOptions" /></label>
+    </>}
+    {error && <p role="alert">{error}</p>}
+    <div className="inline">
+      <button type="submit" disabled={busy}>Save field to draft</button>
+      <button type="button" onClick={close}>Cancel</button>
+      {confirm ? <button type="button" disabled={busy} onClick={() => save(null)}>Confirm deletion of {field.name}</button>
+        : <button type="button" disabled={busy} onClick={() => setConfirm(true)}>Delete field</button>}
+    </div>
+  </form>;
 }
 
 function AclSettings({ app, session, refresh }: { app: App; session: Session; refresh: () => Promise<void> }) {

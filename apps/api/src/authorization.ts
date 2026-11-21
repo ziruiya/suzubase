@@ -5,7 +5,7 @@ import {
 } from '@suzubase/db';
 import {
   AclConfiguration, AppAction, appActions, DirectorySubject, fieldActions, FieldAction,
-  RecordAction, recordActions, RecordSubject, ViewCondition, multiOptionFieldTypes, FieldType,
+  RecordAction, recordActions, RecordSubject, ViewCondition, multiOptionFieldTypes, FieldType, type FieldDefinition,
 } from '@suzubase/shared-types';
 
 export interface PermissionDecision {
@@ -141,7 +141,7 @@ export class AuthorizationService {
   }
 
   fieldDecision(access: RecordAccess, fieldId: string, action: FieldAction): PermissionDecision {
-    if (action === 'view' && access.formulaRefs?.get(fieldId)?.some((id) => !this.fieldDecision(access, id, 'view').allowed)) {
+    if (action === 'view' && access.formulaRefs?.get(fieldId)?.some((id) => !access.types.has(id) || !this.fieldDecision(access, id, 'view').allowed)) {
       return { allowed: false, matched: [] };
     }
     const rules = access.acl.field.filter((rule) => rule.fieldId === fieldId && rule.action === action);
@@ -227,4 +227,9 @@ export interface RecordAccess {
   acl: AclConfiguration;
   types: ReadonlyMap<string, FieldType>;
   formulaRefs?: ReadonlyMap<string, string[]>;
+}
+
+export function formulaReferences(fields: FieldDefinition[]) {
+  return new Map(fields.filter(({ formula }) => formula).map(({ fieldId, formula }) =>
+    [fieldId, formula!.flatMap((token) => token.kind === 'field' ? [token.fieldId] : [])]));
 }

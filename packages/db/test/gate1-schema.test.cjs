@@ -105,3 +105,79 @@ test('GF-02 rich text, calculated results and layout definitions round-trip with
   assert.doesNotMatch(csv, /<p>|separator/);
   t.diagnostic(JSON.stringify({ layout: elements.map(({ fieldId, layoutElement }) => ({ fieldId, layoutElement })), values: read.record.data }));
 });
+
+test('GF-03 publishes rename and layout, blocks formula dependency, and archives removed fields behind a special grant', async (t) => {
+  const owner = await provision();
+  const token = await login(owner);
+  const { id } = await createApp(token);
+  const base = '/apps/' + id;
+  const request = (status, method, path, body) => expectRequest(status, base + path, { method, token, body });
+  const quantity = await request(201, 'POST', '/fields', { name: 'Quantity', code: 'quantity', type: 'number' });
+  const total = await request(201, 'POST', '/fields', { name: 'Total', code: 'total', type: 'calculation', formula: [
+    { kind: 'field', fieldId: quantity.fieldId }, { kind: 'number', value: '2' }, { kind: 'operator', operator: '*' },
+  ] });
+  await request(201, 'POST', '/publish');
+  const record = await request(201, 'POST', '/records', { data: { [quantity.fieldId]: '3' } });
+  await request(200, 'PATCH', '/draft/fields/' + quantity.fieldId, { name: 'Units', code: 'units' });
+  const formLayout = [{ id: owner.userId, cells: [{ fieldId: quantity.fieldId, width: 6 }, { fieldId: total.fieldId, width: 6 }] }];
+  await request(200, 'PUT', '/draft/layout', formLayout);
+  assert.equal((await request(200, 'GET', '')).fields.find(({ fieldId }) => fieldId === quantity.fieldId).name, 'Quantity');
+  await request(201, 'POST', '/publish');
+  const published = await request(200, 'GET', '');
+  assert.deepEqual(published.formLayout, formLayout);
+  assert.equal(published.fields.find(({ fieldId }) => fieldId === quantity.fieldId).name, 'Units');
+  const updated = await request(200, 'PUT', '/records/' + record.id, {
+    revision: record.revision, data: { [quantity.fieldId]: '4' },
+  });
+  assert.equal(updated.data[total.fieldId], '8');
+  await request(201, 'POST', '/rollback-display');
+  assert.deepEqual((await request(200, 'GET', '')).formLayout, []);
+  await request(200, 'DELETE', '/draft/fields/' + quantity.fieldId);
+  const blocked = await request(409, 'POST', '/publish', { migration: { incompatible: 'reject' } });
+  assert.ok(blocked.problems.some(({ fieldId, dependency }) => fieldId === total.fieldId && dependency === 'formula'));
+  await request(200, 'DELETE', '/draft/fields/' + total.fieldId);
+  const pass = await request(201, 'POST', '/publish', { migration: { incompatible: 'reject' } });
+  assert.equal(pass.migrationReport.migrated, 1);
+  assert.deepEqual((await request(200, 'GET', '/records/' + record.id)).data, {});
+  await request(404, 'GET', '/records/' + record.id + '/archived-fields');
+  const { Client } = require('pg');
+  const db = new Client({ connectionString: process.env.ADMIN_DATABASE_URL });
+  await db.connect();
+  try {
+    await db.query('UPDATE tenant_members SET can_read_archived_fields = true WHERE tenant_id = $1 AND user_id = $2',
+      [owner.tenantId, owner.userId]);
+  } finally {
+    await db.end();
+  }
+  const archive = await request(200, 'GET', '/records/' + record.id + '/archived-fields');
+  assert.equal(archive.data[quantity.fieldId], '4');
+  assert.equal(archive.definitions[quantity.fieldId].name, 'Units');
+  t.diagnostic(JSON.stringify({ blocked, migrated: pass.migrationReport, archive: archive.data }));
+});
+
+test('GF-03 explicitly repairs incompatible values during type migration and preserves deactivated options', async (t) => {
+  const token = await login(await provision());
+  const { id } = await createApp(token);
+  const request = (status, method, path, body) => expectRequest(status, '/apps/' + id + path, { method, token, body });
+  const original = await request(201, 'POST', '/fields', { name: 'Cost', code: 'cost', type: 'text' });
+  const selected = await request(201, 'POST', '/fields', { name: 'Choice', code: 'choice', type: 'select', options: [
+    { value: 'x', label: 'X' }, { value: 'y', label: 'Y' },
+  ] });
+  await request(201, 'POST', '/publish');
+  const value = await request(201, 'POST', '/records', { data: { [original.fieldId]: 'bad', [selected.fieldId]: 'x' } });
+  await request(200, 'PATCH', '/draft/fields/' + selected.fieldId, { options: [
+    { value: 'x', label: 'X', disabled: true }, { value: 'y', label: 'Y' },
+  ] });
+  await request(201, 'POST', '/publish');
+  const existing = await request(200, 'GET', '/records/' + value.id + '/form');
+  assert.equal(existing.fields.find(({ fieldId }) => fieldId === selected.fieldId).options[0].disabled, true);
+  await request(400, 'POST', '/records', { data: { [selected.fieldId]: 'x' } });
+  await request(200, 'PATCH', '/draft/fields/' + original.fieldId, { type: 'number' });
+  const blocked = await request(409, 'POST', '/publish');
+  assert.equal(blocked.problems[0].value, 'bad');
+  const pass = await request(201, 'POST', '/publish', { migration: { incompatible: 'clear-optional' } });
+  const migrated = await request(200, 'GET', '/records/' + value.id);
+  assert.deepEqual(migrated.data, { [selected.fieldId]: 'x' });
+  assert.equal(pass.migrationReport.incompatibleValues[0].value, 'bad');
+  t.diagnostic(JSON.stringify({ blocked, migration: pass.migrationReport }));
+});

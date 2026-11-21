@@ -1,4 +1,4 @@
-import { fieldContract, type RecordResponse } from '@suzubase/shared-types';
+import { fieldContract, type FormLayout, type RecordResponse } from '@suzubase/shared-types';
 import { useEffect, useState, type FormEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 import { api, appPath, download, json, message, type App, type AppSummary, type Field, type Profile, type Session } from './api';
@@ -9,7 +9,7 @@ import { AccountSecurity } from './account-security';
 import './style.css';
 
 type Item = Pick<RecordResponse, 'id' | 'recordNo' | 'data' | 'revision' | 'schemaVersion'>;
-type RecordForm = { record: RecordResponse; fields: Field[]; can: { edit: boolean; delete: boolean } };
+type RecordForm = { record: RecordResponse; fields: Field[]; formLayout: FormLayout; can: { edit: boolean; delete: boolean } };
 type Search = { field: string; mode: string; query: string };
 type History = {
   events: { eventId: string; actorLabel: string; kind: string; occurredAt: string; schemaVersion: number;
@@ -199,7 +199,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
     {screen === 'settings' && app.can.manage && (!narrow || session.profile.isAdmin) &&
       <Settings app={app} session={session} narrow={narrow} onClose={back} reload={reload} />}
     {(screen === 'new' || screen === 'edit') && <RecordEditor key={form?.record.id ?? 'new'}
-      session={session} app={app} fields={screen === 'edit' ? form!.fields : app.fields}
+      session={session} app={app} fields={screen === 'edit' ? form!.fields : app.fields} layout={screen === 'edit' ? form!.formLayout : app.formLayout}
       record={screen === 'edit' ? form!.record : undefined}
       onCancel={() => screen === 'edit' ? setScreen('detail') : back()}
       onSaved={(saved) => { setFeedback('Saved to the server'); void open(saved.id); }} />}
@@ -218,7 +218,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
             json('DELETE', { revision: form.record.revision })).then(() => { back(); setFeedback('Record moved to the recycle bin'); })
             .catch((error) => setError(message(error))); }}>Confirm move</button></div>
       </section>}
-      <RecordValues fields={form.fields} record={form.record} session={session} app={app} />
+      <RecordValues fields={form.fields} layout={form.formLayout} record={form.record} session={session} app={app} />
       <div className="inline"><button onClick={() => void api<History>(root + '/' + form.record.id + '/history', token)
         .then(setHistory).catch((error) => setError(message(error)))}>Show history</button></div>
       {history && <section aria-label="Record history"><h2>History</h2><ol className="history">{history.events.map((event) =>

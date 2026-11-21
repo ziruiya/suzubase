@@ -1,9 +1,10 @@
 import { Temporal } from '@js-temporal/polyfill';
-import { multiOptionFieldTypes, optionFieldTypes, type RecordData, type RecordResponse } from '@suzubase/shared-types';
+import { multiOptionFieldTypes, optionFieldTypes, type FormLayout, type RecordData, type RecordResponse } from '@suzubase/shared-types';
 import { useEffect, useRef, useState } from 'react';
 import { Controller, useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
+import { FormGrid } from './form-layout';
 import { RichTextEditor, RichTextValue, richTextSummary } from './rich-text';
 import { draftKey, recoverDraft, removeDrafts, writeDraft, type Draft, type DraftScope } from './drafts';
 
@@ -141,23 +142,10 @@ function RuntimeField({
     onChange={(event) => onChange(event.target.value)} />;
 }
 
-export function LayoutField({ field }: { field: Field }) {
-  const element = field.layoutElement;
-  if (!element) return null;
-  switch (element.kind) {
-    case 'label': return <p>{element.text || field.name}</p>;
-    case 'separator': return <hr />;
-    case 'blank': return <div className="layout-blank" aria-hidden="true" />;
-    case 'group': return <h3>{element.text || field.name}</h3>;
-  }
-}
-
-export function RecordValues({ fields, record, session, app }: { fields: Field[]; record: RecordResponse; session: Session; app: App }) {
+export function RecordValues({ fields, layout, record, session, app }: { fields: Field[]; layout: FormLayout; record: RecordResponse; session: Session; app: App }) {
   const [error, setError] = useState('');
-  return <dl className="record-values">
-    {fields.map((field) => field.type === 'layout'
-      ? <div key={field.fieldId}><LayoutField field={field} /></div>
-      : <div className="value-row" key={field.fieldId}>
+  return <div className="record-values">
+    <FormGrid fields={fields} layout={layout} render={(field) => <dl className="value-row">
       <dt>{field.name}</dt>
       <dd>{field.type === 'attachment'
         ? parseArray(record.data[field.fieldId]).map((id, index) => <button key={id} type="button"
@@ -166,15 +154,15 @@ export function RecordValues({ fields, record, session, app }: { fields: Field[]
         : field.type === 'richText' && record.data[field.fieldId]
           ? <RichTextValue html={record.data[field.fieldId]} />
           : (record.data[field.fieldId] ? displayValue(field, record.data[field.fieldId], session.profile.timeZone) : '—')}</dd>
-    </div>)}
+    </dl>} />
     {error && <div role="alert">{error}</div>}
-  </dl>;
+  </div>;
 }
 
 export function RecordEditor({
-  session, app, fields, record, onSaved, onCancel,
+  session, app, fields, layout, record, onSaved, onCancel,
 }: {
-  session: Session; app: App; fields: Field[]; record?: RecordResponse;
+  session: Session; app: App; fields: Field[]; layout: FormLayout; record?: RecordResponse;
   onSaved: (record: RecordResponse) => void; onCancel: () => void;
 }) {
   const newId = useRef('new:' + crypto.randomUUID());
@@ -331,8 +319,7 @@ export function RecordEditor({
         setState('editing');
       }}>Copy my changes onto the latest version</button>
     </section>}
-    {fields.map((field) => field.type === 'layout' ? <LayoutField field={field} key={field.fieldId} />
-      : <div className="form-field" key={field.fieldId}>
+    <FormGrid fields={fields} layout={layout} render={(field) => <div className="form-field">
       <label htmlFor={'field-' + field.fieldId} id={'field-' + field.fieldId + '-label'}>{field.name}{field.required ? ' *' : ''}</label>
       <Controller name={field.fieldId} control={form.control} defaultValue="" render={({ field: input, fieldState }) => <>
         <RuntimeField field={field} value={input.value ?? ''} session={session} app={app} disabled={busy}
@@ -340,7 +327,7 @@ export function RecordEditor({
           onPending={(names) => pending.current.set(field.fieldId, names)} />
         {fieldState.error && <p role="alert" className="error">{fieldState.error.message}</p>}
       </>} />
-    </div>)}
+    </div>} />
     <p className="muted">Date and time use {profile.timeZone}.</p>
     {allowDraft ? <details><summary>About local drafts</summary>
       <p>Drafts stay in this browser and expire after {profile.draftExpiryHours / 24} days. Signing out clears your drafts.

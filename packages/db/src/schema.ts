@@ -1,4 +1,4 @@
-import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -43,6 +43,7 @@ export const users = pgTable('users', {
 export const tenantMembers = pgTable('tenant_members', {
   tenantId: tenantId(),
   userId: uuid('user_id').notNull(),
+  canReadArchivedFields: boolean('can_read_archived_fields').notNull().default(false),
   canManageRecycleBin: boolean('can_manage_recycle_bin').notNull().default(false),
   isAdmin: boolean('is_admin').notNull().default(false),
   disabledAt: time('disabled_at'),
@@ -111,6 +112,9 @@ export const appVersions = pgTable('app_versions', {
   appId: uuid('app_id').notNull(),
   version: integer().notNull(),
   aclConfiguration: jsonb('acl_configuration').$type<AclConfiguration>().notNull().default(sql`'{"app":[],"record":[],"field":[]}'::jsonb`),
+  fieldEdits: jsonb('field_edits').$type<Record<string, FieldDefinition | null>>().notNull().default(sql`'{}'::jsonb`),
+  formLayout: jsonb('form_layout').$type<FormLayout>().notNull().default(sql`'[]'::jsonb`),
+  migrationReport: jsonb('migration_report').$type<unknown>(),
   viewConfiguration: jsonb('view_configuration').$type<ViewConfiguration>().notNull().default(sql`'{"views":[],"defaultId":null}'::jsonb`),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.version] }),
@@ -158,6 +162,7 @@ export const records = pgTable('records', {
   id: uuid().notNull().defaultRandom(),
   recordNo: bigint('record_no', { mode: 'bigint' }).notNull(),
   data: jsonb().$type<RecordData>().notNull(),
+  archivedData: jsonb('archived_data').$type<RecordData>().notNull().default(sql`'{}'::jsonb`),
   schemaVersion: integer('schema_version').notNull(),
   revision: integer().notNull().default(1),
   status: text().notNull().default('active'),

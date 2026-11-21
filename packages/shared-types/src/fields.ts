@@ -72,3 +72,21 @@ export interface LayoutElement {
 export function isRecordInput(type: FieldType) {
   return type !== 'autoNumber' && type !== 'calculation' && type !== 'layout';
 }
+
+export interface FieldDefinition {
+  fieldId: string;
+  code: string;
+  name: string;
+  type: FieldType;
+  required: boolean;
+  uniqueValue: boolean;
+  options: FieldOption[];
+  autoNumber: AutoNumberConfiguration | null;
+  searchMode: TextSearchMode | null;
+  formula: Formula | null;
+  layoutElement: LayoutElement | null;
+}
+
+export const layoutWidths = [3, 4, 6, 8, 9, 12] as const;
+export type LayoutCell = { fieldId: string; width: (typeof layoutWidths)[number] };
+export type FormLayout = { id: string; groupFieldId?: string; cells: LayoutCell[] }[];

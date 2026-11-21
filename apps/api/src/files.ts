@@ -106,7 +106,8 @@ export class FileService {
       await tx.insert(fileReferences).values({ tenantId, appId, recordId, ...target });
       await tx.update(files).set({ state: 'ATTACHED', referenceCount: file.referenceCount + 1 }).where(scope);
     }
-    for (const stale of current.filter((item) => !requested.some((entry) => same(item, entry)))) {
+    for (const stale of current.filter((item) => attachments.some(({ fieldId }) => fieldId === item.fieldId) &&
+      !requested.some((entry) => same(item, entry)))) {
       await tx.delete(fileReferences).where(and(scope, eq(fileReferences.fieldId, stale.fieldId), eq(fileReferences.fileId, stale.fileId)));
       await tx.update(files).set({
         referenceCount: sql`${files.referenceCount} - 1`,
