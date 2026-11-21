@@ -1,14 +1,23 @@
 import 'reflect-metadata';
-import { Controller, Get, Module } from '@nestjs/common';
+import { Controller, Get, Module, ServiceUnavailableException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
+import { createHealthCheck } from '@suzubase/db';
+
 @Controller()
 class HealthController {
+  private readonly checkDatabase = createHealthCheck(process.env.DATABASE_URL!);
+
   @Get('health')
-  health() {
-    return { status: 'ok' };
+  async health() {
+    try {
+      await this.checkDatabase();
+      return { status: 'ok', database: 'connected' };
+    } catch {
+      throw new ServiceUnavailableException('Database unavailable');
+    }
   }
 }
 
