@@ -5,6 +5,7 @@ import { api, appPath, download, json, message, type App, type AppSummary, type 
 import { removeDrafts } from './drafts';
 import { displayValue, RecordEditor, RecordValues } from './forms';
 import { BulkEdit } from './bulk-edit';
+import { useSelectorOptions } from './selector-options';
 import { RecycleBin } from './recycle-bin';
 import { Settings } from './settings';
 import { Directory } from './directory';
@@ -119,6 +120,7 @@ function Portal({ session, navigate, narrow }: { session: Session; navigate: (id
 
 function Records({ appId, session, narrow, leave }: { appId: string; session: Session; narrow: boolean; leave: () => void }) {
   const [app, setApp] = useState<App>();
+  const selectors = useSelectorOptions(app, session);
   const [view, setView] = useState<string>();
   const [items, setItems] = useState<Item[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
@@ -208,8 +210,9 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
     {screen === 'recycle' && <RecycleBin path={root} session={session} back={back} />}
     {screen === 'settings' && app.can.manage && (!narrow || session.profile.isAdmin) &&
       <Settings app={app} session={session} narrow={narrow} onClose={back} reload={reload} />}
+    {(screen === 'new' || screen === 'edit') && selectors.error && <p role="alert">Could not load directory options. {selectors.error}</p>}
     {(screen === 'new' || screen === 'edit') && <RecordEditor key={form?.record.id ?? 'new'}
-      session={session} app={app} fields={screen === 'edit' ? form!.fields : app.fields} layout={screen === 'edit' ? form!.formLayout : app.formLayout}
+      session={session} app={app} directory={selectors.options} fields={screen === 'edit' ? form!.fields : app.fields} layout={screen === 'edit' ? form!.formLayout : app.formLayout}
       record={screen === 'edit' ? form!.record : undefined}
       onCancel={() => screen === 'edit' ? setScreen('detail') : back()}
       onSaved={(saved) => { setFeedback('Saved to the server'); void open(saved.id); }} />}
@@ -228,7 +231,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
             json('DELETE', { revision: form.record.revision })).then(() => { back(); setFeedback('Record moved to the recycle bin'); })
             .catch((error) => setError(message(error))); }}>Confirm move</button></div>
       </section>}
-      <RecordValues fields={form.fields} layout={form.formLayout} record={form.record} session={session} app={app} />
+      <RecordValues fields={form.fields} layout={form.formLayout} record={form.record} session={session} app={app} directory={selectors.options} />
       <div className="inline">
         <button onClick={() => void api<History>(root + '/' + form.record.id + '/history', token)
           .then(setHistory).catch((error) => setError(message(error)))}>Show history</button>
@@ -267,7 +270,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
           {canCreate && <button className="primary" onClick={() => { setForm(undefined); setScreen('new'); setFeedback(''); }}>New record</button>}
         </div>
       </div>
-      {bulkEdit && app.can.edit && <BulkEdit app={app} path={root} rows={items} session={session} done={() => load()}
+      {bulkEdit && app.can.edit && <BulkEdit app={app} directory={selectors.options} path={root} rows={items} session={session} done={() => load()}
         close={() => setBulkEdit(false)} />}
       {app.archivedAt && <p className="notice">This application is archived.</p>}
       <div className="toolbar">
@@ -292,8 +295,14 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
       </div>
       <div className="inline spread">
         <p role="status">{busy ? 'Loading records…' : total === undefined ? '' : total + ' records'}</p>
-        {app.can.export && !search && <button onClick={() => void download(base + '/csv/export' + (view ? '?view=' + view : ''),
-          token, 'records.csv').catch((error) => setError(message(error)))}>Export CSV</button>}
+        {app.can.export && <div className="inline">{[false, true].map((bundle) => <button key={String(bundle)} onClick={() => {
+          const query = new URLSearchParams({
+            ...(view && { view }), ...(search && { field: search.field, query: search.query, mode: search.mode }),
+            ...(bundle && { attachments: 'true' }),
+          });
+          void download(base + '/csv/export?' + query, token, bundle ? 'records-with-attachments.zip' : 'records.csv')
+            .catch((error) => setError(message(error)));
+        }}>{bundle ? 'Export CSV and attachments' : search ? 'Export search results' : 'Export CSV'}</button>)}</div>}
       </div>
       {summary.length > 0 && <div className="inline summaries">{summary.map((entry) =>
         <span key={entry.fieldId}><strong>{app.fields.find(({ fieldId }) => fieldId === entry.fieldId)?.name}</strong> ·
@@ -305,7 +314,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
             style={selectedView?.columns.length ? { flexBasis: selectedView.columns.find(({ fieldId }) => fieldId === field.fieldId)?.width } : undefined}>
             <dt>{field.name}</dt>
             <dd>{record.data[field.fieldId]
-              ? displayValue(field, record.data[field.fieldId], session.profile.timeZone) : '—'}</dd>
+              ? displayValue(field, record.data[field.fieldId], session.profile.timeZone, selectors.options) : '—'}</dd>
           </div>)}</dl>
         </article>)}</section> : !busy && <section className="panel stack">
           <h2>No records found</h2>

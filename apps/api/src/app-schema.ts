@@ -5,7 +5,7 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiTags } from '@nestjs/swagger';
 import {
-  and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, recordReferences, recordUniqueValues, sql, TenantContext, TenantTransaction, withTenantTransaction,
+  and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, memberGroups, organizations, recordReferences, recordUniqueValues, sql, tenantMembers, users, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
 import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, optionFieldTypes, type FieldDefinition, type FormLayout, SavedView, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
@@ -256,6 +256,24 @@ export class AppSchemaService {
           ? app.titleFieldId : null,
         formLayout: this.visibleLayout(await this.layout(tx, context, appId, app.publishedSchemaVersion), definitions),
         archivedAt: app.archivedAt, localDrafts: app.localDrafts, can, schemaVersion: app.publishedSchemaVersion, fields: definitions, ...views };
+    });
+  }
+
+  async selectorOptions(context: TenantContext, appId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      const { fields, access } = await this.access(tx, context, appId, 'view');
+      const visible = new Set(fields.filter(({ fieldId }) => this.authorization.fieldDecision(access, fieldId, 'view').allowed)
+        .map(({ type }) => type));
+      const user = visible.has('user') ? await tx.select({
+        id: users.id, name: sql<string>`COALESCE(${users.displayName}, ${users.loginName}, ${users.email})`,
+        disabled: sql<boolean>`${tenantMembers.disabledAt} IS NOT NULL`,
+      }).from(users).innerJoin(tenantMembers, and(eq(users.tenantId, tenantMembers.tenantId), eq(users.id, tenantMembers.userId)))
+        .where(eq(users.tenantId, context.tenantId)).orderBy(sql`2`, users.id) : [];
+      const organization = visible.has('organization') ? await tx.select({ id: organizations.id, name: organizations.name })
+        .from(organizations).where(eq(organizations.tenantId, context.tenantId)).orderBy(organizations.name, organizations.id) : [];
+      const group = visible.has('group') ? await tx.select({ id: memberGroups.id, name: memberGroups.name })
+        .from(memberGroups).where(eq(memberGroups.tenantId, context.tenantId)).orderBy(memberGroups.name, memberGroups.id) : [];
+      return { user, organization, group };
     });
   }
 
@@ -766,6 +784,11 @@ export class AppSchemaController {
   @AllowApiToken('view')
   get(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
     return this.schemas.getPublished(context, parseInput(identifier, id));
+  }
+
+  @Get(':appId/selector-options')
+  selectorOptions(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
+    return this.schemas.selectorOptions(context, parseInput(identifier, id));
   }
 
   @Post(':appId/fields')

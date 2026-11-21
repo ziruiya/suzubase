@@ -2,9 +2,9 @@ import { BadRequestException, Injectable, NotFoundException, ServiceUnavailableE
 import {
   and, eq, recordSearchValues, records, sql, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { FieldType, RecordResponse, TextSearchMode } from '@suzubase/shared-types';
+import { type FieldDefinition } from '@suzubase/shared-types';
 import { z } from 'zod';
-import { normalizeSearch, searchableKinds, type SearchKind } from './search-projection';
+import { normalizeSearch, searchableKinds } from './search-projection';
 import { RecordQueryService } from './record-query';
 import { identifier, postgresErrorCode } from './validation';
 
@@ -30,33 +30,38 @@ function upperPrefixBound(prefix: string) {
 export class SearchService {
   constructor(private readonly query: RecordQueryService) {}
 
+  matchingRecords(tx: TenantTransaction, context: TenantContext, appId: string,
+    fields: Pick<FieldDefinition, 'fieldId' | 'type' | 'searchMode'>[], input: z.infer<typeof searchInput>) {
+    const field = fields.find(({ fieldId }) => fieldId === input.field);
+    if (!field) throw new NotFoundException('无权限');
+    const kinds = searchableKinds(field);
+    const kind = input.mode === 'tail' ? 'phone-reverse' : kinds[0];
+    if (!kind || !kinds.includes(kind) || (input.mode === 'prefix' && kind !== 'customer-id')) {
+      throw new BadRequestException('Search mode is unavailable for this field');
+    }
+    const value = normalizeSearch(kind, input.query);
+    if (!value || (kind === 'phone-reverse' && !/^[0-9]{4,}$/.test(value))) {
+      throw new BadRequestException('Enter a valid search value. Phone suffixes require at least four digits.');
+    }
+    // LIKE is not leakproof in PostgreSQL, so RLS can prevent the planner from
+    // turning it into an index range. The text_pattern_ops comparisons are
+    // leakproof and use the same byte ordering as the projection index.
+    const upper = input.mode === 'exact' ? undefined : upperPrefixBound(value);
+    const filter = input.mode === 'exact' ? eq(recordSearchValues.value, value) : and(
+      sql`${recordSearchValues.value} OPERATOR(pg_catalog.~>=~) ${value}`,
+      upper === undefined ? undefined : sql`${recordSearchValues.value} OPERATOR(pg_catalog.~<~) ${upper}`,
+    );
+    return tx.select({ recordId: recordSearchValues.recordId }).from(recordSearchValues).where(and(
+      eq(recordSearchValues.tenantId, context.tenantId), eq(recordSearchValues.appId, appId),
+      eq(recordSearchValues.fieldId, input.field), eq(recordSearchValues.kind, kind), filter,
+    )).as('matches');
+  }
+
   async search(context: TenantContext, appId: string, input: z.infer<typeof searchInput>) {
     try {
       return await withTenantTransaction(context, async (tx) => {
         const scope = await this.query.scope(tx, context, appId, input.view);
-        const field = scope.fields.find(({ fieldId }) => fieldId === input.field);
-        if (!field) throw new NotFoundException('无权限');
-        const kinds = searchableKinds(field);
-        const kind = input.mode === 'tail' ? 'phone-reverse' : kinds[0];
-        if (!kind || !kinds.includes(kind) || (input.mode === 'prefix' && kind !== 'customer-id')) {
-          throw new BadRequestException('Search mode is unavailable for this field');
-        }
-        const value = normalizeSearch(kind, input.query);
-        if (!value || (kind === 'phone-reverse' && !/^[0-9]{4,}$/.test(value))) {
-          throw new BadRequestException('Enter a valid search value. Phone suffixes require at least four digits.');
-        }
-        // LIKE is not leakproof in PostgreSQL, so RLS can prevent the planner from
-        // turning it into an index range. The text_pattern_ops comparisons are
-        // leakproof and use the same byte ordering as the projection index.
-        const upper = input.mode === 'exact' ? undefined : upperPrefixBound(value);
-        const filter = input.mode === 'exact' ? eq(recordSearchValues.value, value) : and(
-          sql`${recordSearchValues.value} OPERATOR(pg_catalog.~>=~) ${value}`,
-          upper === undefined ? undefined : sql`${recordSearchValues.value} OPERATOR(pg_catalog.~<~) ${upper}`,
-        );
-        const matches = tx.select({ recordId: recordSearchValues.recordId }).from(recordSearchValues).where(and(
-          eq(recordSearchValues.tenantId, context.tenantId), eq(recordSearchValues.appId, appId),
-          eq(recordSearchValues.fieldId, input.field), eq(recordSearchValues.kind, kind), filter,
-        )).as('matches');
+        const matches = this.matchingRecords(tx, context, appId, scope.fields, input);
         await tx.execute(sql`SET LOCAL statement_timeout = '1500ms'`);
         const started = performance.now();
         // A single statement supplies both the count and its first page from one snapshot.

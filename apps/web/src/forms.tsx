@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Controller, useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
+import { directoryType, type SelectorOptions } from './selector-options';
 import { FormGrid } from './form-layout';
 import { RichTextEditor, RichTextValue, richTextSummary } from './rich-text';
 import { draftKey, recoverDraft, removeDrafts, writeDraft, type Draft, type DraftScope } from './drafts';
@@ -40,7 +41,11 @@ function inputValue(field: Field, value: string, timeZone: string) {
   return value;
 }
 
-export function displayValue(field: Field, value: string, timeZone: string) {
+export function displayValue(field: Field, value: string, timeZone: string, directory?: SelectorOptions) {
+  if (directoryType(field.type)) {
+    const option = directory?.[field.type].find(({ id }) => id === value);
+    return option ? option.name + (option.disabled ? '（已停用）' : '') : value;
+  }
   if (field.type === 'richText') return richTextSummary(value);
   if (optionFieldTypes.has(field.type)) {
     const values = multiOptionFieldTypes.has(field.type) ? parseArray(value) : [value];
@@ -55,10 +60,10 @@ export function displayValue(field: Field, value: string, timeZone: string) {
 }
 
 export function RuntimeField({
-  field, value, onChange, session, app, onPending, disabled,
+  field, value, onChange, session, app, onPending, disabled, directory,
 }: {
   field: Field; value: string; onChange: (value: string) => void; session: Session; app: App;
-  onPending: (names: string[]) => void; disabled: boolean;
+  onPending: (names: string[]) => void; disabled: boolean; directory?: SelectorOptions;
 }) {
   const [pending, setPending] = useState<{ file: File; error?: string }[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -86,7 +91,17 @@ export function RuntimeField({
     onPending(next.map(({ file }) => file.name));
   }
   const id = 'field-' + field.fieldId;
-  if (!field.editable) return <output id={id}>{value ? displayValue(field, value, session.profile.timeZone) : '—'}</output>;
+  if (!field.editable) return <output id={id}>{value ? displayValue(field, value, session.profile.timeZone, directory) : '—'}</output>;
+  if (directoryType(field.type)) {
+    const options = directory?.[field.type];
+    return <select id={id} value={value} disabled={disabled || !options} onChange={(event) => onChange(event.target.value)}>
+      <option value="">{options ? 'Select…' : 'Loading options…'}</option>
+      {value && !options?.some(({ id }) => id === value) && <option value={value}>{value}</option>}
+      {options?.map(({ id, name, disabled }) => <option key={id} value={id} disabled={disabled}>
+        {name}{disabled ? '（已停用）' : ''}
+      </option>)}
+    </select>;
+  }
   if (field.type === 'richText') return <RichTextEditor id={id} html={value} disabled={disabled} onChange={onChange} />;
   if (field.type === 'multiline') return <textarea id={id} rows={5} value={value} onChange={(event) => onChange(event.target.value)} disabled={disabled} />;
   if (multiOptionFieldTypes.has(field.type)) {
@@ -142,7 +157,7 @@ export function RuntimeField({
     onChange={(event) => onChange(event.target.value)} />;
 }
 
-export function RecordValues({ fields, layout, record, session, app }: { fields: Field[]; layout: FormLayout; record: RecordResponse; session: Session; app: App }) {
+export function RecordValues({ fields, layout, record, session, app, directory }: { directory?: SelectorOptions; fields: Field[]; layout: FormLayout; record: RecordResponse; session: Session; app: App }) {
   const [error, setError] = useState('');
   return <div className="record-values">
     <FormGrid fields={fields} layout={layout} render={(field) => <dl className="value-row">
@@ -153,16 +168,16 @@ export function RecordValues({ fields, layout, record, session, app }: { fields:
             .catch((error) => setError(message(error)))}>Download attachment {index + 1}</button>)
         : field.type === 'richText' && record.data[field.fieldId]
           ? <RichTextValue html={record.data[field.fieldId]} />
-          : (record.data[field.fieldId] ? displayValue(field, record.data[field.fieldId], session.profile.timeZone) : '—')}</dd>
+          : (record.data[field.fieldId] ? displayValue(field, record.data[field.fieldId], session.profile.timeZone, directory) : '—')}</dd>
     </dl>} />
     {error && <div role="alert">{error}</div>}
   </div>;
 }
 
 export function RecordEditor({
-  session, app, fields, layout, record, onSaved, onCancel,
+  session, app, fields, layout, record, onSaved, onCancel, directory,
 }: {
-  session: Session; app: App; fields: Field[]; layout: FormLayout; record?: RecordResponse;
+  session: Session; app: App; fields: Field[]; layout: FormLayout; directory?: SelectorOptions; record?: RecordResponse;
   onSaved: (record: RecordResponse) => void; onCancel: () => void;
 }) {
   const newId = useRef('new:' + crypto.randomUUID());
@@ -322,7 +337,7 @@ export function RecordEditor({
     <FormGrid fields={fields} layout={layout} render={(field) => <div className="form-field">
       <label htmlFor={'field-' + field.fieldId} id={'field-' + field.fieldId + '-label'}>{field.name}{field.required ? ' *' : ''}</label>
       <Controller name={field.fieldId} control={form.control} defaultValue="" render={({ field: input, fieldState }) => <>
-        <RuntimeField field={field} value={input.value ?? ''} session={session} app={app} disabled={busy}
+        <RuntimeField field={field} value={input.value ?? ''} session={session} app={app} disabled={busy} directory={directory}
           onChange={(value) => { input.onChange(value); if (!latest) setState('editing'); }}
           onPending={(names) => pending.current.set(field.fieldId, names)} />
         {fieldState.error && <p role="alert" className="error">{fieldState.error.message}</p>}

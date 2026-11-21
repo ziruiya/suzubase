@@ -1,7 +1,7 @@
 import { richTextPlain } from './rich-text';
 import {
   BadRequestException, Body, ConflictException, Controller, Get, HttpException, Injectable,
-  NotFoundException, Param, Post, Query, StreamableFile, UseGuards,
+  NotFoundException, Param, Post, Query, ServiceUnavailableException, StreamableFile, UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiProduces, ApiTags } from '@nestjs/swagger';
 import { and, csvJobs, eq, records, sql, TenantContext, TenantTransaction, withTenantTransaction } from '@suzubase/db';
@@ -15,12 +15,18 @@ import { FileService } from './files';
 import { AuthenticatedTenant, SessionGuard } from './identity';
 import { RecordQueryService } from './record-query';
 import { RecordService } from './records';
-import { identifier, parseInput } from './validation';
+import { SearchService, searchInput } from './search';
+import { identifier, parseInput, postgresErrorCode } from './validation';
 
 const preflightInput = z.strictObject({
   csv: z.string().max(200000),
   mapping: z.record(z.string().max(128), z.union([identifier, z.literal('lookup'), z.null()])),
 });
+const attachmentQuery = z.enum(['true', 'false']).optional();
+const exportQuery = z.union([
+  z.strictObject({ view: identifier.optional(), attachments: attachmentQuery }),
+  searchInput.extend({ attachments: attachmentQuery }),
+]);
 const batchInput = z.strictObject({ offset: z.int().min(0).max(1000), size: z.int().min(1).max(50).default(50) });
 type Job = typeof csvJobs.$inferSelect;
 
@@ -64,6 +70,7 @@ export class CsvService {
     private readonly records: RecordService,
     private readonly query: RecordQueryService,
     private readonly files: FileService,
+    private readonly search: SearchService,
   ) {}
 
   async preflight(context: TenantContext, appId: string, input: z.infer<typeof preflightInput>) {
@@ -171,13 +178,21 @@ export class CsvService {
     });
   }
 
-  async export(context: TenantContext, appId: string, viewId: string | undefined, bundle: boolean) {
+  async export(context: TenantContext, appId: string, { view: viewId, attachments, ...filters }: z.infer<typeof exportQuery>) {
+    const bundle = attachments === 'true';
     const { csv, attachmentIds, richText } = await withTenantTransaction(context, async (tx) => {
       const { where, fields, data, view, sort, descending } = await this.query.scope(tx, context, appId, viewId, 'export');
       const selected = (view?.columns.length
         ? view.columns.map(({ fieldId }) => fields.find((field) => field.fieldId === fieldId)!)
         : fields).filter(({ type }) => type !== 'layout');
-      const rows = await tx.select({ data }).from(records).where(where)
+      const eligible = tx.select({ data }).from(records).$dynamic();
+      const search = 'field' in filters ? filters : undefined;
+      if (search) {
+        const hits = this.search.matchingRecords(tx, context, appId, fields, search);
+        eligible.innerJoin(hits, eq(records.id, hits.recordId));
+      }
+      await tx.execute(sql`SET LOCAL statement_timeout = '5000ms'`);
+      const rows = await eligible.where(where)
         .orderBy(...(sort ? [sql`${sort} ${descending ? sql`DESC` : sql`ASC`} NULLS LAST`, records.recordNo] : [records.recordNo]))
         .limit(10001);
       if (rows.length > 10000) throw new BadRequestException('Export exceeds 10,000 rows. Narrow the view filters.');
@@ -188,6 +203,9 @@ export class CsvService {
         attachmentIds: bundle ? [...new Set(rows.flatMap(({ data }) => selected
           .filter(({ type }) => type === 'attachment').flatMap(({ fieldId }) => JSON.parse(data[fieldId] || '[]') as string[])))] : [],
       };
+    }).catch((error) => {
+      if (postgresErrorCode(error) === '57014') throw new ServiceUnavailableException('Export timed out. Narrow the filters and retry.');
+      throw error;
     });
     if (!bundle) return csvFile(csv, richText ? 'records-rich-text-exported-as-plain-text.csv' : 'records.csv');
     if (attachmentIds.length > 256) throw new BadRequestException('Attachment bundle exceeds 256 files. Narrow the view filters.');
@@ -241,9 +259,6 @@ export class CsvController {
   @Get('export')
   @ApiProduces('text/csv', 'application/zip')
   export(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Query() query: unknown) {
-    const { view, attachments } = parseInput(z.strictObject({
-      view: identifier.optional(), attachments: z.enum(['true', 'false']).optional(),
-    }), query);
-    return this.csv.export(context, parseInput(identifier, appId), view, attachments === 'true');
+    return this.csv.export(context, parseInput(identifier, appId), parseInput(exportQuery, query));
   }
 }

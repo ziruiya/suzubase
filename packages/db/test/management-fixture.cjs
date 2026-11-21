@@ -6,14 +6,16 @@ async function managementFixture() {
   const app = await createApp(token, 'managed');
   const appUrl = '/apps/' + app.id;
   const call = (status, path, method, body) => expectRequest(status, appUrl + path, { method, body, token });
-  const title = await call(201, '/fields', 'POST', { name: 'Title', code: 'title', type: 'text' });
+  const title = await call(201, '/fields', 'POST', { name: 'Title', code: 'b-title', type: 'text' });
   const amount = await call(201, '/fields', 'POST', { name: 'Amount', code: 'amount', type: 'number' });
   const notes = await call(201, '/fields', 'POST', { name: 'Notes', code: 'notes', type: 'richText' });
+  const region = await call(201, '/fields', 'POST', { name: 'Region', code: 'region', type: 'organization' });
+  const team = await call(201, '/fields', 'POST', { name: 'Team', code: 'team', type: 'group' });
   await publish(token, app.id);
   await call(201, '/records', 'POST', { data: { [title.fieldId]: 'Active', [amount.fieldId]: '20' } });
   const record = await call(201, '/records', 'POST', { data: { [title.fieldId]: 'Deleted', [amount.fieldId]: '100' } });
   await call(200, '/records/' + record.id, 'DELETE', { revision: record.revision });
-  return { owner, token, app, fields: { title, amount, notes } };
+  return { owner, token, app, fields: { title, amount, notes, region, team } };
 }
 
 if (require.main === module) {

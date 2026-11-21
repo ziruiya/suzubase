@@ -84,10 +84,20 @@ test('Gate 1 browser directory, layout drag and undo, saved views, rich text, an
     await page.getByText('Record 2 was restored.').waitFor();
     await button('Back to records').click();
     await button('Record 2').waitFor();
+    await button('Batch edit').click();
+    const batch = page.getByRole('region', { name: 'Batch edit' });
+    await batch.getByLabel('Record 2', { exact: true }).check();
+    await batch.getByLabel('Field to edit').selectOption(fields.title.fieldId);
+    await batch.getByLabel('New value for Title').fill('Restored customer');
+    await button('Update selected records').click();
+    await batch.getByText('Record 2 · Saved', { exact: true }).waitFor();
+    await button('Close batch edit').click();
 
     await button('Record 1').click();
     await button('Edit').click();
     const rich = page.getByRole('textbox', { name: 'Notes' });
+    await page.getByLabel('Region', { exact: true }).selectOption({ label: 'Tokyo' });
+    await page.getByLabel('Team', { exact: true }).selectOption({ label: 'Sales Japan' });
     await rich.fill('Formatted note');
     await rich.press('ControlOrMeta+a');
     await button('Bold').click();
@@ -95,6 +105,8 @@ test('Gate 1 browser directory, layout drag and undo, saved views, rich text, an
     const formatted = page.locator('.rich-text-value b, .rich-text-value strong');
     await formatted.waitFor();
     assert.equal(await formatted.innerText(), 'Formatted note');
+    await page.locator('.record-values').getByText('Tokyo', { exact: true }).waitFor();
+    await page.locator('.record-values').getByText('Sales Japan', { exact: true }).waitFor();
     await button('Orders').click();
     await button('Settings').click();
     await button('Permissions').click();

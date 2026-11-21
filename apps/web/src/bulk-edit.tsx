@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { api, json, message, type App, type Session } from './api';
+import type { SelectorOptions } from './selector-options';
 import { normalizeInForm, RuntimeField } from './forms';
 
 type Row = { id: string; revision: number; recordNo: string };
@@ -15,8 +16,8 @@ function resultMessage(outcome: Outcome) {
   return 'Validation failed';
 }
 
-export function BulkEdit({ app, path, rows, session, done, close }: {
-  app: App; path: string; rows: Row[]; session: Session; done: () => Promise<void>; close: () => void;
+export function BulkEdit({ app, path, rows, session, done, close, directory }: {
+  app: App; directory?: SelectorOptions; path: string; rows: Row[]; session: Session; done: () => Promise<void>; close: () => void;
 }) {
   const [selection, setSelection] = useState<string[]>([]);
   const [fieldId, setFieldId] = useState('');
@@ -71,7 +72,7 @@ export function BulkEdit({ app, path, rows, session, done, close }: {
         {!clear && <>
           <label htmlFor={'field-' + field.fieldId} id={'field-' + field.fieldId + '-label'}>New value for {field.name}</label>
           <RuntimeField key={field.fieldId} field={field} value={value} onChange={setValue} onPending={(names) => setPending(names.length > 0)}
-            session={session} app={app} disabled={busy} />
+            session={session} app={app} disabled={busy} directory={directory} />
         </>}
       </div>}
       <button type="submit" disabled={!field || !selection.length || busy || pending && !clear}>Update selected records</button>
