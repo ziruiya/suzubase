@@ -18,7 +18,7 @@ type Search = { field: string; mode: string; query: string };
 type Archive = { data: Record<string, string>; definitions: Record<string, Field> };
 type History = {
   events: { eventId: string; actorLabel: string; kind: string; occurredAt: string; schemaVersion: number;
-    changes: { fieldId: string; oldValue: string | null; newValue: string | null }[] }[];
+    changes: { fieldId: string; rowId?: string; childFieldId?: string; rowChange?: string; oldValue: string | null; newValue: string | null }[] }[];
   schemas: Record<number, Field[]>;
 };
 
@@ -252,7 +252,11 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
           {event.changes.map((change) => {
             const field = history.schemas[event.schemaVersion]?.find(({ fieldId }) => fieldId === change.fieldId);
             const format = (value: string | null) => value === null ? '—' : field ? displayValue(field, value, session.profile.timeZone) : value;
-            return <div key={change.fieldId}>{field?.name ?? change.fieldId} · {format(change.oldValue)} → {format(change.newValue)}</div>;
+            const child = field?.table?.fields.find(({ fieldId }) => fieldId === change.childFieldId);
+            return <div key={[change.fieldId, change.rowId, change.childFieldId, change.rowChange].join('/')}>
+              {field?.name ?? change.fieldId}{child && ' · ' + child.name}{change.rowId && ' · Row ' + change.rowId}
+              {change.rowChange && ' · ' + change.rowChange} · {format(change.oldValue)} → {format(change.newValue)}
+            </div>;
           })}
         </li>)}</ol></section>}
       {archive && <section aria-label="Archived fields"><h2>Archived fields</h2>
@@ -315,7 +319,7 @@ function Records({ appId, session, narrow, leave }: { appId: string; session: Se
           <dl className={selectedView?.columns.length ? 'view-columns' : undefined}>{columns.map((field) => <div key={field.fieldId}
             style={selectedView?.columns.length ? { flexBasis: selectedView.columns.find(({ fieldId }) => fieldId === field.fieldId)?.width } : undefined}>
             <dt>{field.name}</dt>
-            <dd>{record.data[field.fieldId]
+            <dd>{field.table ? record.data[field.fieldId] ? record.data[field.fieldId] + ' rows' : '—' : record.data[field.fieldId]
               ? displayValue(field, record.data[field.fieldId], session.profile.timeZone, selectors.options)
               : field.lookup ? record.data[field.lookup.localKeyFieldId] ?? '—' : '—'}</dd>
           </div>)}</dl>

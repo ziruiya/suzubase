@@ -1,4 +1,4 @@
-import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type LookupConfiguration, type RelatedConfiguration, type ViewCondition } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type LookupConfiguration, type RelatedConfiguration, type TableConfiguration, type ViewCondition } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey,
@@ -136,6 +136,7 @@ export const fields = pgTable('fields', {
   searchMode: text('search_mode').$type<TextSearchMode>(),
   formula: jsonb().$type<Formula>(),
   lookup: jsonb().$type<LookupConfiguration>(),
+  table: jsonb().$type<TableConfiguration>(),
   related: jsonb().$type<RelatedConfiguration>(),
   layoutElement: jsonb('layout_element').$type<LayoutElement>(),
   autoNumber: jsonb('auto_number').$type<AutoNumberConfiguration>(),
@@ -185,6 +186,30 @@ export const records = pgTable('records', {
   foreignKey({ columns: [t.tenantId, t.createdBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
   foreignKey({ columns: [t.tenantId, t.updatedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
   foreignKey({ columns: [t.tenantId, t.deletedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
+export const recordTableRows = pgTable('record_table_rows', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  recordId: uuid('record_id').notNull(),
+  fieldId: uuid('field_id').notNull(),
+  rowId: uuid('row_id').notNull(),
+  rowOrder: integer('row_order').notNull(),
+  data: jsonb().$type<RecordData>().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.recordId, t.fieldId, t.rowId] }),
+  unique().on(t.tenantId, t.appId, t.recordId, t.fieldId, t.rowOrder),
+  check('record_table_rows_data_object', sql`jsonb_typeof(${t.data}) = 'object'`),
+  foreignKey({
+    name: 'record_table_rows_record_fk',
+    columns: [t.tenantId, t.appId, t.recordId],
+    foreignColumns: [records.tenantId, records.appId, records.id],
+  }),
+  foreignKey({
+    name: 'record_table_rows_field_fk',
+    columns: [t.tenantId, t.appId, t.fieldId],
+    foreignColumns: [fields.tenantId, fields.appId, fields.fieldId],
+  }),
 ]);
 
 export const recordReferences = pgTable('record_references', {

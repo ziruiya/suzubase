@@ -5,10 +5,10 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiHeader, ApiProduces, ApiTags } from '@nestjs/swagger';
 import {
-  and, appCounters, eq, gt, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordReferences, recordUniqueValues, records, sql, TenantContext,
+  and, appCounters, eq, gt, inArray, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordReferences, recordTableRows, recordUniqueValues, records, sql, TenantContext,
   TenantTransaction, users, withTenantTransaction,
 } from '@suzubase/db';
-import { FieldChange, FieldDefinition, isRecordInput, lookupTargets, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse } from '@suzubase/shared-types';
+import { FieldChange, FieldDefinition, isRecordInput, lookupTargets, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse, TableRow } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { assignAutoNumber, numberScope } from './auto-number';
 import { AppSchemaService } from './app-schema';
@@ -19,6 +19,7 @@ import { fieldChanges, serializeRecord, writeRecordEvent } from './record-events
 import { FileService, fileIds } from './files';
 import { SearchService, searchInput } from './search';
 import { projectSearchValues } from './search-projection';
+import { prepareTableRows, replaceTableRows, tableRowScope } from './table-rows';
 import { uniqueKey } from './schema-preflight';
 import { calculateFields } from './formula';
 import { normalizeValue } from './field-values';
@@ -187,6 +188,8 @@ export class RecordService {
         }
       }
     }
+    const tables = await prepareTableRows(fields, fieldData, new Map(), true, (type, value) =>
+      this.validDirectoryValue(tx, context, type, value));
     const data = await this.normalizeData(tx, context, appId, schemaVersion, fieldData);
     for (const field of fields) {
       const config = field.autoNumber;
@@ -205,21 +208,25 @@ export class RecordService {
       createdBy: context.userId, updatedBy: context.userId,
     }).returning();
     const record = serializeRecord(row);
+    await replaceTableRows(tx, { ...identity, recordId: record.id }, tables.replacements);
     await this.saveLookupReferences(tx, context, record, references);
     await this.reserveUniqueValues(tx, context, record);
     await this.reconcileFiles(tx, context, record);
     await projectSearchValues(tx, context, record, fields);
-    await writeRecordEvent(tx, context, record, 'created', fieldChanges({}, data), source);
+    await writeRecordEvent(tx, context, record, 'created', [...fieldChanges({}, data), ...tables.changes], source);
     if (key !== undefined) {
       await tx.insert(recordCreateKeys).values({
-        ...identity, userId: context.userId, key, recordId: record.id, response: record,
+        ...identity, userId: context.userId, key, recordId: record.id,
+        response: { ...record, data: { ...record.data, ...Object.fromEntries(
+          [...tables.replacements].map(([id, rows]) => [id, JSON.stringify(rows)]),
+        ) } },
       });
     }
     if (source === 'import') return this.visibleRecord(access, record);
     if (access.acl.record.some(({ action }) => action === 'view')) {
       return this.findRecord(tx, context, appId, record.id);
     }
-    return this.visibleRecord(access, record);
+    return this.withTableRows(tx, context, this.visibleRecord(access, record), access);
   }
 
   async get(context: TenantContext, appId: string, recordId: string) {
@@ -250,7 +257,30 @@ export class RecordService {
       const hasRecordRules = access.acl.record.some((rule) => rule.action === 'view' || rule.action === action);
       throw new NotFoundException(hasRecordRules ? '无权限' : undefined);
     }
-    return serializeRecord(row);
+    const record = serializeRecord(row);
+    return raw || deleted ? record : this.withTableRows(tx, context, record, access);
+  }
+
+  private async readTableRows(tx: TenantTransaction, context: TenantContext, appId: string, recordId: string, ids: string[]) {
+    const result = new Map<string, TableRow[]>();
+    if (!ids.length) return result;
+    const rows = await tx.select({ fieldId: recordTableRows.fieldId, rowId: recordTableRows.rowId, data: recordTableRows.data })
+      .from(recordTableRows).where(and(tableRowScope({ tenantId: context.tenantId, appId, recordId }),
+        inArray(recordTableRows.fieldId, ids))).orderBy(recordTableRows.rowOrder);
+    for (const { fieldId, ...row } of rows) {
+      const existing = result.get(fieldId);
+      if (existing) existing.push(row);
+      else result.set(fieldId, [row]);
+    }
+    return result;
+  }
+
+  private async withTableRows(tx: TenantTransaction, context: TenantContext, record: RecordResponse, access: RecordAccess) {
+    const ids = [...access.types].filter(([id, type]) => type === 'table' &&
+      this.authorization.fieldDecision(access, id, 'view').allowed).map(([id]) => id);
+    const rows = await this.readTableRows(tx, context, record.appId, record.id, ids);
+    for (const id of ids) record.data[id] = JSON.stringify(rows.get(id) ?? []);
+    return record;
   }
 
   private visibleRecord(access: RecordAccess, record: RecordResponse): RecordResponse {
@@ -278,7 +308,7 @@ export class RecordService {
         candidate = { ...current.data };
       } else if ('fieldId' in input) {
         const type = inputTypes.get(input.fieldId);
-        if (!type || !isRecordInput(type)) throw new BadRequestException([{ field: input.fieldId, message: 'Field is not writable in this record version' }]);
+        if (!type || type === 'table' || !isRecordInput(type)) throw new BadRequestException([{ field: input.fieldId, message: 'Field is not writable in this record version' }]);
         this.assertEditable(access, { [input.fieldId]: input.value ?? '' }, definitions);
         candidate = Object.fromEntries(Object.entries(current.data).filter(([id]) => isRecordInput(inputTypes.get(id))));
         if (input.value === null) delete candidate[input.fieldId];
@@ -295,6 +325,10 @@ export class RecordService {
       if (refresh && 'lookupFieldId' in input && input.confirmation !== refresh.confirmation) {
         throw new ConflictException('Lookup values changed. Preview again before confirming.');
       }
+      const tableIds = definitions.filter((field) => field.table && Object.hasOwn(candidate, field.fieldId)).map(({ fieldId }) => fieldId);
+      const before = await this.readTableRows(tx, context, appId, recordId, tableIds);
+      const tables = await prepareTableRows(definitions, candidate, before, false, (type, value) =>
+        this.validDirectoryValue(tx, context, type, value));
       const data = refresh ? { ...current.data } :
         await this.normalizeData(tx, context, appId, current.schemaVersion, candidate, { data: current.data, fields });
       const references = refresh ? [] : await this.resolveLookups(tx, context, definitions, data, current.data);
@@ -311,12 +345,13 @@ export class RecordService {
       )).returning();
       if (!row) this.rejectRevision(await this.findRecord(tx, context, appId, recordId));
       const updated = serializeRecord(row);
+      await replaceTableRows(tx, { tenantId: context.tenantId, appId, recordId }, tables.replacements);
       await this.saveLookupReferences(tx, context, updated, references);
       await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, recordId));
       await this.reserveUniqueValues(tx, context, updated);
       await this.reconcileFiles(tx, context, updated);
       await projectSearchValues(tx, context, updated, definitions);
-      await writeRecordEvent(tx, context, updated, refresh ? 'lookup-refetched' : 'updated', fieldChanges(current.data, data));
+      await writeRecordEvent(tx, context, updated, refresh ? 'lookup-refetched' : 'updated', [...fieldChanges(current.data, data), ...tables.changes]);
       return this.findRecord(tx, context, appId, recordId);
     });
   }
@@ -499,7 +534,7 @@ export class RecordService {
 
   async list(context: TenantContext, appId: string, { after, limit = 50, view }: z.infer<typeof pageInput>) {
     return withTenantTransaction(context, async (tx) => {
-      const { where, sort, sortValue, numericSort, descending, data } = await this.query.scope(tx, context, appId, view);
+      const { where, sort, sortValue, numericSort, descending, data, fields } = await this.query.scope(tx, context, appId, view);
       let afterCondition = after === undefined ? undefined : gt(records.recordNo, BigInt(after));
       if (after !== undefined && sort) {
         const [cursor] = await tx.select({ value: sortValue! }).from(records)
@@ -523,8 +558,21 @@ export class RecordService {
         createdAt: records.createdAt, createdBy: records.createdBy, updatedAt: records.updatedAt,
         updatedBy: records.updatedBy, deletedAt: records.deletedAt, deletedBy: records.deletedBy, data,
       }).from(records).where(and(where, afterCondition)).orderBy(...order).limit(limit + 1);
+      const items = rows.slice(0, limit).map(serializeRecord);
+      const tables = fields.filter(({ type }) => type === 'table');
+      if (items.length && tables.length) {
+        const counts = await tx.select({
+          recordId: recordTableRows.recordId, fieldId: recordTableRows.fieldId, count: sql<string>`count(*)::text`,
+        }).from(recordTableRows).where(and(eq(recordTableRows.tenantId, context.tenantId), eq(recordTableRows.appId, appId),
+          inArray(recordTableRows.recordId, items.map(({ id }) => id)), inArray(recordTableRows.fieldId, tables.map(({ fieldId }) => fieldId)),
+        )).groupBy(recordTableRows.recordId, recordTableRows.fieldId);
+        const byRecordField = new Map(counts.map(({ recordId, fieldId, count }) => [recordId + fieldId, count]));
+        for (const item of items) {
+          for (const { fieldId } of tables) item.data[fieldId] = byRecordField.get(item.id + fieldId) ?? '0';
+        }
+      }
       return {
-        items: rows.slice(0, limit).map(serializeRecord),
+        items,
         nextCursor: rows.length > limit ? rows[limit - 1].recordNo.toString() : null,
       };
     });

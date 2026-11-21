@@ -1,5 +1,5 @@
 import { Temporal } from '@js-temporal/polyfill';
-import { multiOptionFieldTypes, optionFieldTypes, type FormLayout, type RecordData, type RecordResponse } from '@suzubase/shared-types';
+import { multiOptionFieldTypes, optionFieldTypes, type FormLayout, type RecordData, type RecordResponse, type TableField, type TableRow } from '@suzubase/shared-types';
 import { useEffect, useRef, useState } from 'react';
 import { Controller, useForm, useWatch } from 'react-hook-form';
 import { z } from 'zod';
@@ -26,9 +26,15 @@ function parseArray(value: string) {
   }
 }
 
-export function normalizeInForm(field: Field, value: string, timeZone: string) {
+export function normalizeInForm(field: Field, value: string, timeZone: string): string {
   if (field.required && (!value || (field.type === 'richText' && !richTextSummary(value)) || value === '[]' && (multiOptionFieldTypes.has(field.type) || field.type === 'attachment'))) {
     throw new Error('Required');
+  }
+  if (field.table && value) {
+    return JSON.stringify(tableRows(value).map(({ rowId, data }) => ({
+      rowId, data: Object.fromEntries(field.table!.fields.filter(({ type }) => type !== 'calculation').map((child) =>
+        [child.fieldId, normalizeInForm(runtimeChild(child, true), data[child.fieldId] ?? '', timeZone)])),
+    })));
   }
   if (field.type === 'datetime' && value && !value.endsWith('Z')) {
     return Temporal.PlainDateTime.from(value).toZonedDateTime(timeZone, { disambiguation: 'reject' }).toInstant().toString();
@@ -62,10 +68,10 @@ export function displayValue(field: Field, value: string, timeZone: string, dire
 }
 
 export function RuntimeField({
-  field, value, onChange, session, app, onPending, disabled, directory,
+  field, value, onChange, session, app, onPending, disabled, directory, controlId,
 }: {
   field: Field; value: string; onChange: (value: string) => void; session: Session; app: App;
-  onPending: (names: string[]) => void; disabled: boolean; directory?: SelectorOptions;
+  onPending: (names: string[]) => void; disabled: boolean; directory?: SelectorOptions; controlId?: string;
 }) {
   const [pending, setPending] = useState<{ file: File; error?: string }[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -92,7 +98,7 @@ export function RuntimeField({
     setUploading(false);
     onPending(next.map(({ file }) => file.name));
   }
-  const id = 'field-' + field.fieldId;
+  const id = controlId ?? 'field-' + field.fieldId;
   if (!field.editable) return <output id={id}>{value ? displayValue(field, value, session.profile.timeZone, directory) : '—'}</output>;
   if (directoryType(field.type)) {
     const options = directory?.[field.type];
@@ -159,12 +165,68 @@ export function RuntimeField({
     onChange={(event) => onChange(event.target.value)} />;
 }
 
+function tableRows(value: string): TableRow[] {
+  try {
+    const rows = JSON.parse(value || '[]');
+    return Array.isArray(rows) ? rows : [];
+  } catch {
+    return [];
+  }
+}
+
+function runtimeChild(child: TableField, editable: boolean): Field {
+  return { ...child, editable: editable && child.type !== 'calculation', layoutElement: null, searchMode: null, autoNumber: null };
+}
+
+function Subtable({ field, value, session, app, directory, disabled, creating, onChange }: {
+  field: Field; value: string; session: Session; app: App; directory?: SelectorOptions;
+  disabled?: boolean; creating?: boolean; onChange?: (value: string) => void;
+}) {
+  const table = field.table!;
+  const rows = tableRows(value);
+  const canEdit = field.editable && !!onChange && !disabled;
+  function move(index: number, offset: number) {
+    const copy = [...rows];
+    [copy[index], copy[index + offset]] = [copy[index + offset], copy[index]];
+    onChange?.(JSON.stringify(copy));
+  }
+  return <div className="stack">
+    {rows.length === 0 && <p>No rows</p>}
+    {rows.map((row, index) => <details className="panel" key={row.rowId}>
+      <summary>Row {index + 1}</summary>
+      <div className="stack">
+        {table.fields.map((child) => {
+          const id = 'row-' + row.rowId + '-field-' + child.fieldId;
+          return <div className="form-field" key={child.fieldId}>
+            <label htmlFor={id} id={id + '-label'}>{child.name}{child.required ? ' *' : ''}</label>
+            <RuntimeField controlId={id} field={runtimeChild(child, field.editable && !!onChange)} value={row.data[child.fieldId] ?? ''}
+              session={session} app={app} directory={directory} disabled={!!disabled} onPending={() => undefined}
+              onChange={(next) => onChange?.(JSON.stringify(rows.map((item) => item.rowId === row.rowId
+                ? { ...item, data: { ...item.data, [child.fieldId]: next } } : item)))} />
+          </div>;
+        })}
+        {canEdit && <div className="inline">
+          {(creating || table.reorderRows) && <>
+            <button type="button" disabled={index === 0} onClick={() => move(index, -1)}>Move up</button>
+            <button type="button" disabled={index === rows.length - 1} onClick={() => move(index, 1)}>Move down</button>
+          </>}
+          {(creating || table.deleteRows) && <button type="button" disabled={rows.length <= table.minRows}
+            onClick={() => onChange?.(JSON.stringify(rows.filter(({ rowId }) => rowId !== row.rowId)))}>Remove row</button>}
+        </div>}
+      </div>
+    </details>)}
+    {canEdit && (creating || table.addRows) && <button type="button" disabled={rows.length >= table.maxRows}
+      onClick={() => onChange?.(JSON.stringify([...rows, { rowId: crypto.randomUUID(), data: {} }]))}>Add row</button>}
+  </div>;
+}
+
 export function RecordValues({ fields, layout, record, session, app, directory, onRefresh }: { onRefresh?: (record: RecordResponse) => void; directory?: SelectorOptions; fields: Field[]; layout: FormLayout; record: RecordResponse; session: Session; app: App }) {
   const [error, setError] = useState('');
   return <div className="record-values">
     <FormGrid fields={fields} layout={layout} render={(field) => <dl className="value-row">
       <dt>{field.name}</dt>
-      <dd>{field.related ? <RelatedRecords token={session.token} appId={app.id} recordId={record.id} fieldId={field.fieldId} /> : field.lookup ? <>
+      <dd>{field.table ? <Subtable field={field} value={record.data[field.fieldId] ?? ''} session={session} app={app} directory={directory} />
+        : field.related ? <RelatedRecords token={session.token} appId={app.id} recordId={record.id} fieldId={field.fieldId} /> : field.lookup ? <>
         {record.data[field.lookup.localKeyFieldId] ?? '—'}
         {onRefresh && fields.some((key) => key.fieldId === field.lookup!.localKeyFieldId && key.editable) &&
           record.data[field.lookup.localKeyFieldId] && <LookupRefresh token={session.token} onSaved={onRefresh}
@@ -345,7 +407,11 @@ export function RecordEditor({
     </section>}
     <FormGrid fields={fields} layout={layout} render={(field) => <div className="form-field">
       <label htmlFor={'field-' + field.fieldId} id={'field-' + field.fieldId + '-label'}>{field.name}{field.required ? ' *' : ''}</label>
-      {field.related ? record && <RelatedRecords token={token} appId={app.id} recordId={record.id} fieldId={field.fieldId} /> : field.lookup ? <>
+      {field.table ? <Controller name={field.fieldId} control={form.control} defaultValue="" render={({ field: input, fieldState }) => <>
+        <Subtable field={field} value={input.value ?? ''} session={session} app={app} directory={directory} disabled={busy} creating={!record}
+          onChange={(value) => { input.onChange(value); if (!latest) setState('editing'); }} />
+        {fieldState.error && <p role="alert">{fieldState.error.message}</p>}
+      </>} /> : field.related ? record && <RelatedRecords token={token} appId={app.id} recordId={record.id} fieldId={field.fieldId} /> : field.lookup ? <>
       <LookupPreview token={token} fieldId={field.fieldId} recordId={record?.id}
         path={appPath(app.id) + '/records/lookup-preview'} disabled={busy}
         value={watchedValues[field.lookup.localKeyFieldId] ?? ''} />

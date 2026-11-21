@@ -31,6 +31,7 @@ export const fieldContract = {
   richText: { ...displayOnly, storage: 'sanitized HTML fragment', csv: 'plain text' },
   calculation: { ...displayOnly, storage: 'computed decimal or string snapshot', csv: 'computed result, export only' },
   lookup: { ...displayOnly, storage: 'typed snapshots in mapped fields plus record_references', csv: 'local key input, typed snapshots export only' },
+  table: { ...displayOnly, storage: 'ordered record_table_rows', csv: 'one row per child row' },
   related: { ...displayOnly, storage: 'no stored value', csv: 'live display fields as read-only text' },
   layout: { ...displayOnly, storage: 'schema only', csv: 'omitted' },
 } as const;
@@ -103,7 +104,22 @@ export function lookupTargets(fields: FieldDefinition[]) {
   return new Set(fields.flatMap((field) => field.lookup?.copies.map(({ targetFieldId }) => targetFieldId) ?? []));
 }
 
+export const tableRowLimit = 100;
+export const tableFieldTypes = ['text', 'multiline', 'number', 'calculation', 'radio', 'checkbox', 'select',
+  'multiselect', 'date', 'time', 'datetime', 'url', 'user', 'organization', 'group'] as const;
+export type TableField = Pick<FieldDefinition, 'fieldId' | 'code' | 'name' | 'required' | 'uniqueValue' | 'options' | 'formula'> &
+  { type: (typeof tableFieldTypes)[number] };
+export interface TableConfiguration {
+  fields: TableField[];
+  minRows: number;
+  maxRows: number;
+  addRows: boolean;
+  deleteRows: boolean;
+  reorderRows: boolean;
+}
+
 export interface FieldDefinition {
+  table?: TableConfiguration | null;
   lookup?: LookupConfiguration | null;
   related?: RelatedConfiguration | null;
   fieldId: string;

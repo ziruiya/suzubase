@@ -83,7 +83,7 @@ export class CsvService {
       const lookupColumns = headers.filter((header) => target(header) === 'lookup' || /^lookup:/i.test(header));
       const mapping = headers.map((header) => lookupColumns.includes(header) ? null : target(header));
       const targets = mapping.filter((id): id is string => id !== null);
-      if (targets.some((id) => !fields.some(({ fieldId, type }) => fieldId === id && type !== 'layout' && type !== 'calculation' && type !== 'related')) || new Set(targets).size !== targets.length) {
+      if (targets.some((id) => !fields.some(({ fieldId, type }) => fieldId === id && type !== 'layout' && type !== 'calculation' && type !== 'related' && type !== 'table')) || new Set(targets).size !== targets.length) {
         throw new BadRequestException('Map each column to a distinct published field');
       }
       if (!targets.length && !lookupColumns.length) throw new BadRequestException('Map at least one column');

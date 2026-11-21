@@ -183,6 +183,13 @@
       "when": 1795281653298,
       "tag": "0025_gate2_related",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1795281905162,
+      "tag": "0026_gate2_table",
+      "breakpoints": true
     }
   ]
 }

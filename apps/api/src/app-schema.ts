@@ -7,12 +7,12 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, memberGroups, organizations, recordReferences, recordUniqueValues, sql, tenantMembers, users, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, lookupTargets, optionFieldTypes, type FieldDefinition, type FormLayout, SavedView, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
+import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, lookupTargets, optionFieldTypes, type FieldDefinition, type FormLayout, SavedView, tableFieldTypes, tableRowLimit, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AuthorizationService, formulaReferences, RecordAccess } from './authorization';
 import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
 import { aclInput } from './acl-input';
-import { formulaInput } from './formula';
+import { formulaInput, formulaProblems } from './formula';
 import { normalizeValue } from './field-values';
 import { dataPreflight, formLayoutInput, isDestructive, migrationInput, referencesPreflight, uniqueKey,
   validLayout, withoutLayoutField, type MigrationStrategy } from './schema-preflight';
@@ -64,8 +64,25 @@ const relatedInput = z.strictObject({
   ...referencePresentation,
   appId: identifier, localFieldId: identifier, matchFieldId: identifier, pageSize: z.int().min(1).max(100),
 });
+const tableFieldInput = z.strictObject({
+  ...metadata, fieldId: identifier, type: z.enum(tableFieldTypes), required: z.boolean().default(false),
+  uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
+  formula: formulaInput.nullable().default(null),
+}).refine(({ type, formula, required, uniqueValue, options }) =>
+  (type === 'calculation') === Boolean(formula) && !(formula && required) &&
+  (!uniqueValue || fieldContract[type].unique) &&
+  optionFieldTypes.has(type) === (options.length > 0) && new Set(options.map(({ value }) => value)).size === options.length,
+{ message: 'Unsupported child field options, validation or formula' });
+const tableInput = z.strictObject({
+  fields: z.array(tableFieldInput).min(1).max(25),
+  minRows: z.int().min(0).max(tableRowLimit), maxRows: z.int().min(1).max(tableRowLimit),
+  addRows: z.boolean(), deleteRows: z.boolean(), reorderRows: z.boolean(),
+}).refine(({ fields, minRows, maxRows }) => minRows <= maxRows &&
+  new Set(fields.map(({ fieldId }) => fieldId)).size === fields.length &&
+  new Set(fields.map(({ code }) => code)).size === fields.length,
+{ message: 'Check row bounds and duplicate child field IDs or codes' });
 const fieldProperties = z.strictObject({
-  ...metadata, type: z.enum(fieldTypes), lookup: lookupInput.optional(), related: relatedInput.optional(), formula: formulaInput.optional(), layoutElement: layoutInput.optional(), autoNumber: numbering.optional(), searchMode: z.enum(textSearchModes).optional(), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
+  ...metadata, type: z.enum(fieldTypes), lookup: lookupInput.optional(), related: relatedInput.optional(), table: tableInput.optional(), formula: formulaInput.optional(), layoutElement: layoutInput.optional(), autoNumber: numbering.optional(), searchMode: z.enum(textSearchModes).optional(), required: z.boolean().default(false), uniqueValue: z.boolean().default(false), options: z.array(option).max(200).default([]),
 });
 const fieldPatch = fieldProperties.extend({
   required: z.boolean(), uniqueValue: z.boolean(), options: z.array(option).max(200),
@@ -76,7 +93,8 @@ const fieldInput = fieldProperties.refine(({ options, type }) => optionFieldType
   .refine(({ type, autoNumber, required }) => (type === 'autoNumber') === Boolean(autoNumber) &&
     !(type === 'autoNumber' && required), { path: ['autoNumber'] })
   .refine(({ type, formula, layoutElement, required }) => (type === 'calculation') === Boolean(formula) &&
-    (type === 'layout') === Boolean(layoutElement) && (!required || isRecordInput(type)), { path: ['type'] })
+    (type === 'layout') === Boolean(layoutElement) && (!required || isRecordInput(type) && type !== 'table'), { path: ['type'] })
+  .refine(({ type, table }) => (type === 'table') === Boolean(table), { path: ['table'] })
   .refine(({ type, related }) => (type === 'related') === Boolean(related), { path: ['related'] })
   .refine(({ type, lookup }) => (type === 'lookup') === Boolean(lookup), { path: ['lookup'] })
   .refine(({ type, searchMode }) => !searchMode || type === 'text', { path: ['searchMode'] });
@@ -89,7 +107,7 @@ const publishInput = z.strictObject({ migration: migrationInput.optional() });
 const binQuery = z.enum(['true', 'false']).optional();
 
 export const appHttp = {
-  createAppInput, appInput, settingsInput, lifecycleInput, fieldInput, fieldPatch, layoutInput, option, numbering, lookupInput, relatedInput,
+  createAppInput, appInput, settingsInput, lifecycleInput, fieldInput, fieldPatch, layoutInput, option, numbering, lookupInput, relatedInput, tableInput,
   formLayoutInput, viewInput, defaultViewInput, aclInput, previewInput, publishInput, binQuery,
 };
 
@@ -211,10 +229,15 @@ export class AppSchemaService {
         await tx.insert(appCounters).values(identity);
         const definitions = await this.getFields(tx, context, appId, source.publishedSchemaVersion);
         const fieldMapping = new Map(definitions.map(({ fieldId }) => [fieldId, randomUUID()]));
-        for (const { fieldId, code, name, type, required, uniqueValue, options, autoNumber, searchMode, formula, layoutElement, lookup, related } of definitions) {
+        for (const { fieldId, code, name, type, required, uniqueValue, options, autoNumber, searchMode, formula, layoutElement, lookup, related, table } of definitions) {
           const copiedId = fieldMapping.get(fieldId)!;
+          const rowFields = new Map(table?.fields.map(({ fieldId }) => [fieldId, randomUUID()]));
           await tx.insert(fields).values({
             ...identity, fieldId: copiedId, code, name, type, required, uniqueValue, options, searchMode, layoutElement, introducedIn: 1,
+            table: table && { ...table, fields: table.fields.map((child) => ({
+              ...child, fieldId: rowFields.get(child.fieldId)!,
+              formula: child.formula?.map((part) => part.kind === 'field' ? { ...part, fieldId: rowFields.get(part.fieldId)! } : part) ?? null,
+            })) },
             related: related && { ...related, localFieldId: fieldMapping.get(related.localFieldId)! },
             lookup: lookup && {
               ...lookup,
@@ -347,7 +370,7 @@ export class AppSchemaService {
     const definitionRows = await tx.select({
       fieldId: fields.fieldId, code: fields.code, name: fields.name, type: fields.type, required: fields.required,
       uniqueValue: fields.uniqueValue, autoNumber: fields.autoNumber, searchMode: fields.searchMode,
-      options: fields.options, lookup: fields.lookup, related: fields.related, formula: fields.formula, layoutElement: fields.layoutElement,
+      options: fields.options, lookup: fields.lookup, related: fields.related, table: fields.table, formula: fields.formula, layoutElement: fields.layoutElement,
     }).from(fields).where(and(
       eq(fields.tenantId, context.tenantId), eq(fields.appId, appId), lte(fields.introducedIn, version),
     )).orderBy(fields.introducedIn, fields.code);
@@ -407,6 +430,7 @@ export class AppSchemaService {
         }
         if (input.lookup) await this.validateLookup(tx, context, input.lookup, definitions);
         if (input.related) await this.validateRelated(tx, context, input.related, definitions);
+        if (input.table) this.validateTable(input.table);
         const [field] = await tx.insert(fields).values({ ...identity, ...input, introducedIn: version }).returning();
         return field;
       });
@@ -414,6 +438,11 @@ export class AppSchemaService {
       if (postgresErrorCode(error) === '23505') throw new ConflictException('Field code already in use');
       throw error;
     }
+  }
+
+  private validateTable(config: z.infer<typeof tableInput>) {
+    const problems = formulaProblems(config.fields, []);
+    if (problems.length) throw new BadRequestException(problems);
   }
 
   private async validateRelated(tx: TenantTransaction, context: TenantContext,
@@ -445,7 +474,7 @@ export class AppSchemaService {
     for (const { sourceFieldId, targetFieldId } of config.copies) {
       const from = source.get(sourceFieldId);
       const to = local.get(targetFieldId);
-      if (!from || !to || !isRecordInput(to.type) || to.type === 'attachment' || from.type !== to.type ||
+      if (!from || !to || !isRecordInput(to.type) || ['attachment', 'table'].includes(to.type) || from.type !== to.type ||
           to.required || to.uniqueValue || targetFieldId === config.localKeyFieldId || usedTargets.has(targetFieldId) ||
           localFields.some((field) => field.lookup?.localKeyFieldId === targetFieldId) ||
           JSON.stringify(from.options.map(({ value }) => value).sort()) !== JSON.stringify(to.options.map(({ value }) => value).sort())) {
@@ -480,13 +509,14 @@ export class AppSchemaService {
         const { fieldId: id, ...before } = field;
         const type = patch.type ?? before.type;
         const sameType = type === before.type;
-        if (!sameType && (!isRecordInput(type) || type === 'attachment' || before.type === 'attachment' || before.type === 'autoNumber')) {
+        if (!sameType && (type === 'table' || before.type === 'table' || !isRecordInput(type) || type === 'attachment' || before.type === 'attachment' || before.type === 'autoNumber')) {
           throw new BadRequestException('Create a separate field when changing attachment, layout or generated value types');
         }
         const input = parseInput(fieldInput, {
           ...before, ...patch, type,
           formula: patch.formula ?? (sameType ? before.formula ?? undefined : undefined),
           autoNumber: patch.autoNumber ?? (sameType ? before.autoNumber ?? undefined : undefined),
+          table: patch.table ?? (sameType ? before.table ?? undefined : undefined),
           related: patch.related ?? (sameType ? before.related ?? undefined : undefined),
           lookup: patch.lookup ?? (sameType ? before.lookup ?? undefined : undefined),
           layoutElement: patch.layoutElement ?? (sameType ? before.layoutElement ?? undefined : undefined),
@@ -505,7 +535,8 @@ export class AppSchemaService {
         }
         if (input.lookup) await this.validateLookup(tx, context, input.lookup, definitions.filter((entry) => entry.fieldId !== id));
         if (input.related) await this.validateRelated(tx, context, input.related, definitions.filter((entry) => entry.fieldId !== id));
-        edited = { ...input, fieldId: id, related: input.related ?? null, lookup: input.lookup ?? null, autoNumber: input.autoNumber ?? null, formula: input.formula ?? null,
+        if (input.table) this.validateTable(input.table);
+        edited = { ...input, fieldId: id, table: input.table ?? null, related: input.related ?? null, lookup: input.lookup ?? null, autoNumber: input.autoNumber ?? null, formula: input.formula ?? null,
           layoutElement: input.layoutElement ?? null, searchMode: input.searchMode ?? null };
       }
       const version = await this.beginDraft(tx, context, app);

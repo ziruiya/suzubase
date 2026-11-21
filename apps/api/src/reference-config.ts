@@ -15,7 +15,7 @@ export function normalizeReferencePresentation(config: ReferencePresentation, fi
   const definitions = new Map(fields.map((field) => [field.fieldId, field]));
   if (config.displayFieldIds?.some((id) => {
     const field = definitions.get(id);
-    return !field || ['layout', 'lookup', 'related', 'attachment'].includes(field.type);
+    return !field || ['layout', 'lookup', 'related', 'table', 'attachment'].includes(field.type);
   })) throw new BadRequestException('Unsupported reference display field');
   if (config.sort) {
     const field = definitions.get(config.sort.fieldId);

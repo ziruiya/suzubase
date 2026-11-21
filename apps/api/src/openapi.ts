@@ -28,6 +28,7 @@ const field = z.object({
   options: z.array(appHttp.option), formula: formulaInput.nullable(), layoutElement: appHttp.layoutInput.nullable(),
   lookup: appHttp.lookupInput.nullable().optional(),
   related: appHttp.relatedInput.nullable().optional(),
+  table: appHttp.tableInput.nullable().optional(),
   autoNumber: appHttp.numbering.nullable(), searchMode: z.enum(textSearchModes).nullable(),
 });
 const formField = field.extend({ editable: flag });
@@ -114,7 +115,8 @@ const history = z.object({
   events: z.array(z.object({
     eventId: id, recordRevision: integer, schemaVersion: integer, occurredAt: timestamp, actorId: id,
     actorLabel: text, source: text, kind: text,
-    changes: z.array(z.object({ fieldId: id, oldValue: text.nullable(), newValue: text.nullable() })),
+    changes: z.array(z.object({ fieldId: id, rowId: id.optional(), childFieldId: id.optional(),
+      rowChange: z.enum(['added', 'removed', 'moved']).optional(), oldValue: text.nullable(), newValue: text.nullable() })),
   })),
 });
 const historyExport = history.extend({ recordId: id, recordNo, recordRevision: integer, archive: archive.optional() });

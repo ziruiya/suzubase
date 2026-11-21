@@ -16,7 +16,15 @@ export interface RecordResponse {
   updatedAt: string;
 }
 
+export interface TableRow {
+  rowId: string;
+  data: RecordData;
+}
+
 export interface FieldChange {
+  rowId?: string;
+  rowChange?: 'added' | 'removed' | 'moved';
+  childFieldId?: string;
   fieldId: string;
   oldValue: string | null;
   newValue: string | null;

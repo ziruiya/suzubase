@@ -69,7 +69,7 @@ export function ReferenceSettings({ fields, value, onChange }: {
     <legend>Reference results</legend>
     <label>Display fields <select multiple value={value.displayFieldIds ?? []} onChange={(event) =>
       onChange({ ...value, displayFieldIds: Array.from(event.target.selectedOptions, (option) => option.value) })}>
-      {fields.filter(({ type }) => !['layout', 'attachment', 'lookup', 'related'].includes(type)).map((field) =>
+      {fields.filter(({ type }) => !['layout', 'attachment', 'lookup', 'related', 'table'].includes(type)).map((field) =>
         <option key={field.fieldId} value={field.fieldId}>{field.name}</option>)}
     </select></label>
     <div className="inline">

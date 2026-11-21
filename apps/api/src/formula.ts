@@ -42,7 +42,7 @@ function evaluate(formula: Formula, readField: (id: string) => Operand): Operand
 
 function readOperand(fields: ReadonlyMap<string, Definition>, data: RecordData, id: string): Operand {
   const field = fields.get(id);
-  if (!field || ['layout', 'calculation', 'attachment', 'richText'].includes(field.type)) {
+  if (!field || ['layout', 'calculation', 'attachment', 'richText', 'related', 'table'].includes(field.type)) {
     throw new Error('Unsupported or missing formula reference ' + id);
   }
   const value = data[id] ?? null;
