@@ -41,7 +41,25 @@ Wave C complete (G3-10 to G3-15):   tests 93, pass 93, fail 0
 Typecheck (pnpm -r typecheck): api + web pass. Docker build pass.
 Browser suite (3 Chromium tests): not runnable in the local Alpine dev
   image - see deviation 3. Hosted CI is the arbiter.
-托管 CI: <pending at report compilation; see branch CI run>
+托管 CI: run 44999907127 on 5eb3e68 - conclusion success (attempt 2).
+  All steps green, including the 3 Chromium browser tests (14 s) and the
+  post-suite audit. The first hosted run (44999038047, fb99bda) failed in
+  the combined test step: root cause was an audit-integrity population
+  bug, NOT a product defect - the audit selected package-import events
+  by source = 'migration' alone, conflating Gate 1/2 schema-publication
+  events ('schema-migrated' / 'workflow-pool', which legitimately carry
+  no import provenance and do produce outbox rows) with Gate 3 import
+  events. Reproduced locally in CI order (audit failed twice against
+  the post-suite database; all 25 real import events fully provenanced);
+  fixed in 433ea7d by scoping checks 2/3a to import_job_id IS NOT NULL
+  (the product read path's own discriminator; negative control: an
+  injected import outbox row still fails the audit). CI step split into
+  named steps in 5eb3e68 for diagnosability. Honest remainder: attempt 1
+  of run 44999907127 failed once in the integration step (79 s vs 86 s
+  on the passing rerun) and passed on rerun; job logs are not
+  retrievable through the available API tooling, so the specific test
+  behind that single failure is unidentified - recorded as a one-off
+  flake sighting, not a diagnosed fix.
 ```
 
 ## Wave A - Export (G3-01 to G3-05)
@@ -220,7 +238,11 @@ Detail is in `GATE3-WAVEC-REPORT.md`; the load-bearing numbers:
    dev image** (Chromium absent; the Playwright glibc headless shell
    cannot execute on musl). Environment-only; no browser-tested surface
    changed in Wave C beyond two boundary-copy strings. Hosted CI is
-   the arbiter: 托管 CI: <pending at report compilation; see branch CI run>
+   the arbiter: 托管 CI: run 44999907127 on 5eb3e68 - conclusion success; the 3
+   Chromium browser tests pass on the hosted runner (14 s), so this
+   deviation is closed. See the test summary block for the audit
+   population bug (433ea7d) that caused the first hosted failure and
+   the one unidentified integration-step flake on attempt 1.
 4. **Migration reversibility (ruling 11).** Migrations `0032` / `0033`
    are additive and schema-reversible (dropping the added objects),
    but **one-way in production once Gate 3 data exists** - a downgrade
