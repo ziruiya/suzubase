@@ -5,12 +5,28 @@
 //   1. field-change history: for sampled records, record_events line up with
 //      the record revision counter (event revisions are a contiguous,
 //      explainable sequence and every event carries actor + source + time);
-//   2. migrated-record provenance: for sampled migration-sourced events, the
+//   2. migrated-record provenance: for sampled package-import events, the
 //      four provenance elements (import_job_id, source_actor_id,
 //      source_timestamp, actual operator via migration_audit_log) are present;
 //   3. outbox reconciliation: import jobs produced zero outbox events for
 //      their target apps during staging, and daily outbox rows have matching
 //      notification deliveries (no duplicates, no loss) for processed rows.
+//
+// Population note (fix, G3-15 CI diagnosis): source = 'migration' covers TWO
+// different writers. (a) The Gate 3 package-import executor (import.ts
+// batchHistory) inserts events directly, ALWAYS sets import_job_id (falling
+// back to the job id), and never inserts outbox rows -- the provenance and
+// zero-outbox contracts apply to exactly this population, which the product
+// itself identifies by import_job_id IS NOT NULL (see records.ts/comments.ts
+// provenance rendering). (b) Gate 1/2 schema publication writes
+// 'schema-migrated' and 'workflow-pool' events through writeRecordEvent with
+// source 'migration': ordinary operator actions by the publishing admin that
+// legitimately carry no import provenance and DO produce outbox rows (the
+// designed notification path). Selecting on source alone conflated (b) with
+// (a) and failed any database where a schema was ever published; checks 2 and
+// 3a therefore scope to import_job_id IS NOT NULL. No assertion is weakened:
+// every package-import event is still required to carry all four provenance
+// elements and zero outbox rows.
 // Exit code is non-zero when any check fails. Output is JSON.
 import { createRequire } from 'node:module';
 
@@ -61,10 +77,11 @@ try {
   record('history-vs-revision sample', historyProblems === 0,
     `${records.length} records sampled, ${historyProblems} problem records`);
 
-  // 2. Migrated provenance: four elements on migration-sourced events.
+  // 2. Migrated provenance: four elements on package-import events
+  // (import_job_id IS NOT NULL selects the import population; see header).
   const migrated = (await client.query(
     `SELECT tenant_id, app_id, record_id, import_job_id, source_actor_id, source_timestamp, actor_id
-     FROM record_events WHERE source = 'migration' ${scope.length ? 'AND ' + scope.join(' AND ') : ''}
+     FROM record_events WHERE source = 'migration' AND import_job_id IS NOT NULL ${scope.length ? 'AND ' + scope.join(' AND ') : ''}
      ORDER BY random() LIMIT ${sampleSize}`, params)).rows;
   let provenanceProblems = 0;
   for (const event of migrated) {
@@ -80,13 +97,15 @@ try {
       `${audits.length}/${jobIds.length} sampled import jobs have audit rows`);
   }
 
-  // 3a. Migration-sourced events must never have produced outbox rows
-  // (import-period side-effect suppression, G3-06): daily edits after
-  // activation legitimately create outbox rows, migration events never do.
+  // 3a. Package-import events must never have produced outbox rows
+  // (import-period side-effect suppression, G3-06): the import executor never
+  // inserts outbox rows. Schema-publication events (also source 'migration',
+  // import_job_id NULL) go through writeRecordEvent and legitimately produce
+  // outbox rows, so they are not part of this population.
   const importOutbox = (await client.query(
     `SELECT count(*)::int AS n FROM outbox o
      JOIN record_events e ON e.tenant_id = o.tenant_id AND e.app_id = o.app_id AND e.event_id = o.event_id
-     WHERE e.source = 'migration'`)).rows[0].n;
+     WHERE e.source = 'migration' AND e.import_job_id IS NOT NULL`)).rows[0].n;
   record('import outbox reconciliation (zero side effects)', importOutbox === 0,
     `${importOutbox} outbox rows joined to migration-sourced events`);
 
