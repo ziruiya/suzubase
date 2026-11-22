@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 
 export type CompatibilityStatus = 'EQUIVALENT' | 'DATA_ONLY' | 'UNRESOLVED' | 'UNSUPPORTED';
 
@@ -113,6 +113,11 @@ export function sha256Buffer(buffer: Uint8Array) {
   return createHash('sha256').update(buffer).digest('hex');
 }
 
+export function stableSourceUuid(sourceKey: string) {
+  const hex = createHash('sha256').update(sourceKey).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 export class KintoneSourceAdapter {
   constructor(private readonly origin: string, private readonly apiToken: string,
     private readonly timeoutMs = 15000, private readonly maxRetries = 2) {}
@@ -152,6 +157,9 @@ export class KintoneSourceAdapter {
       ['appAcl', '/k/v1/app/acl.json?app=' + encodeURIComponent(appId)],
       ['recordAcl', '/k/v1/record/acl.json?app=' + encodeURIComponent(appId)],
       ['fieldAcl', '/k/v1/field/acl.json?app=' + encodeURIComponent(appId)],
+      ['processes', '/k/v1/app/status.json?app=' + encodeURIComponent(appId)],
+      ['processDefinitions', '/k/v1/app/processes.json?app=' + encodeURIComponent(appId)],
+      ['records', '/k/v1/records.json?app=' + encodeURIComponent(appId) + '&query=$id%20>%200&limit=1'],
     ];
     const available: Record<string, unknown> = {};
     const unavailable: SourceEvidence['unavailable'] = [];
@@ -182,8 +190,12 @@ export class KintoneSourceAdapter {
       }) as any;
       cursorId = cursor.id;
       while (cursorId) {
-        const page = await this.request('GET', `/k/v1/records/cursor.json?id=${encodeURIComponent(cursorId)}`) as any;
+        const page = await this.request('POST', '/k/v1/records/cursor.json', { id: cursorId }) as any;
         records.push(...(page.records ?? []));
+        if (!page.records || !Array.isArray(page.records)) {
+          preflight.unavailable.push({ item: 'records', reason: 'cursor returned a non-record page', evidence: { next: page.next } });
+          break;
+        }
         for (const record of page.records ?? []) {
           const recordId = String(record.$id?.value ?? '');
           for (const field of fields) {
@@ -194,7 +206,7 @@ export class KintoneSourceAdapter {
                   sourceRecordId: recordId,
                   sourceTableCode: field.code,
                   sourceRowId: String(row.id ?? `${recordId}:${field.code}:${rowOrder}`),
-                  targetRowId: randomUUID(),
+                  targetRowId: stableSourceUuid(`${appId}:${recordId}:${field.code}:${String(row.id ?? `${recordId}:${field.code}:${rowOrder}`)}`),
                   rowOrder,
                   data: row.value ?? {},
                   attachments: Object.values(row.value ?? {}).flatMap((value: any) =>
@@ -247,9 +259,8 @@ export class KintoneSourceAdapter {
           }
         }
         if (!page.next) break;
-        cursorId = cursorId;
       }
-      if (cursorId) await this.request('DELETE', `/k/v1/records/cursor.json?app=${encodeURIComponent(appId)}&id=${encodeURIComponent(cursorId)}`).catch(() => undefined);
+      if (cursorId) await this.request('DELETE', '/k/v1/records/cursor.json', { id: cursorId }).catch(() => undefined);
     } catch (error) {
       preflight.unavailable.push({ item: 'records', reason: error instanceof Error ? error.message : 'unavailable', evidence: null });
     }
@@ -261,6 +272,10 @@ export class KintoneSourceAdapter {
     };
     const blocking = compatibility.filter(({ status }) => status === 'UNSUPPORTED');
     return { evidence, compatibility, records, comments, attachments, subtableRows, blocking,
-      packageReady: blocking.length === 0 && preflight.unavailable.every(({ item }) => item !== 'records') };
+      packageReady: blocking.length === 0 &&
+        preflight.unavailable.length === 0 &&
+        Boolean(frozenWindow) &&
+        !compatibility.some(({ status }) => status === 'UNRESOLVED') &&
+        records.length >= 0 };
   }
 }

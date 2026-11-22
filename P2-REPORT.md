@@ -54,6 +54,11 @@
   source domain.
 - Subtable row identities and attachment SHA-256 extraction are represented,
   with source row/record/table evidence.
+- Record cursor pagination now uses the kintone cursor POST contract, cursor
+  deletion uses the supported DELETE contract, and subtable target row IDs are
+  deterministic from source app/record/table/row identity.
+- The extract CLI writes a secret-free checkpoint summary containing counts and
+  source availability state, while each detailed report is written separately.
 - M3 does not yet claim final M1 activation. M1 package production, real
   kintone credential/permission execution and the complex real-app acceptance
   drill require source credentials and an isolated target application.

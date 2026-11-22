@@ -54,6 +54,18 @@ try {
     mkdirSync(outDir, { recursive: true });
     const out = resolve(outDir, `kintone-${appId}-${Date.now()}.json`);
     writeFileSync(out, JSON.stringify(report, null, 2));
+    const checkpoint = resolve(outDir, `kintone-${appId}.checkpoint.json`);
+    writeFileSync(checkpoint, JSON.stringify({
+      appId,
+      extractedAt: report.evidence.extractedAt,
+      frozenWindow: report.evidence.frozenWindow,
+      recordCount: report.records.length,
+      commentCount: report.comments.length,
+      attachmentCount: report.attachments.length,
+      subtableRowCount: report.subtableRows.length,
+      unavailableCount: report.evidence.unavailable.length,
+      packageReady: report.packageReady,
+    }, null, 2));
     console.log(JSON.stringify({ report: out, result: report.finalM1BusinessResult,
       recordsExtracted: result.records.length, compatibility: report.functionEquivalenceCount }));
   }
