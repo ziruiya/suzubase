@@ -14,6 +14,14 @@ export interface RecordResponse {
   createdAt: string;
   updatedBy: string;
   updatedAt: string;
+  /** Present only for migration-restored records (contracts 4 SS4.5.3). */
+  migration?: {
+    importJobId: string;
+    sourceActorId: string | null;
+    sourceActorName: string | null;
+    sourceTimestamp: string | null;
+    sourceRecordNo: string | null;
+  };
 }
 
 export interface TableRow {

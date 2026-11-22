@@ -46,6 +46,7 @@ export class AuthorizationService {
 
   appScope(context: TenantContext, appId: string | undefined, action: AppAction = 'view') {
     return and(eq(apps.tenantId, context.tenantId), appId ? eq(apps.id, appId) : undefined, isNull(apps.deletedAt),
+      eq(apps.activationState, 'active'),
       this.appAction(context, action));
   }
 
@@ -61,7 +62,7 @@ export class AuthorizationService {
   }
 
   appManagementScope(context: TenantContext) {
-    return and(eq(apps.tenantId, context.tenantId), this.appAction(context, 'manage'));
+    return and(eq(apps.tenantId, context.tenantId), eq(apps.activationState, 'active'), this.appAction(context, 'manage'));
   }
 
   async requireRecycleAccess(tx: TenantTransaction, context: TenantContext) {

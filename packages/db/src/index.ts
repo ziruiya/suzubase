@@ -6,7 +6,7 @@ import type { ApiTokenAction } from '@suzubase/shared-types';
 
 export { and, eq, inArray, or, isNull, lte, gt, sql } from 'drizzle-orm';
 export {
-  apiTokens, apps, appCounters, autoNumberCounters, issuedAutoNumbers, appVersions, csvJobs, deploymentInstance, exportJobs, permissionAudit, fields, fileReferences, files, outbox, recordCreateKeys, recordEvents, recordSearchValues, recordUniqueValues, records, recordReferences, recordTableRows, runtimeIndexes,
+  apiTokens, apps, appCounters, autoNumberCounters, issuedAutoNumbers, appVersions, csvJobs, deploymentInstance, exportJobs, importJobs, migrationAuditLog, migrationTokens, permissionAudit, fields, fileReferences, files, outbox, recordCreateKeys, recordEvents, recordSearchValues, recordUniqueValues, records, recordReferences, recordTableRows, runtimeIndexes, type SourceIdMapRow,
   notifications, recordComments, commentMentions,
   workflowDefinitions, workflowStates, workflowActions, recordWorkflowState, workflowAssignments, workflowEvents,
   groupMembers, loginCredentials, memberGroups, organizations, tenantMembers, tenants, users,
@@ -43,6 +43,14 @@ export async function verifyLogin(email: string, password: string): Promise<(Ten
 
 export function apiTokenHash(token: string) {
   return createHash('sha256').update(token, 'ascii').digest('hex');
+}
+
+export async function verifyMigrationToken(token: string) {
+  const result = await pool.query<TenantContext & { importJobId: string; targetAppId: string | null; expiresAt: string }>(
+    'SELECT tenant_id AS "tenantId", user_id AS "userId", import_job_id AS "importJobId", target_app_id AS "targetAppId", expires_at AS "expiresAt" FROM authentication.verify_migration_token($1)',
+    [apiTokenHash(token)],
+  );
+  return result.rows[0];
 }
 
 export async function verifyApiToken(token: string) {

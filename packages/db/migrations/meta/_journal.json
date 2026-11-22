@@ -232,6 +232,13 @@
       "when": 1795284000000,
       "tag": "0032_gate3_export",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1795285000000,
+      "tag": "0033_gate3_import",
+      "breakpoints": true
     }
   ]
 }

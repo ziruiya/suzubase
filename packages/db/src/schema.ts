@@ -98,6 +98,7 @@ export const apps = pgTable('apps', {
   adminMemo: text('admin_memo').notNull().default(''),
   archivedAt: time('archived_at'),
   deletedAt: time('deleted_at'),
+  activationState: text('activation_state').notNull().default('active'),
   createdBy: uuid('created_by').notNull(),
   publishedSchemaVersion: integer('published_schema_version').notNull().default(1),
   draftSchemaVersion: integer('draft_schema_version'),
@@ -178,9 +179,15 @@ export const records = pgTable('records', {
   updatedAt: time('updated_at').notNull().defaultNow(),
   deletedBy: uuid('deleted_by'),
   deletedAt: time('deleted_at'),
+  importJobId: uuid('import_job_id'),
+  sourceActorId: text('source_actor_id'),
+  sourceActorName: text('source_actor_name'),
+  sourceTimestamp: time('source_timestamp'),
+  sourceRecordNo: text('source_record_no'),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
   unique().on(t.tenantId, t.appId, t.recordNo),
+  foreignKey({ columns: [t.tenantId, t.importJobId], foreignColumns: [importJobs.tenantId, importJobs.id] }),
   check('records_data_object', sql`jsonb_typeof(${t.data}) = 'object'`),
   foreignKey({
     columns: [t.tenantId, t.appId, t.schemaVersion],
@@ -358,6 +365,10 @@ export const recordComments = pgTable('record_comments', {
   body: text().notNull(),
   createdAt: time('created_at').notNull().defaultNow(),
   deletedAt: time('deleted_at'),
+  importJobId: uuid('import_job_id'),
+  sourceActorId: text('source_actor_id'),
+  sourceActorName: text('source_actor_name'),
+  sourceTimestamp: time('source_timestamp'),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.recordId, t.id] }),
   foreignKey({
@@ -370,6 +381,7 @@ export const recordComments = pgTable('record_comments', {
     columns: [t.tenantId, t.authorId],
     foreignColumns: [tenantMembers.tenantId, tenantMembers.userId],
   }),
+  foreignKey({ columns: [t.tenantId, t.importJobId], foreignColumns: [importJobs.tenantId, importJobs.id] }),
   index('record_comments_page_idx').on(t.tenantId, t.appId, t.recordId, t.createdAt.desc(), t.id.desc()),
 ]);
 
@@ -409,6 +421,9 @@ export const recordEvents = pgTable('record_events', {
   objectId: uuid('object_id'),
   occurredAt: time('occurred_at').notNull().defaultNow(),
   changes: jsonb().$type<FieldChange[]>().notNull(),
+  importJobId: uuid('import_job_id'),
+  sourceActorId: text('source_actor_id'),
+  sourceTimestamp: time('source_timestamp'),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.eventId] }),
   unique().on(t.tenantId, t.appId, t.recordId, t.recordRevision),
@@ -421,6 +436,7 @@ export const recordEvents = pgTable('record_events', {
     foreignColumns: [appVersions.tenantId, appVersions.appId, appVersions.version],
   }),
   foreignKey({ columns: [t.tenantId, t.actorId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  foreignKey({ columns: [t.tenantId, t.importJobId], foreignColumns: [importJobs.tenantId, importJobs.id] }),
 ]);
 
 export const workflowEvents = pgTable('workflow_events', {
@@ -735,4 +751,83 @@ export const exportJobs = pgTable('export_jobs', {
   primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
   foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
   foreignKey({ columns: [t.tenantId, t.requestedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
+export const importJobs = pgTable('import_jobs', {
+  tenantId: tenantId(),
+  id: uuid().notNull().defaultRandom(),
+  createdBy: uuid('created_by').notNull(),
+  sourceExportId: text('source_export_id'),
+  sourceInstanceId: text('source_instance_id'),
+  sourceTenantId: text('source_tenant_id'),
+  sourceAppId: text('source_app_id'),
+  sourceAppCode: text('source_app_code'),
+  packageSha256: text('package_sha256').notNull(),
+  packageBytes: integer('package_bytes').notNull(),
+  status: text().notNull().default('uploaded'),
+  stage: text().notNull().default('uploaded'),
+  targetAppId: uuid('target_app_id'),
+  duplicateOf: uuid('duplicate_of'),
+  duplicateConfirmed: boolean('duplicate_confirmed').notNull().default(false),
+  entityMapping: jsonb('entity_mapping').$type<SourceIdMapRow[]>().notNull().default(sql`'[]'::jsonb`),
+  userMapping: jsonb('user_mapping').$type<Record<string, string | null>>().notNull().default(sql`'{}'::jsonb`),
+  groupMapping: jsonb('group_mapping').$type<Record<string, string | null>>().notNull().default(sql`'{}'::jsonb`),
+  organizationMapping: jsonb('organization_mapping').$type<Record<string, string | null>>().notNull().default(sql`'{}'::jsonb`),
+  dependencyDecisions: jsonb('dependency_decisions').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  pending: jsonb().$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  completion: text(),
+  report: jsonb().$type<unknown>(),
+  errorReport: jsonb('error_report').$type<unknown>(),
+  error: text(),
+  attempts: integer().notNull().default(0),
+  executeRequested: boolean('execute_requested').notNull().default(false),
+  executeTokenId: uuid('execute_token_id'),
+  createdAt: time('created_at').notNull().defaultNow(),
+  updatedAt: time('updated_at').notNull().defaultNow(),
+  activatedAt: time('activated_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.createdBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  foreignKey({ columns: [t.tenantId, t.targetAppId], foreignColumns: [apps.tenantId, apps.id] }),
+]);
+
+export interface SourceIdMapRow {
+  objectType: string;
+  sourceId: string;
+  targetId: string;
+  status: 'created' | 'existing';
+}
+
+export const migrationAuditLog = pgTable('migration_audit_log', {
+  tenantId: tenantId(),
+  id: uuid().notNull().defaultRandom(),
+  importJobId: uuid('import_job_id').notNull(),
+  targetAppId: uuid('target_app_id'),
+  operatorId: uuid('operator_id').notNull(),
+  action: text().notNull(),
+  objectType: text('object_type').notNull(),
+  objectId: text('object_id'),
+  fieldSurface: jsonb('field_surface').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  createdAt: time('created_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.importJobId], foreignColumns: [importJobs.tenantId, importJobs.id] }),
+  foreignKey({ columns: [t.tenantId, t.operatorId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
+export const migrationTokens = authentication.table('migration_tokens', {
+  tenantId: tenantId(),
+  id: uuid().notNull().defaultRandom(),
+  importJobId: uuid('import_job_id').notNull(),
+  targetAppId: uuid('target_app_id'),
+  issuedBy: uuid('issued_by').notNull(),
+  secretHash: text('secret_hash').notNull(),
+  expiresAt: time('expires_at').notNull(),
+  createdAt: time('created_at').notNull().defaultNow(),
+  revokedAt: time('revoked_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.id] }),
+  unique().on(t.secretHash),
+  foreignKey({ columns: [t.tenantId, t.importJobId], foreignColumns: [importJobs.tenantId, importJobs.id] }),
+  foreignKey({ columns: [t.tenantId, t.issuedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
 ]);
