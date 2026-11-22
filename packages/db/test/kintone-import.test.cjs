@@ -110,10 +110,15 @@ test('P2-M3 resumes a failed cursor from its checkpoint without duplicate record
       return send(200, { processes: { default: { states: { open: {} } } } });
     }
     if (url.pathname === '/k/v1/records.json') return send(200, { records: [] });
-    if (url.pathname === '/k/v1/records/cursor.json' && req.method === 'POST') {
-      const chunks = [];
-      for await (const chunk of req) chunks.push(chunk);
-      const body = JSON.parse(Buffer.concat(chunks).toString() || '{}');
+    if (url.pathname === '/k/v1/records/cursor.json' &&
+      ['GET', 'POST'].includes(req.method)) {
+      let body;
+      if (req.method === 'GET') body = { id: url.searchParams.get('id') };
+      else {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        body = JSON.parse(Buffer.concat(chunks).toString() || '{}');
+      }
       if (body.id === 'fixture-cursor') {
         cursorPages++;
         if (cursorPages === 1) return send(200, { records: [

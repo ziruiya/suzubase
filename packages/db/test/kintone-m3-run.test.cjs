@@ -12,17 +12,24 @@ configureRuntime();
 test('P2-M3-C runner completes a mock extraction and isolated local SuzuBase import', async (t) => {
   const expectedTokens = { '100': 'fixture-token-a', '200': 'fixture-token-b' };
   const seenTokens = [];
+  const appInfoRequests = [];
   const cursorTokens = [];
   const cursors = new Map();
   const source = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const appId = url.searchParams.get('app');
-    seenTokens.push({ appId, token: req.headers['x-cybozu-api-token'] });
+    seenTokens.push({
+      appId, token: req.headers['x-cybozu-api-token'], method: req.method,
+      contentType: req.headers['content-type'],
+    });
     const json = (body, status = 200) => {
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(body));
     };
-    if (url.pathname === '/k/v1/app.json') return json({ name: `Fixture ${appId}` });
+    if (url.pathname === '/k/v1/app.json') {
+      appInfoRequests.push({ id: url.searchParams.get('id'), app: url.searchParams.get('app') });
+      return json({ name: `Fixture ${appId}` });
+    }
     if (url.pathname === '/k/v1/app/form/fields.json') return json({ properties: {
       title: { type: 'SINGLE_LINE_TEXT', label: 'Title' },
       lines: { type: 'SUBTABLE', fields: { item: { type: 'SINGLE_LINE_TEXT', label: 'Item' } } },
@@ -38,18 +45,18 @@ test('P2-M3-C runner completes a mock extraction and isolated local SuzuBase imp
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(Buffer.concat(chunks).toString() || '{}');
-      if (body.app) cursorTokens.push({ appId: body.app, token: req.headers['x-cybozu-api-token'] });
-      if (body.id) {
-        const recordAppId = cursors.get(body.id);
-        return json({ records: [{
-          $id: { value: '1' }, title: { value: `Record from ${recordAppId}` },
-          lines: { value: [{ id: 'row-1', value: { item: { value: 'table item' } } }] },
-          docs: { value: [{ fileKey: `file-${recordAppId}`, name: 'fixture.txt' }] },
-        }], next: false });
-      }
+      cursorTokens.push({ appId: body.app, token: req.headers['x-cybozu-api-token'] });
       const id = `cursor-${body.app}`;
       cursors.set(id, body.app);
       return json({ id });
+    }
+    if (url.pathname === '/k/v1/records/cursor.json' && req.method === 'GET') {
+      const recordAppId = cursors.get(url.searchParams.get('id'));
+      return json({ records: [{
+        $id: { value: '1' }, title: { value: `Record from ${recordAppId}` },
+        lines: { value: [{ id: 'row-1', value: { item: { value: 'table item' } } }] },
+        docs: { value: [{ fileKey: `file-${recordAppId}`, name: 'fixture.txt' }] },
+      }], next: false });
     }
     if (url.pathname === '/k/v1/records/cursor.json' && req.method === 'DELETE') return json({});
     if (url.pathname === '/k/v1/record/comments.json') return json({ comments: [{
@@ -119,9 +126,13 @@ test('P2-M3-C runner completes a mock extraction and isolated local SuzuBase imp
   assert.ok(report.dimensions.attachments.every((item) => item.source === 1 && item.target === 1));
   assert.ok(report.dimensions.comments.every((item) => item.source === 1 && item.target === 1));
   assert.equal(report.sourceUnavailable.length, 0);
+  assert.ok(appInfoRequests.length > 0);
+  assert.ok(appInfoRequests.every(({ id, app }) => ['100', '200'].includes(id) && app === null));
   assert.deepEqual([...new Set(seenTokens.map(({ token }) => token))].sort(),
     [expectedTokens['100'], expectedTokens['200']].sort());
   assert.ok(seenTokens.filter(({ appId }) => appId !== null)
     .every(({ appId, token }) => token === expectedTokens[appId]));
+  assert.ok(seenTokens.filter(({ method }) => method === 'GET')
+    .every(({ contentType }) => contentType === undefined));
   assert.ok(cursorTokens.every(({ appId, token }) => token === expectedTokens[appId]));
 });

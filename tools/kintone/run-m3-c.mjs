@@ -15,6 +15,7 @@ const dryRun = process.env.KINTONE_DRY_RUN === 'true';
 let targetOrigin;
 try { targetOrigin = new URL(process.env.SUZUBASE_TARGET_API_ORIGIN); }
 catch { console.error('SUZUBASE_TARGET_API_ORIGIN must be an absolute URL'); process.exit(2); }
+const localTarget = ['127.0.0.1', '::1', 'localhost'].includes(targetOrigin.hostname);
 const required = [
   'KINTONE_SUBDOMAIN', 'KINTONE_APP_A_ID', 'KINTONE_APP_B_ID',
   'KINTONE_API_TOKEN_A', 'KINTONE_API_TOKEN_B',
@@ -36,8 +37,9 @@ if (process.env.SUZUBASE_TARGET_ISOLATED !== 'true') {
 if (targetOrigin.username || targetOrigin.password || targetOrigin.pathname !== '/' ||
   targetOrigin.search || targetOrigin.hash ||
   (dryRun && (!['http:', 'https:'].includes(targetOrigin.protocol) ||
-    !['127.0.0.1', '::1', 'localhost', 'api'].includes(targetOrigin.hostname))) ||
-  (!dryRun && targetOrigin.protocol !== 'https:')) {
+    (!localTarget && targetOrigin.hostname !== 'api'))) ||
+  (!dryRun && targetOrigin.protocol !== 'https:' &&
+    !(targetOrigin.protocol === 'http:' && localTarget))) {
   console.error('Target must be an isolated HTTPS origin (or a local origin in dry-run mode)');
   process.exit(2);
 }

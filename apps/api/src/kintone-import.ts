@@ -665,7 +665,10 @@ export class KintoneSourceAdapter {
         response = await this.fetcher(this.origin + path, {
           method,
           redirect: 'error',
-          headers: { 'X-Cybozu-API-Token': this.apiToken, 'Content-Type': 'application/json' },
+          headers: {
+            'X-Cybozu-API-Token': this.apiToken,
+            ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+          },
           body: body === undefined ? undefined : JSON.stringify(body),
           signal: AbortSignal.timeout(this.timeoutMs),
         });
@@ -716,7 +719,7 @@ export class KintoneSourceAdapter {
 
   async preflight(appId: string) {
     const checks = [
-      ['app', '/k/v1/app.json?app=' + encodeURIComponent(appId)],
+      ['app', '/k/v1/app.json?id=' + encodeURIComponent(appId)],
       ['fields', '/k/v1/app/form/fields.json?app=' + encodeURIComponent(appId)],
       ['layout', '/k/v1/app/form/layout.json?app=' + encodeURIComponent(appId)],
       ['settings', '/k/v1/app/settings.json?app=' + encodeURIComponent(appId)],
@@ -846,7 +849,9 @@ export class KintoneSourceAdapter {
       cursorId = cursor.id;
       if (!cursorId) throw new Error('kintone cursor creation returned no cursor ID');
       while (cursorId) {
-        const page = await this.request('POST', '/k/v1/records/cursor.json', { id: cursorId }) as any;
+        const page = await this.request(
+          'GET', `/k/v1/records/cursor.json?id=${encodeURIComponent(cursorId)}`,
+        ) as any;
         if (!page.records || !Array.isArray(page.records)) {
           preflight.unavailable.push({ item: 'records', reason: 'cursor returned a non-record page', evidence: { next: page.next } });
           break;
@@ -933,7 +938,9 @@ export class KintoneSourceAdapter {
         }
         if (!page.next) break;
       }
-      if (cursorId) await this.request('DELETE', '/k/v1/records/cursor.json', { id: cursorId }).catch(() => undefined);
+      if (cursorId) await this.request(
+        'DELETE', `/k/v1/records/cursor.json?id=${encodeURIComponent(cursorId)}`,
+      ).catch(() => undefined);
     } catch (error) {
       preflight.unavailable.push({ item: 'records', reason: error instanceof Error ? error.message : 'unavailable', evidence: null });
     }
