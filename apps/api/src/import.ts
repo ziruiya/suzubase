@@ -33,6 +33,12 @@ import {
  * executor therefore never runs under a bare session.
  */
 export const PROGRAM_VERSION = '1.0.0';
+/** Route-scoped body limit for POST /imports/upload (Wave C gap fix).
+ * Import packages are tenant-admin-only whole-application archives and can
+ * legitimately exceed the 8 MB single-attachment limit; the parser in
+ * main.ts applies this larger limit ONLY to the import upload route and
+ * keeps maxAttachmentBytes for every other octet-stream route. */
+export const maxImportPackageBytes = 256 * 1024 * 1024;
 export const MIGRATION_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface MigrationContext extends TenantContext {

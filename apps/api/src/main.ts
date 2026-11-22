@@ -12,7 +12,7 @@ import { NotificationPlanner } from './notification-planner';
 import { CommentController, CommentService } from './comments';
 import { CsvController, CsvService } from './csv';
 import { ExportController, ExportService } from './export';
-import { ImportController, ImportExecutionService, ImportFinalizer, ImportOrchestrator, ImportService, MigrationController, MigrationGuard, TokenReissueController } from './import';
+import { ImportController, ImportExecutionService, ImportFinalizer, ImportOrchestrator, ImportService, MigrationController, MigrationGuard, TokenReissueController, maxImportPackageBytes } from './import';
 import { RuntimeIndexController, RuntimeIndexService } from './runtime-indexes';
 import { SearchService } from './search';
 import { RecordQueryService } from './record-query';
@@ -55,8 +55,39 @@ class AppModule {}
 async function main() {
   const adapter = new FastifyAdapter();
   const app = await NestFactory.create<NestFastifyApplication>(AppModule, adapter);
-  adapter.getInstance().addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: maxAttachmentBytes },
-    (_request, body, done) => done(null, body));
+  // Route-scoped body limits (Wave C gap fix): a single global parser limit
+  // of maxAttachmentBytes made every import package above 8 MB die in the
+  // parser before the (tenant-admin-only) upload handler could run. The
+  // streaming parser below enforces maxImportPackageBytes ONLY for
+  // POST /imports/upload and keeps maxAttachmentBytes for all other
+  // octet-stream routes (single attachment uploads); the attachment service
+  // additionally enforces each application's own configured limit.
+  adapter.getInstance().addContentTypeParser('application/octet-stream',
+    (request, payload, done) => {
+      const limit = request.url.startsWith('/imports/upload')
+        ? maxImportPackageBytes : maxAttachmentBytes;
+      const chunks: Buffer[] = [];
+      let size = 0;
+      let finished = false;
+      payload.on('data', (chunk: Buffer) => {
+        if (finished) return;
+        size += chunk.length;
+        if (size > limit) {
+          finished = true;
+          const error = new Error('Request body is too large') as Error & { statusCode: number };
+          error.statusCode = 413;
+          done(error);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      payload.on('end', () => {
+        if (!finished) { finished = true; done(null, Buffer.concat(chunks)); }
+      });
+      payload.on('error', (error: Error) => {
+        if (!finished) { finished = true; done(error); }
+      });
+    });
   const config = new DocumentBuilder().setTitle('SuzuBase').setVersion('1')
     .addBearerAuth({ type: 'http', scheme: 'bearer', description: 'Send a session JWT or an app token on supported app routes. Token administration requires a session.' }).build();
   SwaggerModule.setup('docs', app, () => completeOpenApi(SwaggerModule.createDocument(app, config)));
