@@ -21,6 +21,7 @@ type Search = { field: string; mode: string; query: string };
 type Archive = { data: Record<string, string>; definitions: Record<string, Field> };
 type History = {
   events: { eventId: string; actorLabel: string; kind: string; occurredAt: string; schemaVersion: number;
+    workflow?: { action: string | null; from: string | null; to: string | null; reason: string | null; assigneeIds: string[] };
     changes: { fieldId: string; rowId?: string; childFieldId?: string; rowChange?: string; oldValue: string | null; newValue: string | null }[] }[];
   schemas: Record<number, Field[]>;
 };
@@ -134,6 +135,20 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
   const [summary, setSummary] = useState<{ fieldId: string; sum: string | null; average: string | null }[]>([]);
   const [form, setForm] = useState<RecordForm>();
   const [history, setHistory] = useState<History>();
+  const [historyFilter, setHistoryFilter] = useState({ kind: '', fieldId: '' });
+  const loadHistory = (filter = historyFilter) => {
+    if (!form) return;
+    const query = new URLSearchParams();
+    if (filter.kind) query.set('kind', filter.kind);
+    if (filter.fieldId) query.set('fieldId', filter.fieldId);
+    const suffix = query.toString() ? '?' + query.toString() : '';
+    void api<History>(root + '/' + form.record.id + '/history' + suffix, token)
+      .then(setHistory).catch((error) => setError(message(error)));
+  };
+  const applyHistoryFilter = (filter: { kind: string; fieldId: string }) => {
+    setHistoryFilter(filter);
+    loadHistory(filter);
+  };
   const [archive, setArchive] = useState<Archive>();
   const [screen, setScreen] = useState<'list' | 'detail' | 'edit' | 'new' | 'settings' | 'recycle' | 'tasks' | 'unassigned' | 'notifications'>('list');
   const [search, setSearch] = useState<Search>();
@@ -251,8 +266,7 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
       {app.commentsEnabled && <Comments key={form.record.id} appId={app.id} recordId={form.record.id} session={session}
         archived={!!app.archivedAt} refresh={() => void open(form.record.id)} />}
       <div className="inline">
-        <button onClick={() => void api<History>(root + '/' + form.record.id + '/history', token)
-          .then(setHistory).catch((error) => setError(message(error)))}>Show history</button>
+        <button onClick={() => loadHistory()}>Show history</button>
         {app.can.export && <button onClick={() => void download(root + '/' + form.record.id + '/history/export', token, 'history.json')
           .catch((error) => setError(message(error)))}>Export history</button>}
         {session.profile.canReadArchivedFields && <>
@@ -262,9 +276,27 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
             token, 'history-with-archived-fields.json').catch((error) => setError(message(error)))}>Export history with archived fields</button>}
         </>}
       </div>
-      {history && <section aria-label="Record history"><h2>History</h2><ol className="history">{history.events.map((event) =>
+      {history && <section aria-label="Record history"><h2>History</h2>
+        <div className="inline">
+          <label>Event type <select aria-label="History event type" value={historyFilter.kind}
+            onChange={(event) => applyHistoryFilter({ ...historyFilter, kind: event.target.value })}>
+            <option value="">All</option>
+            {[...new Set(history.events.map(({ kind }) => kind))].map((kind) =>
+              <option key={kind} value={kind}>{kind}</option>)}
+          </select></label>
+          <label>Field <select aria-label="History field" value={historyFilter.fieldId}
+            onChange={(event) => applyHistoryFilter({ ...historyFilter, fieldId: event.target.value })}>
+            <option value="">All</option>
+            {[...new Map(Object.values(history.schemas).flat().map((field) => [field.fieldId, field])).values()]
+              .map((field) => <option key={field.fieldId} value={field.fieldId}>{field.name}</option>)}
+          </select></label>
+        </div>
+        <ol className="history">{history.events.map((event) =>
         <li key={event.eventId}><strong>{event.kind === 'WORKFLOW_REPAIR' ? 'Workflow repair' : event.kind}</strong> · {event.actorLabel}
           <time>{new Date(event.occurredAt).toLocaleString(undefined, { timeZone: session.profile.timeZone })}</time>
+          {event.workflow && <div>{event.workflow.action ?? event.kind} · {event.workflow.from ?? '—'} → {event.workflow.to ?? '—'}
+            {event.workflow.reason && ' · ' + event.workflow.reason}
+            {event.workflow.assigneeIds.length > 0 && ' · Assignees: ' + event.workflow.assigneeIds.length}</div>}
           {event.changes.map((change) => {
             const field = history.schemas[event.schemaVersion]?.find(({ fieldId }) => fieldId === change.fieldId);
             const format = (value: string | null) => value === null ? '—' : field ? displayValue(field, value, session.profile.timeZone) : value;

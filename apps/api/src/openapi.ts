@@ -120,6 +120,8 @@ const history = z.object({
   events: z.array(z.object({
     eventId: id, recordRevision: integer, schemaVersion: integer, occurredAt: timestamp, actorId: id,
     actorLabel: text, source: text, kind: text, objectType: text, objectId: nullableId,
+    workflow: z.object({ action: text.nullable(), from: text.nullable(), to: text.nullable(),
+      reason: text.nullable(), assigneeIds: z.array(id) }).optional(),
     changes: z.array(z.object({ fieldId: id, rowId: id.optional(), childFieldId: id.optional(),
       rowChange: z.enum(['added', 'removed', 'moved']).optional(), oldValue: text.nullable(), newValue: text.nullable() })),
   })),
@@ -273,7 +275,7 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [entry + '/restore']: { post: { body: recordHttp.revisionInput, reply: record, conflict: z.union([revisionConflict, errorSchema]) } },
   [entry + '/form']: { get: { reply: recordForm } },
   [entry + '/archived-fields']: { get: { reply: archive, description: 'Requires the independent archived-field grant and record view permission.' } },
-  [entry + '/history']: { get: { reply: history } },
+  [entry + '/history']: { get: { query: recordHttp.historyQuery, reply: history } },
   [entry + '/history/export']: { get: { query: recordHttp.historyExportQuery, reply: historyExport, download: ['application/json'],
     description: 'Include deleted field definitions and values only with the independent archived-field grant.' } },
   [tenant + '/directory']: { get: { reply: directory } },

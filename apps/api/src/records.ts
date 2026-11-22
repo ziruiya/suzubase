@@ -6,7 +6,7 @@ import {
 import { ApiBearerAuth, ApiHeader, ApiProduces, ApiTags } from '@nestjs/swagger';
 import {
   and, appCounters, eq, gt, inArray, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordReferences, recordTableRows, recordUniqueValues, records, sql, TenantContext,
-  TenantTransaction, users, withTenantTransaction,
+  TenantTransaction, users, withTenantTransaction, workflowActions, workflowEvents, workflowStates,
 } from '@suzubase/db';
 import { FieldChange, FieldDefinition, isRecordInput, lookupTargets, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse, TableRow } from '@suzubase/shared-types';
 import { z } from 'zod';
@@ -58,8 +58,9 @@ const aggregateQuery = z.strictObject({
 const recycleQuery = pageInput.omit({ view: true });
 const batchCreateInput = z.strictObject({ items: z.array(createInput).min(1).max(100) });
 const historyExportQuery = z.strictObject({ includeArchived: z.enum(['true', 'false']).optional() });
+const historyQuery = z.strictObject({ kind: z.string().min(1).max(64).optional(), fieldId: identifier.optional() });
 export const recordHttp = { createInput, updateInput, revisionInput, batchUpdateInput, batchCreateInput,
-  pageInput, searchInput, aggregateQuery, recycleQuery, historyExportQuery, lookupPreviewInput, lookupRefreshInput, lookupSearchInput, relatedQuery };
+  pageInput, searchInput, aggregateQuery, recycleQuery, historyExportQuery, historyQuery, lookupPreviewInput, lookupRefreshInput, lookupSearchInput, relatedQuery };
 
 const keyPattern = /^[!-~]{1,128}$/;
 const createKey = z.string().regex(keyPattern).optional();
@@ -726,11 +727,11 @@ export class RecordService {
     return { data: row.data, definitions };
   }
 
-  async history(context: TenantContext, appId: string, id: string) {
+  async history(context: TenantContext, appId: string, id: string, filter: z.infer<typeof historyQuery> = {}) {
     return withTenantTransaction(context, async (tx) => {
       await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
       await this.findRecord(tx, context, appId, id);
-      return this.historySnapshot(tx, context, appId, id);
+      return this.historySnapshot(tx, context, appId, id, filter);
     });
   }
 
@@ -751,7 +752,8 @@ export class RecordService {
     });
   }
 
-  private async historySnapshot(tx: TenantTransaction, context: TenantContext, appId: string, id: string) {
+  private async historySnapshot(tx: TenantTransaction, context: TenantContext, appId: string, id: string,
+    filter: z.infer<typeof historyQuery> = {}) {
     const { access } = await this.appSchema.access(tx, context, appId, 'view');
     const eventScope = and(eq(recordEvents.tenantId, context.tenantId), eq(recordEvents.appId, appId), eq(recordEvents.recordId, id));
     const versions = await tx.selectDistinct({ version: recordEvents.schemaVersion }).from(recordEvents).where(eventScope);
@@ -792,12 +794,36 @@ export class RecordService {
     )).innerJoin(tenantMembers, and(
       eq(tenantMembers.tenantId, users.tenantId), eq(tenantMembers.userId, users.id),
     )).where(eventScope).orderBy(recordEvents.recordRevision);
-    return {
-      events: events.map(({ event, name, email, disabledAt }) => ({
-        ...event, actorLabel: (name ?? email) + (disabledAt ? '（已停用）' : ''),
-      })),
-      schemas: Object.fromEntries(schemas),
-    };
+    // Enrich workflow events from the single-source workflow_events side table
+    // (the same rows the workflow history view reads) so the record history
+    // renders action, from→to state names, reason and assignees inline.
+    const workflowDetail = new Map<string, {
+      action: string | null; from: string | null; to: string | null; reason: string | null; assigneeIds: string[];
+    }>();
+    if (events.length) {
+      const stateName = (column: typeof workflowEvents.fromStateId | typeof workflowEvents.toStateId) => sql<string | null>`(
+        SELECT ${workflowStates.name} FROM ${workflowStates}
+        WHERE ${workflowStates.tenantId} = ${workflowEvents.tenantId} AND ${workflowStates.appId} = ${workflowEvents.appId}
+          AND ${workflowStates.workflowId} = ${workflowEvents.workflowId} AND ${workflowStates.id} = ${column})`;
+      const rows = await tx.select({
+        eventId: workflowEvents.eventId, action: workflowActions.name, reason: workflowEvents.reason,
+        assigneeIds: workflowEvents.assigneeIds,
+        from: stateName(workflowEvents.fromStateId), to: stateName(workflowEvents.toStateId),
+      }).from(workflowEvents).leftJoin(workflowActions, and(
+        eq(workflowActions.tenantId, workflowEvents.tenantId), eq(workflowActions.appId, workflowEvents.appId),
+        eq(workflowActions.workflowId, workflowEvents.workflowId), eq(workflowActions.id, workflowEvents.actionId),
+      )).where(and(eq(workflowEvents.tenantId, context.tenantId), eq(workflowEvents.appId, appId),
+        inArray(workflowEvents.eventId, events.map(({ event }) => event.eventId))));
+      for (const row of rows) workflowDetail.set(row.eventId, row);
+    }
+    const enriched = events.map(({ event, name, email, disabledAt }) => ({
+      ...event, actorLabel: (name ?? email) + (disabledAt ? '（已停用）' : ''),
+      ...(workflowDetail.has(event.eventId) ? { workflow: workflowDetail.get(event.eventId)! } : {}),
+    }));
+    const filtered = enriched.filter((event) =>
+      (!filter.kind || event.kind === filter.kind) &&
+      (!filter.fieldId || event.changes.some((change) => change.fieldId === filter.fieldId || change.childFieldId === filter.fieldId)));
+    return { events: filtered, schemas: Object.fromEntries(schemas) };
   }
 
   private rejectRevision(current: RecordResponse): never {
@@ -936,8 +962,10 @@ export class RecordsController {
 
   @Get(':recordId/history')
   @AllowApiToken('view')
-  history(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') id: string) {
-    return this.service.history(context, parseInput(identifier, appId), parseInput(identifier, id));
+  history(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') id: string,
+    @Query() query: unknown) {
+    return this.service.history(context, parseInput(identifier, appId), parseInput(identifier, id),
+      parseInput(historyQuery, query ?? {}));
   }
 
   @Get(':recordId')
