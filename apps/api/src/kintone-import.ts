@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import {
   emptyCounts, MINIMUM_PROGRAM_VERSION, PACKAGE_FORMAT_VERSION, SENSITIVE_DATA_NOTICE, sealPackage,
@@ -28,6 +29,7 @@ export interface FieldCompatibility {
   sourceUnavailable: boolean;
   upgradeRequired: boolean;
   formula?: KintoneFormulaToken[] | null;
+  tableFields?: FieldCompatibility[];
 }
 
 type KintoneFormulaToken = { kind: 'field'; fieldId: string } |
@@ -130,9 +132,8 @@ function isPrivateHostname(hostname: string): boolean {
   if (version === 6) {
     const normalized = lower;
     if (normalized === '::' || normalized === '::1' || normalized.startsWith('fc') ||
-      normalized.startsWith('fd') || normalized.startsWith('fe8') ||
-      normalized.startsWith('fe9') || normalized.startsWith('fea') ||
-      normalized.startsWith('feb') || normalized.startsWith('ff')) return true;
+      normalized.startsWith('fd') || ['fe8', 'fe9', 'fea', 'feb', 'fec', 'fed', 'fee', 'fef']
+        .some((prefix) => normalized.startsWith(prefix)) || normalized.startsWith('ff')) return true;
     const mapped = normalized.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
     if (mapped) return isPrivateHostname(mapped[1]);
     const mappedHex = normalized.match(/::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
@@ -156,6 +157,17 @@ export function validateKintoneDomain(input: string, allowedHosts = process.env.
   if (!allowlist.length) throw new Error('KINTONE_ALLOWED_HOSTS is required');
   if (!allowlist.includes(url.hostname.toLowerCase())) throw new Error('kintone source host is not allowlisted');
   return url.origin;
+}
+
+function targetOptions(source: any): { value: string; label: string; disabled: boolean }[] {
+  const entries: [string, any][] = Array.isArray(source)
+    ? source.map((option: any) => [String(option.value), option])
+    : Object.entries(source ?? {});
+  return entries.map(([rawValue, rawOption]) => ({
+    value: String(rawValue),
+    label: String(rawOption?.label ?? rawValue),
+    disabled: false,
+  }));
 }
 
 export function mapKintoneField(source: any, options: {
@@ -219,6 +231,30 @@ export function mapKintoneField(source: any, options: {
       status: 'EQUIVALENT', reason: 'Link protocol preserves typed semantics',
       sourceUnavailable: false, upgradeRequired: false };
   }
+  if (type === 'SUBTABLE') {
+    const tableFields = Object.entries(source.fields ?? {}).map(([childCode, child]: [string, any]) =>
+      mapKintoneField({ ...child, code: childCode }, { fields: Object.entries(source.fields ?? {})
+        .map(([code, value]: [string, any]) => ({ ...value, code })) }));
+    const invalidChild = tableFields.find(({ status, targetType }) =>
+      status !== 'EQUIVALENT' || !['text', 'multiline', 'number', 'calculation', 'radio', 'checkbox',
+        'select', 'multiselect', 'date', 'time', 'datetime', 'url', 'user', 'organization', 'group']
+        .includes(String(targetType)));
+    if (!tableFields.length) return {
+      ...base, targetType: 'table', status: 'UNRESOLVED',
+      reason: 'Subtable has no target-supported child-field definition',
+      sourceUnavailable: false, upgradeRequired: false, tableFields,
+    };
+    if (invalidChild) return {
+      ...base, targetType: 'table', status: invalidChild.status === 'UNSUPPORTED' ? 'UNSUPPORTED' : 'UNRESOLVED',
+      reason: `Subtable child ${invalidChild.sourceFieldCode} is not target-compatible: ${invalidChild.reason}`,
+      sourceUnavailable: false, upgradeRequired: invalidChild.upgradeRequired, tableFields,
+    };
+    return {
+      ...base, targetType: 'table', status: 'EQUIVALENT',
+      reason: 'Subtable row schema maps to supported SuzuBase table fields',
+      sourceUnavailable: false, upgradeRequired: false, tableFields,
+    };
+  }
   if (type === 'REFERENCE_TABLE') return {
     ...base, targetType: 'related', status: 'UNRESOLVED',
     reason: 'Cross-app reference requires target application mapping',
@@ -229,6 +265,14 @@ export function mapKintoneField(source: any, options: {
     reason: 'Source identity and target directory membership require explicit mapping',
     sourceUnavailable: false, upgradeRequired: false,
   };
+  if (['RADIO_BUTTON', 'DROP_DOWN', 'CHECK_BOX', 'MULTI_SELECT'].includes(type)) {
+    const mappedOptions = targetOptions(source.options);
+    if (!mappedOptions.length || mappedOptions.some(({ value }) => !/^[a-z0-9][a-z0-9_.-]{0,63}$/i.test(value))) return {
+      ...base, targetType: direct[type], status: 'UNRESOLVED',
+      reason: 'Source choice values cannot be represented safely by target option identifiers',
+      sourceUnavailable: false, upgradeRequired: false,
+    };
+  }
   return { ...base, targetType: direct[type], status: 'EQUIVALENT',
     reason: 'Target field preserves source value semantics', sourceUnavailable: false, upgradeRequired: false };
 }
@@ -260,6 +304,14 @@ export interface KintoneExtractionResult {
   subtableStates: KintoneSubtableState[];
   blocking: FieldCompatibility[];
   packageReady: boolean;
+  sourceMetadata?: {
+    layout: unknown;
+    settings: unknown;
+    acl: { app: unknown; record: unknown; field: unknown };
+    workflow: { status: unknown; definitions: unknown };
+  };
+  gateProblems?: string[];
+  downgrades?: { item: string; reason: string; sourceCount: number }[];
 }
 
 function kintoneValue(value: any): string {
@@ -268,6 +320,64 @@ function kintoneValue(value: any): string {
   if (Array.isArray(value)) return JSON.stringify(value);
   if (typeof value === 'object' && 'value' in value) return kintoneValue(value.value);
   return JSON.stringify(value);
+}
+
+function sourceUserId(appId: string, user: any) {
+  const code = String(user?.code ?? user?.userId ?? '');
+  return code ? stableSourceUuid(`kintone:${appId}:user:${code}`) : null;
+}
+
+function sourceDirectoryUsers(appId: string, comments: any[]) {
+  const users = new Map<string, { id: string; email: string; loginName: string | null;
+    displayName: string | null; disabled: boolean }>();
+  const add = (identity: any) => {
+    const id = sourceUserId(appId, identity);
+    if (!id) return;
+    const code = String(identity.code ?? identity.userId);
+    users.set(id, {
+      id, email: '', loginName: code,
+      displayName: String(identity.name ?? identity.displayName ?? code), disabled: false,
+    });
+  };
+  for (const comment of comments) {
+    add(comment.creator ?? comment.user);
+    for (const mention of comment.mentions ?? []) add(mention.user ?? mention);
+  }
+  return [...users.values()];
+}
+
+function mappedCommentMentions(appId: string, comment: any) {
+  const body = kintoneValue(comment.content ?? comment.body ?? '');
+  return (comment.mentions ?? []).flatMap((mention: any) => {
+    const userId = sourceUserId(appId, mention.user ?? mention);
+    if (!userId) return [];
+    const name = String(mention.name ?? mention.user?.name ?? mention.displayName ?? mention.code ?? '');
+    let offset = Number.isInteger(mention.offset) ? mention.offset : -1;
+    let length = Number.isInteger(mention.length) ? mention.length : 0;
+    if (offset < 0 && name) {
+      const matched = `@${name}`;
+      const foundAt = body.indexOf(matched);
+      if (foundAt >= 0 && body.indexOf(matched, foundAt + matched.length) < 0) {
+        offset = foundAt;
+        length = matched.length;
+      }
+    }
+    if (offset < 0 || length <= 0 || offset + length > body.length) return [];
+    return [{ userId, offset, length }];
+  });
+}
+
+function sourceEntryCount(value: any): number {
+  if (Array.isArray(value)) return value.length;
+  if (!value || typeof value !== 'object') return 0;
+  let count = 0;
+  for (const key of ['rights', 'states', 'actions']) {
+    if (Array.isArray(value[key])) count += value[key].length;
+    else if (value[key] && typeof value[key] === 'object') count += Object.keys(value[key]).length;
+  }
+  if (count) return count;
+  if (value.processes && typeof value.processes === 'object') return Object.keys(value.processes).length;
+  return 0;
 }
 
 export function buildM1CompatiblePackage(
@@ -283,6 +393,9 @@ export function buildM1CompatiblePackage(
   if (extraction.blocking.length || extraction.compatibility.some(({ status }) => status === 'UNRESOLVED')) {
     throw new Error('kintone package blocked: unsupported or unresolved mappings exist');
   }
+  if (extraction.gateProblems?.length) {
+    throw new Error(`kintone package blocked: ${extraction.gateProblems.join('; ')}`);
+  }
   if (extraction.attachments.some((file) => !file.sha256 || !file.body)) {
     throw new Error('kintone package blocked: an attachment entity or SHA-256 is unavailable');
   }
@@ -290,35 +403,67 @@ export function buildM1CompatiblePackage(
   const sourceAppId = extraction.evidence.appId;
   const targetAppId = stableSourceUuid(`kintone-app:${extraction.evidence.appId}`);
   const targetTenantId = options.sourceTenantId ?? stableSourceUuid(`kintone-tenant:${extraction.evidence.appId}`);
-  const fields = extraction.compatibility.map((item, index) => ({
-    fieldId: stableSourceUuid(`kintone:${sourceAppId}:field:${item.sourceFieldCode}`),
+  const fieldId = (code: string) => stableSourceUuid(`kintone:${sourceAppId}:field:${code}`);
+  const targetFormula = (formula: KintoneFormulaToken[] | null | undefined, tableCode?: string) =>
+    formula?.map((token) => token.kind === 'field'
+      ? { ...token, fieldId: fieldId(tableCode ? `${tableCode}:${token.fieldId}` : token.fieldId) }
+      : token) ?? null;
+  const fields = extraction.compatibility.map((item) => {
+    const config = item.sourceConfig as any;
+    const tableFields = item.tableFields?.map((child) => {
+      const childConfig = child.sourceConfig as any;
+      return {
+        fieldId: fieldId(`${item.sourceFieldCode}:${child.sourceFieldCode}`),
+        code: child.sourceFieldCode,
+        name: String(childConfig.label ?? child.sourceFieldCode),
+        type: child.targetType,
+        required: Boolean(childConfig.required),
+        uniqueValue: false,
+        options: targetOptions(childConfig.options),
+        formula: targetFormula(child.formula, item.sourceFieldCode),
+      };
+    });
+    const layoutKind: Record<string, string> = {
+      GROUP: 'group', LABEL: 'label', SPACER: 'blank', HR: 'separator',
+    };
+    return {
+    fieldId: fieldId(item.sourceFieldCode),
     code: item.sourceFieldCode,
-    name: item.sourceFieldCode,
+    name: String(config.label ?? item.sourceFieldCode),
     type: item.targetType,
-    required: false,
+    required: Boolean(config.required),
     uniqueValue: false,
     searchMode: null,
-    formula: item.formula ?? null,
+    formula: targetFormula(item.formula),
     lookup: null,
     related: null,
-    table: null,
-    layoutElement: null,
+    table: tableFields?.length ? {
+      fields: tableFields, minRows: 0, maxRows: 100,
+      addRows: true, deleteRows: true, reorderRows: true,
+    } : null,
+    layoutElement: layoutKind[item.sourceType]
+      ? { kind: layoutKind[item.sourceType], text: String(config.label ?? item.sourceFieldCode) } : null,
     autoNumber: null,
-    options: [],
+    options: targetOptions(config.options),
     kintoneSource: {
       sourceType: item.sourceType,
       sourceConfig: item.sourceConfig,
       compatibility: item.status,
       reason: item.reason,
     },
-  }));
+  }; });
   const records = extraction.records.map((record: any) => {
     const sourceId = String(record.$id?.value ?? '');
     const data: Record<string, string> = {};
     for (const item of extraction.compatibility) {
       const source = record[item.sourceFieldCode];
-      if (source !== undefined) data[stableSourceUuid(`kintone:${sourceAppId}:field:${item.sourceFieldCode}`)] =
-        kintoneValue(source);
+      if (source !== undefined && item.sourceType !== 'SUBTABLE') {
+        const value = item.sourceType === 'FILE'
+          ? JSON.stringify((source.value ?? []).map((file: any) =>
+            stableSourceUuid(`kintone:${sourceAppId}:file:${file.fileKey}`)))
+          : kintoneValue(source);
+        data[fieldId(item.sourceFieldCode)] = value;
+      }
     }
     return {
       id: stableSourceUuid(`kintone:${sourceAppId}:record:${sourceId}`),
@@ -338,13 +483,25 @@ export function buildM1CompatiblePackage(
       kintoneSourceId: sourceId,
     };
   });
-  const tableRows = extraction.subtableRows.map((row) => ({
-    recordId: stableSourceUuid(`kintone:${sourceAppId}:record:${row.sourceRecordId}`),
-    fieldId: stableSourceUuid(`kintone:${sourceAppId}:field:${row.sourceTableCode}`),
-    rowId: row.targetRowId,
-    rowOrder: row.rowOrder,
-    data: Object.fromEntries(Object.entries(row.data).map(([key, value]) => [key, kintoneValue(value)])),
-  }));
+  const tableRows = extraction.subtableRows.map((row) => {
+    const table = extraction.compatibility.find((item) => item.sourceFieldCode === row.sourceTableCode);
+    if (!table || table.status !== 'EQUIVALENT' || !table.tableFields) {
+      throw new Error(`kintone package blocked: table ${row.sourceTableCode} has no verified child schema`);
+    }
+    const data: Record<string, string> = {};
+    for (const [sourceCode, value] of Object.entries(row.data)) {
+      const child = table.tableFields.find((item) => item.sourceFieldCode === sourceCode);
+      if (!child) throw new Error(`kintone package blocked: unknown child field ${row.sourceTableCode}.${sourceCode}`);
+      data[fieldId(`${row.sourceTableCode}:${sourceCode}`)] = kintoneValue(value);
+    }
+    return {
+      recordId: stableSourceUuid(`kintone:${sourceAppId}:record:${row.sourceRecordId}`),
+      fieldId: fieldId(row.sourceTableCode),
+      rowId: row.targetRowId,
+      rowOrder: row.rowOrder,
+      data,
+    };
+  });
   const attachmentEntries = extraction.attachments.map((file) => ({
     fileId: stableSourceUuid(`kintone:${sourceAppId}:file:${file.fileKey}`),
     version: 1,
@@ -354,11 +511,25 @@ export function buildM1CompatiblePackage(
     name: file.name ?? file.fileKey,
     contentType: 'application/octet-stream',
   }));
+  const attachmentMetadata = extraction.attachments.map((file, index) => ({
+    id: attachmentEntries[index].fileId,
+    uploadedBy: stableSourceUuid(`kintone:${sourceAppId}:user:unknown`),
+    name: file.name ?? file.fileKey,
+    contentType: 'application/octet-stream',
+    bytes: file.bytes ?? 0,
+    sha256: file.sha256,
+    state: 'READY',
+    version: 1,
+    referenceCount: 0,
+    createdAt: extraction.evidence.extractedAt,
+    deletedAt: null,
+  }));
   const attachmentBodies = Object.fromEntries(extraction.attachments
     .filter((file) => file.body && file.sha256)
     .map((file) => [`attachments/${stableSourceUuid(`kintone:${sourceAppId}:file:${file.fileKey}`)}/v1/body`, Buffer.from(file.body!)]));
 
   const expected: ObjectCounts = emptyCounts();
+  const directoryUsers = sourceDirectoryUsers(sourceAppId, extraction.comments);
   expected.apps = 1;
   expected.appVersions = 1;
   expected.fieldVersionSnapshots = 1;
@@ -368,6 +539,7 @@ export function buildM1CompatiblePackage(
   expected.attachments = attachmentEntries.length;
   expected.attachmentVersions = attachmentEntries.length;
   expected.comments = extraction.comments.length;
+  expected.userReferences = directoryUsers.length;
   expected.workflowVersions = 0;
   expected.aclEntries = 0;
 
@@ -378,6 +550,8 @@ export function buildM1CompatiblePackage(
     subtableStates: extraction.subtableStates,
     attachments: extraction.attachments.map(({ body: _body, ...file }) => file),
     comments: extraction.comments,
+    sourceMetadata: extraction.sourceMetadata ?? null,
+    downgrades: extraction.downgrades ?? [],
   };
   const files = {
     'data/app.json': JSON.stringify({
@@ -406,7 +580,7 @@ export function buildM1CompatiblePackage(
     'data/records.json': JSON.stringify({ records }),
     'data/table-rows.json': JSON.stringify({ rows: tableRows }),
     'data/references.json': JSON.stringify({ references: [] }),
-    'data/attachments.json': JSON.stringify({ files: attachmentEntries }),
+    'data/attachments.json': JSON.stringify({ files: attachmentMetadata }),
     'data/comments.json': JSON.stringify({ comments: extraction.comments.map((comment: any, index: number) => ({
       id: stableSourceUuid(`kintone:${sourceAppId}:comment:${String(comment.id ?? index)}`),
       recordId: stableSourceUuid(`kintone:${sourceAppId}:record:${String(comment.recordId ?? comment.$id?.value ?? '')}`),
@@ -415,7 +589,7 @@ export function buildM1CompatiblePackage(
       deleted: false,
       deletedAt: null,
       body: kintoneValue(comment.content ?? comment.body ?? ''),
-      mentions: (comment.mentions ?? []).map((mention: any) => ({ userId: String(mention.code ?? mention.userId ?? '') })),
+      mentions: mappedCommentMentions(sourceAppId, comment),
     })) }),
     'data/history.json': JSON.stringify({ recordEvents: [], workflowEvents: [] }),
     'data/config.json': JSON.stringify({
@@ -425,7 +599,9 @@ export function buildM1CompatiblePackage(
       apiTokens: [],
       kintoneCompatibility: compatEvidence,
     }),
-    'data/directory.json': JSON.stringify({ users: [], groups: [], organizations: [] }),
+    'data/directory.json': JSON.stringify({
+      users: directoryUsers, groups: [], organizations: [],
+    }),
   };
   return sealPackage({
     manifestBase: {
@@ -446,7 +622,11 @@ export function buildM1CompatiblePackage(
         kintoneSubtables: 'included',
         kintoneComments: 'included',
         kintoneAttachments: extraction.attachments.length ? 'included' : 'absent',
-        kintoneWorkflow: extraction.compatibility.some((item) => ['STATUS', 'STATUS_ASSIGNEE'].includes(item.sourceType))
+        kintoneWorkflow: extraction.downgrades?.some(({ item }) => item === 'workflow')
+          ? 'unsupported' : 'absent',
+        kintonePermissions: extraction.downgrades?.some(({ item }) => item === 'permissions')
+          ? 'unsupported' : 'absent',
+        kintoneLayout: extraction.downgrades?.some(({ item }) => item === 'layout')
           ? 'unsupported' : 'absent',
       },
       attachments: attachmentEntries,
@@ -459,19 +639,32 @@ export function buildM1CompatiblePackage(
 
 export class KintoneSourceAdapter {
   private readonly origin: string;
+  private readonly checkResolvedAddresses: boolean;
 
   constructor(origin: string, private readonly apiToken: string,
     private readonly timeoutMs = 15000, private readonly maxRetries = 2,
     private readonly fetcher: typeof fetch = fetch) {
     this.origin = validateKintoneDomain(origin);
+    this.checkResolvedAddresses = fetcher === fetch;
+  }
+
+  private async ensurePublicDestination() {
+    if (!this.checkResolvedAddresses) return;
+    const hostname = new URL(this.origin).hostname;
+    const addresses = await lookup(hostname, { all: true, verbatim: true });
+    if (!addresses.length || addresses.some(({ address }) => isPrivateHostname(address))) {
+      throw new Error('kintone source resolves to an internal or non-public IP address');
+    }
   }
 
   private async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown) {
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       let response: Response;
       try {
+        await this.ensurePublicDestination();
         response = await this.fetcher(this.origin + path, {
           method,
+          redirect: 'error',
           headers: { 'X-Cybozu-API-Token': this.apiToken, 'Content-Type': 'application/json' },
           body: body === undefined ? undefined : JSON.stringify(body),
           signal: AbortSignal.timeout(this.timeoutMs),
@@ -545,6 +738,9 @@ export class KintoneSourceAdapter {
 
   async extract(appId: string, frozenWindow = false, options: {
     acceptCalcDataOnly?: boolean;
+    acceptLayoutDowngrade?: boolean;
+    acceptWorkflowDowngrade?: boolean;
+    acceptPermissionDowngrade?: boolean;
     checkpoint?: KintoneExtractionCheckpoint;
     onCheckpoint?: (checkpoint: KintoneExtractionCheckpoint) => void | Promise<void>;
   } = {}) {
@@ -559,6 +755,55 @@ export class KintoneSourceAdapter {
     const compatibility = fields.map((field) => mapKintoneField(field, {
       fields, acceptCalcDataOnly: options.acceptCalcDataOnly,
     }));
+    const sourceMetadata = {
+        layout: preflight.available.layout,
+        settings: preflight.available.settings,
+      acl: {
+          app: preflight.available.appAcl,
+          record: preflight.available.recordAcl,
+          field: preflight.available.fieldAcl,
+      },
+      workflow: {
+          status: preflight.available.processes,
+          definitions: preflight.available.processDefinitions,
+      },
+    };
+    const permissionCount = ['appAcl', 'recordAcl', 'fieldAcl']
+      .reduce((total, item) => total + sourceEntryCount(preflight.available[item]), 0);
+    const workflowCount = sourceEntryCount(preflight.available.processes) +
+      sourceEntryCount(preflight.available.processDefinitions);
+    const sourceLayout = preflight.available.layout as any;
+    const layoutItems = Array.isArray(sourceLayout) ? sourceLayout :
+      Array.isArray(sourceLayout?.layout) ? sourceLayout.layout :
+      sourceLayout?.layout && typeof sourceLayout.layout === 'object'
+        ? Object.keys(sourceLayout.layout) : [];
+    const layoutCount = layoutItems.length;
+    const gateProblems: string[] = [];
+    const downgrades: NonNullable<KintoneExtractionResult['downgrades']> = [];
+    if (permissionCount && options.acceptPermissionDowngrade) {
+      downgrades.push({
+        item: 'permissions', sourceCount: permissionCount,
+        reason: 'Administrator accepted least-privilege default ACL; source ACL evidence is preserved in the package report',
+      });
+    } else if (permissionCount) {
+      gateProblems.push('source permissions require explicit administrator downgrade acceptance');
+    }
+    if (workflowCount && options.acceptWorkflowDowngrade) {
+      downgrades.push({
+        item: 'workflow', sourceCount: workflowCount,
+        reason: 'Administrator accepted workflow-history downgrade; source workflow evidence is preserved in the package report',
+      });
+    } else if (workflowCount) {
+      gateProblems.push('source workflow requires explicit administrator downgrade acceptance');
+    }
+    if (layoutCount && options.acceptLayoutDowngrade) {
+      downgrades.push({
+        item: 'layout', sourceCount: layoutCount,
+        reason: 'Administrator accepted form-layout downgrade; source layout evidence is preserved in the package report',
+      });
+    } else if (layoutCount) {
+      gateProblems.push('source form layout requires explicit administrator downgrade acceptance');
+    }
     const checkpoint = options.checkpoint;
     const records: any[] = [...(checkpoint?.records ?? [])];
     const comments: any[] = [...(checkpoint?.comments ?? [])];
@@ -599,6 +844,7 @@ export class KintoneSourceAdapter {
           { query: `$id > ${lastRecordId} order by $id asc` }),
       }) as any;
       cursorId = cursor.id;
+      if (!cursorId) throw new Error('kintone cursor creation returned no cursor ID');
       while (cursorId) {
         const page = await this.request('POST', '/k/v1/records/cursor.json', { id: cursorId }) as any;
         if (!page.records || !Array.isArray(page.records)) {
@@ -652,7 +898,9 @@ export class KintoneSourceAdapter {
             while (true) {
               const pageComments = await this.request('GET',
                 `/k/v1/record/comments.json?app=${encodeURIComponent(appId)}&record=${encodeURIComponent(recordId)}&offset=${offset}&limit=10`) as any;
-              comments.push(...(pageComments.comments ?? []));
+              comments.push(...(pageComments.comments ?? []).map((comment: any) => ({
+                ...comment, recordId: String(comment.recordId ?? recordId),
+              })));
               if (!pageComments.comments?.length || pageComments.comments.length < 10) break;
               offset += 10;
               if (offset > 10000) {
@@ -700,10 +948,11 @@ export class KintoneSourceAdapter {
     };
     const blocking = compatibility.filter(({ status }) => status === 'UNSUPPORTED');
     return { evidence, compatibility, records, comments, attachments, subtableRows, subtableStates, blocking,
+      sourceMetadata, gateProblems, downgrades,
       packageReady: blocking.length === 0 &&
         preflight.unavailable.length === 0 &&
+        gateProblems.length === 0 &&
         Boolean(frozenWindow) &&
-        !compatibility.some(({ status }) => status === 'UNRESOLVED') &&
-        records.length >= 0 };
+        !compatibility.some(({ status }) => status === 'UNRESOLVED') };
   }
 }

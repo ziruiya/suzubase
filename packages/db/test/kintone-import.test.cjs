@@ -9,6 +9,7 @@ test('P2-M3 kintone source safety and field mapping are explicit', async () => {
   assert.throws(() => validateKintoneDomain('https://127.0.0.1', '127.0.0.1'), /public origin/);
   assert.throws(() => validateKintoneDomain('https://[::1]', '[::1]'), /public origin/);
   assert.throws(() => validateKintoneDomain('https://[::ffff:127.0.0.1]', '[::ffff:127.0.0.1]'), /public origin/);
+  assert.throws(() => validateKintoneDomain('https://[fec0::1]', '[fec0::1]'), /public origin/);
   assert.throws(() => validateKintoneDomain('https://evil.example', 'example.cybozu.com'), /allowlisted/);
   const previousAllowlist = process.env.KINTONE_ALLOWED_HOSTS;
   process.env.KINTONE_ALLOWED_HOSTS = '127.0.0.1';
@@ -69,6 +70,11 @@ test('P2-M3 resumes a failed cursor from its checkpoint without duplicate record
   let pageTwoFails = true;
   let attachmentFails = true;
   let denyFields = false;
+  let denyAppAcl = false;
+  let denySecondRecordComments = true;
+  let includeSourceWorkflow = false;
+  let includeSourceAcl = false;
+  let includeSourceLayout = false;
   let cursorPages = 0;
   const cursorQueries = [];
   const requests = [];
@@ -83,8 +89,25 @@ test('P2-M3 resumes a failed cursor from its checkpoint without duplicate record
     if (url.pathname === '/k/v1/app/form/fields.json') {
       if (denyFields) return send(403, { message: 'not authorized' });
       return send(200, { properties: {
-        title: { type: 'SINGLE_LINE_TEXT' }, lines: { type: 'SUBTABLE' }, docs: { type: 'FILE' },
+        title: { type: 'SINGLE_LINE_TEXT' },
+        lines: { type: 'SUBTABLE', fields: { item: { type: 'SINGLE_LINE_TEXT', label: 'Item' } } },
+        docs: { type: 'FILE' },
       } });
+    }
+    if (url.pathname === '/k/v1/app/acl.json' && includeSourceAcl) {
+      return send(200, { rights: [{ entity: { type: 'USER', code: 'alice' }, app: 'VIEW' }] });
+    }
+    if (url.pathname === '/k/v1/app/acl.json' && denyAppAcl) {
+      return send(403, { message: 'not authorized' });
+    }
+    if (url.pathname === '/k/v1/app/form/layout.json' && includeSourceLayout) {
+      return send(200, { layout: [{ type: 'ROW', fields: [{ code: 'title' }] }] });
+    }
+    if (url.pathname === '/k/v1/app/status.json' && includeSourceWorkflow) {
+      return send(200, { enable: true, states: { open: {}, closed: {} }, actions: [{ name: 'close' }] });
+    }
+    if (url.pathname === '/k/v1/app/processes.json' && includeSourceWorkflow) {
+      return send(200, { processes: { default: { states: { open: {} } } } });
     }
     if (url.pathname === '/k/v1/records.json') return send(200, { records: [] });
     if (url.pathname === '/k/v1/records/cursor.json' && req.method === 'POST') {
@@ -114,6 +137,15 @@ test('P2-M3 resumes a failed cursor from its checkpoint without duplicate record
     }
     if (url.pathname === '/k/v1/records/cursor.json' && req.method === 'DELETE') return send(200, {});
     if (url.pathname === '/k/v1/record/comments.json') {
+      if (url.searchParams.get('record') === '2' && denySecondRecordComments) {
+        return send(403, { message: 'comment access denied' });
+      }
+      if (url.searchParams.get('record') === '1') {
+        const offset = Number(url.searchParams.get('offset'));
+        return send(200, { comments: offset === 0
+          ? Array.from({ length: 10 }, (_, index) => ({ id: `1-comment-${index + 1}`, content: 'ok' }))
+          : [{ id: '1-comment-11', content: 'tail' }] });
+      }
       return send(200, { comments: [{ id: `${url.searchParams.get('record')}-comment`, content: 'ok' }] });
     }
     if (url.pathname === '/k/v1/file.json') {
@@ -141,6 +173,7 @@ test('P2-M3 resumes a failed cursor from its checkpoint without duplicate record
     onCheckpoint: (checkpoint) => { savedCheckpoint = checkpoint; },
   });
   assert.equal(first.evidence.unavailable.some((item) => item.item === 'records'), true);
+  assert.equal(first.evidence.unavailable.some((item) => item.item === 'comments:2'), true);
   assert.deepEqual(first.records.map((record) => record.$id.value), ['1', '2']);
   assert.equal(first.subtableStates.find((item) => item.sourceRecordId === '1').valueState, 'EMPTY');
   assert.equal(first.subtableStates.find((item) => item.sourceRecordId === '2').valueState, 'NULL');
@@ -160,7 +193,11 @@ test('P2-M3 resumes a failed cursor from its checkpoint without duplicate record
   const resumed = await adapter.extract('app-1', true, { checkpoint: retriedCheckpoint });
   assert.deepEqual(resumed.records.map((record) => record.$id.value), ['1', '2', '3']);
   assert.equal(new Set(resumed.records.map((record) => record.$id.value)).size, 3);
-  assert.deepEqual(resumed.comments.map((comment) => comment.id), ['1-comment', '2-comment', '3-comment']);
+  assert.deepEqual(resumed.comments.map((comment) => comment.id), [
+    ...Array.from({ length: 10 }, (_, index) => `1-comment-${index + 1}`),
+    '1-comment-11', '3-comment',
+  ]);
+  assert.equal(resumed.evidence.unavailable.some((item) => item.item === 'comments:2'), true);
   assert.deepEqual(cursorQueries, ['$id > 0 order by $id asc', '$id > 2 order by $id asc']);
   const row = resumed.subtableRows[0];
   assert.equal(row.targetRowId, stableSourceUuid('kintone:app-1:record:3:table:lines:row:row3'));
@@ -175,11 +212,38 @@ test('P2-M3 resumes a failed cursor from its checkpoint without duplicate record
   const denied = await adapter.preflight('app-1');
   assert.equal(Object.hasOwn(denied.available, 'fields'), false);
   assert.match(denied.unavailable.find((item) => item.item === 'fields').reason, /permission denied/);
+  denyFields = false;
+  denySecondRecordComments = false;
+  denyAppAcl = true;
+  const deniedAcl = await adapter.extract('app-1', true);
+  assert.equal(deniedAcl.sourceMetadata.acl.app, undefined);
+  assert.equal(deniedAcl.evidence.unavailable.some((item) => item.item === 'appAcl'), true);
+  denyAppAcl = false;
+  includeSourceWorkflow = true;
+  includeSourceAcl = true;
+  includeSourceLayout = true;
+  const gated = await adapter.extract('app-1', true);
+  assert.equal(gated.packageReady, false);
+  assert.ok(gated.gateProblems.some((problem) => problem.includes('workflow')));
+  assert.ok(gated.gateProblems.some((problem) => problem.includes('permissions')));
+  assert.ok(gated.gateProblems.some((problem) => problem.includes('layout')));
+  const accepted = await adapter.extract('app-1', true, {
+    acceptWorkflowDowngrade: true, acceptPermissionDowngrade: true, acceptLayoutDowngrade: true,
+  });
+  assert.equal(accepted.packageReady, true);
+  assert.deepEqual(accepted.downgrades.map(({ item }) => item).sort(), ['layout', 'permissions', 'workflow']);
+  const acceptedPackage = require('../../../apps/api/dist/kintone-import.js')
+    .buildM1CompatiblePackage(accepted);
+  assert.deepEqual(require('../../../apps/api/dist/export-package.js')
+    .verifyPackage(acceptedPackage.archive).problems, []);
+  assert.equal(acceptedPackage.manifest.inclusion.kintoneWorkflow, 'unsupported');
+  assert.equal(acceptedPackage.manifest.inclusion.kintonePermissions, 'unsupported');
+  assert.equal(acceptedPackage.manifest.inclusion.kintoneLayout, 'unsupported');
 
 });
 
 test('P2-M3 builds only frozen, complete kintone data as a verifiable M1 package', async () => {
-  const { buildM1CompatiblePackage, stableSourceUuid } = await import('../../../apps/api/dist/kintone-import.js');
+  const { buildM1CompatiblePackage, mapKintoneField, stableSourceUuid } = await import('../../../apps/api/dist/kintone-import.js');
   const { verifyPackage } = await import('../../../apps/api/dist/export-package.js');
   const appId = '123';
   const extractedAt = '2026-11-23T00:00:00.000Z';
@@ -187,6 +251,9 @@ test('P2-M3 builds only frozen, complete kintone data as a verifiable M1 package
     sourceFieldCode: 'title', sourceType: 'SINGLE_LINE_TEXT', targetType: 'text',
     status: 'EQUIVALENT', reason: 'direct', sourceConfig: {}, sourceUnavailable: false, upgradeRequired: false,
   };
+  const tableField = mapKintoneField({
+    code: 'lines', type: 'SUBTABLE', fields: { item: { type: 'SINGLE_LINE_TEXT', label: 'Item' } },
+  });
   const sourceRowId = stableSourceUuid(`kintone:${appId}:row:1`);
   const body = Buffer.from('attachment-body');
   const extraction = {
@@ -194,17 +261,22 @@ test('P2-M3 builds only frozen, complete kintone data as a verifiable M1 package
       source: 'kintone', appId, appName: 'M3 Test', extractedAt, settingVersion: '1',
       recordIdRange: { min: '1', max: '1' }, frozenWindow: true, unavailable: [],
     },
-    compatibility: [field],
+    compatibility: [field, tableField],
     records: [{ $id: { value: '1' }, title: { value: 'Hello' } }],
-    comments: [{ id: '10', recordId: '1', content: 'Review', creator: { code: 'alice' }, createdAt: extractedAt }],
+    comments: [{
+      id: '10', recordId: '1', content: 'Hello @Alice', creator: { code: 'alice' },
+      mentions: [{ code: 'alice', name: 'Alice' }], createdAt: extractedAt,
+    }],
     attachments: [{
       recordId: '1', fieldCode: 'files', fileKey: 'fk-1', name: 'a.txt',
       bytes: body.length, sha256: require('node:crypto').createHash('sha256').update(body).digest('hex'), body,
     }],
     subtableRows: [{
       sourceRecordId: '1', sourceTableCode: 'lines', sourceRowId: 'row-1',
-      targetRowId: sourceRowId, rowOrder: 0, data: { item: 'A' }, attachments: [],
+      targetRowId: stableSourceUuid(`kintone:${appId}:record:1:table:lines:row:row-1`),
+      rowOrder: 0, data: { item: { value: 'A' } }, attachments: [],
     }],
+    subtableStates: [{ sourceRecordId: '1', sourceTableCode: 'lines', valueState: 'ROWS', rowCount: 1 }],
     blocking: [],
     packageReady: true,
   };
@@ -216,6 +288,14 @@ test('P2-M3 builds only frozen, complete kintone data as a verifiable M1 package
   assert.equal(verification.manifest.counts.actual.attachments, 1);
   assert.equal(verification.manifest.counts.actual.comments, 1);
   assert.equal(verification.manifest.counts.actual.tableRows, 1);
+  const { unzipSync } = require('../../../apps/api/node_modules/fflate');
+  const packageFiles = unzipSync(new Uint8Array(sealed.archive));
+  const importedComments = JSON.parse(Buffer.from(packageFiles['data/comments.json']).toString()).comments;
+  assert.deepEqual(importedComments[0].mentions, [{
+    userId: stableSourceUuid(`kintone:${appId}:user:alice`), offset: 6, length: 6,
+  }]);
+  const directory = JSON.parse(Buffer.from(packageFiles['data/directory.json']).toString());
+  assert.equal(directory.users[0].id, stableSourceUuid(`kintone:${appId}:user:alice`));
 
   assert.throws(() => buildM1CompatiblePackage({
     ...extraction,
