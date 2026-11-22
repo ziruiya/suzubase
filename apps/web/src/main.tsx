@@ -8,6 +8,7 @@ import { BulkEdit } from './bulk-edit';
 import { useSelectorOptions } from './selector-options';
 import { RecycleBin } from './recycle-bin';
 import { Settings } from './settings';
+import { ImportWizard } from './import-export';
 import { Directory } from './directory';
 import { NotificationCenter, useUnread } from './notification-center';
 import { Comments } from './comments';
@@ -22,6 +23,7 @@ type Archive = { data: Record<string, string>; definitions: Record<string, Field
 type History = {
   events: { eventId: string; actorLabel: string; kind: string; occurredAt: string; schemaVersion: number;
     workflow?: { action: string | null; from: string | null; to: string | null; reason: string | null; assigneeIds: string[] };
+    source?: string; migration?: { importJobId: string; sourceActorId: string | null; sourceTimestamp: string | null };
     changes: { fieldId: string; rowId?: string; childFieldId?: string; rowChange?: string; oldValue: string | null; newValue: string | null }[] }[];
   schemas: Record<number, Field[]>;
 };
@@ -89,6 +91,7 @@ function Portal({ session, navigate, narrow }: { session: Session; navigate: (id
   const [error, setError] = useState('');
   const [creating, setCreating] = useState(false);
   const [tasks, setTasks] = useState(false);
+  const [imports, setImports] = useState(false);
   const { profile, token } = session;
   useEffect(() => { void api<AppSummary[]>('/apps', token).then(setApps).catch((error) => setError(message(error))); }, []);
   async function create(event: FormEvent<HTMLFormElement>) {
@@ -109,6 +112,8 @@ function Portal({ session, navigate, narrow }: { session: Session; navigate: (id
         <button className="primary" onClick={() => setCreating(!creating)}>{creating ? 'Cancel' : 'New application'}</button>}</div>
     <button type="button" aria-expanded={tasks} onClick={() => setTasks(!tasks)}>My tasks</button>
     {tasks && <Tasks token={token} apps={apps} open={navigate} />}
+    {profile.isAdmin && <button type="button" aria-expanded={imports} onClick={() => setImports(!imports)}>Import migration package</button>}
+    {imports && profile.isAdmin && <ImportWizard session={session} />}
     {error && <p className="error" role="alert">{error}</p>}
     {creating && <form className="panel stack" onSubmit={(event) => void create(event)}>
       <label>Name <input name="name" required /></label>
@@ -252,6 +257,7 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
           {!app.archivedAt && app.can.delete && form.can.delete && <button onClick={() => setConfirm(true)}>Move to recycle bin</button>}
         </div>
       </div>
+      {form.record.migration && <p className="notice">Migrated record · source record no. {form.record.migration.sourceRecordNo ?? '—'} · original author {form.record.migration.sourceActorName ?? form.record.migration.sourceActorId ?? 'unknown'}</p>}
       {confirm && <section className="notice" aria-label="Confirm record deletion">
         <p>Move record {form.record.recordNo} from Active to Recycle bin?</p>
         <div className="inline"><button onClick={() => setConfirm(false)}>Cancel</button>
@@ -293,6 +299,7 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
         </div>
         <ol className="history">{history.events.map((event) =>
         <li key={event.eventId}><strong>{event.kind === 'WORKFLOW_REPAIR' ? 'Workflow repair' : event.kind}</strong> · {event.actorLabel}
+          {event.migration && <span > · Migrated · original actor {event.migration.sourceActorId ?? 'unknown'}</span>}
           <time>{new Date(event.occurredAt).toLocaleString(undefined, { timeZone: session.profile.timeZone })}</time>
           {event.workflow && <div>{event.workflow.action ?? event.kind} · {event.workflow.from ?? '—'} → {event.workflow.to ?? '—'}
             {event.workflow.reason && ' · ' + event.workflow.reason}

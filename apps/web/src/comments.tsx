@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { api, appPath, json, message, type Session } from './api';
 
 type Part = { kind: 'text'; text: string } | { kind: 'mention'; userId: string; name: string };
-type Comment = { id: string; author: string; createdAt: string; deleted: boolean; canDelete: boolean; parts: Part[] };
+type Comment = { id: string; author: string; createdAt: string; deleted: boolean; canDelete: boolean; parts: Part[]; migration?: { importJobId: string; sourceActorId: string | null; sourceTimestamp: string | null } };
 type Page = { items: Comment[]; next: string | null };
 
 function CommentParts({ parts }: { parts: Part[] }) {
@@ -91,6 +91,7 @@ export function Comments({ appId, recordId, session, archived, refresh }: {
       {!page.items.length && <p>No comments</p>}
       <ol className="plain stack">{page.items.map((item) => <li key={item.id} className="panel">
         <strong>{item.author}</strong> · <time>{new Date(item.createdAt).toLocaleString(undefined, { timeZone: session.profile.timeZone })}</time>
+        {item.migration && <span> · Migrated comment (original author and time preserved)</span>}
         <p className="comment-body">{item.deleted ? 'Comment deleted' : <CommentParts parts={item.parts} />}</p>
         {item.canDelete && (deleting === item.id ? <div className="inline">
           <button className="danger" type="button" disabled={busy} onClick={() => void mutate('/' + item.id, 'DELETE')}>Confirm delete comment</button>

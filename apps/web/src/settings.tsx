@@ -8,6 +8,7 @@ import { NotificationSettings } from './notification-settings';
 import { WorkflowSettings } from './workflow-settings';
 import { ViewSettings } from './view-settings';
 import { IndexSettings } from './index-settings';
+import { ExportPanel } from './import-export';
 import { LayoutDesigner } from './form-layout';
 import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
 
@@ -164,7 +165,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
       <button className="primary" disabled={busy}>Save settings</button>
     </form>}
     {active === 'Indexes' && <IndexSettings app={app} session={session} />}
-    {active === 'Import / export' && <CsvSettings app={app} session={session} />}
+    {active === 'Import / export' && <div className="stack"><CsvSettings app={app} session={session} /><ExportPanel app={app} session={session} /></div>}
     {(active === 'Form' || active === 'Views' || active === 'Permissions' || active === 'Notifications') && draft?.version && <div className="inline">
       <button className="primary" disabled={busy} onClick={() => void run(async () => {
         setPreflight(undefined);
