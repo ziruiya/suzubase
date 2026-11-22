@@ -140,7 +140,7 @@ export async function buildFixtureApp1(api, adminDbUrl, { suffix = '' } = {}) {
   f.docs = await field('docs', '添付資料', 'attachment');
   f.legacy = await field('legacy-memo', '旧メモ', 'text');
   f.calc = await field('amount-x2', '金額×2', 'calculation', {
-    formula: [{ kind: 'field', fieldId: f.amount.fieldId }, { kind: 'operator', operator: '*' }, { kind: 'number', value: '2' }],
+    formula: [{ kind: 'field', fieldId: f.amount.fieldId }, { kind: 'number', value: '2' }, { kind: 'operator', operator: '*' }],
   });
   const childName = randomUUID(); const childQty = randomUUID();
   f.lines = await api.expect(token, 201, base + '/fields', { method: 'POST', body: {
@@ -161,11 +161,18 @@ export async function buildFixtureApp1(api, adminDbUrl, { suffix = '' } = {}) {
   await api.expect(token, 200, base + '/draft/acl', { method: 'PUT', body: {
     app: [
       { action: 'view', subject: { kind: 'user', id: member.userId } },
+      { action: 'edit', subject: { kind: 'user', id: member.userId } },
       { action: 'view', subject: { kind: 'group', id: group.id } },
       { action: 'workflow-repair', subject: { kind: 'user', id: owner.userId } },
     ],
     record: [
+      // The creator needs an unconditional rule once record ACL exists
+      // (the Gate 1 search-test convention), or record creation is denied.
+      { action: 'view', subject: { kind: 'user', id: owner.userId }, conditions: [] },
+      { action: 'edit', subject: { kind: 'user', id: owner.userId }, conditions: [] },
       { action: 'view', subject: { kind: 'user', id: member.userId },
+        conditions: [{ fieldId: f.select.fieldId, operator: 'eq', value: 'public' }] },
+      { action: 'edit', subject: { kind: 'user', id: member.userId },
         conditions: [{ fieldId: f.select.fieldId, operator: 'eq', value: 'public' }] },
       { action: 'view', subject: { kind: 'group', id: group.id },
         conditions: [{ fieldId: f.select.fieldId, operator: 'eq', value: 'public' }] },
@@ -185,9 +192,11 @@ export async function buildFixtureApp1(api, adminDbUrl, { suffix = '' } = {}) {
     { id: sMid, code: 'doing', name: '対応中', initial: false, terminal: false, assignees: [{ kind: 'user', id: member.userId }] },
     { id: sDone, code: 'done', name: '完了', initial: false, terminal: true, assignees: [] },
   ], actions: [
-    { id: aStart, name: '対応開始', fromStateId: sOpen, toStateId: sMid, assignees: [], conditions: [] },
+    // Action assignees decide who holds the record after the transition
+    // (the Gate 2 workflow pattern); state assignees are the fallback.
+    { id: aStart, name: '対応開始', fromStateId: sOpen, toStateId: sMid, assignees: [{ kind: 'user', id: member.userId }], conditions: [] },
     { id: aFinish, name: '完了', fromStateId: sMid, toStateId: sDone, assignees: [], conditions: [] },
-    { id: aReject, name: '差戻し', fromStateId: sMid, toStateId: sOpen, assignees: [], conditions: [] },
+    { id: aReject, name: '差戻し', fromStateId: sMid, toStateId: sOpen, assignees: [{ kind: 'creator' }], conditions: [] },
   ] } });
   await api.expect(token, 201, base + '/workflow/publish', { method: 'POST' });
   await api.expect(token, 200, base + '/workflow/enabled', { method: 'PATCH', body: { enabled: true } });
@@ -241,26 +250,30 @@ export async function buildFixtureApp1(api, adminDbUrl, { suffix = '' } = {}) {
       method: 'POST', body: { action_id: actionId, revision: current.revision },
     });
   };
-  for (let i = 0; i < 12; i++) await act(records[i], aStart);
-  for (let i = 0; i < 8; i++) await act(records[i], aFinish, undefined, memberToken);
-  await act(records[12], aStart);
-  await act(records[12], aReject, undefined, memberToken);
+  // Member-executed transitions need records the member may view
+  // (record ACL: visibility = public, i.e. index % 4 !== 0).
+  const publicRecords = records.filter((_, index) => index % 4 !== 0);
+  for (let i = 0; i < 12; i++) await act(publicRecords[i], aStart);
+  for (let i = 0; i < 8; i++) await act(publicRecords[i], aFinish, undefined, memberToken);
+  await act(publicRecords[12], aStart);
+  await act(publicRecords[12], aReject, undefined, memberToken);
   const repairTarget = await api.expect(token, 200, `${base}/records/${records[13].id}`, {});
   const repaired = await api.expect(token, 201, `${base}/records/${records[13].id}/workflow/repair`, {
     method: 'POST', body: { revision: repairTarget.revision, stateId: sMid, reason: '誤配送の復旧', userIds: [member.userId] },
   });
 
   // Comments: two live (one with @mention by the member), one deleted.
-  const c1 = await api.expect(token, 201, `${base}/records/${records[0].id}/comments`, {
+  // Comments live on record 2 (public visibility, so the member can comment).
+  const c1 = await api.expect(token, 201, `${base}/records/${records[1].id}/comments`, {
     method: 'POST', body: { parts: [{ kind: 'text', text: '初回連絡済みです。' }] },
   });
-  const c2 = await api.expect(memberToken, 201, `${base}/records/${records[0].id}/comments`, {
+  const c2 = await api.expect(memberToken, 201, `${base}/records/${records[1].id}/comments`, {
     method: 'POST', body: { parts: [{ kind: 'text', text: '確認しました ' }, { kind: 'mention', userId: owner.userId }] },
   });
-  const c3 = await api.expect(token, 201, `${base}/records/${records[1].id}/comments`, {
+  const c3 = await api.expect(token, 201, `${base}/records/${records[2].id}/comments`, {
     method: 'POST', body: { parts: [{ kind: 'text', text: '削除予定コメント' }] },
   });
-  await api.expect(token, 200, `${base}/records/${records[1].id}/comments/${c3.id}`, { method: 'DELETE' });
+  await api.expect(token, 200, `${base}/records/${records[2].id}/comments/${c3.id}`, { method: 'DELETE' });
 
   // Attachments: three PDFs on record 1 (multiple files, single version each),
   // one file attached then detached (lifecycle DELETED), one left READY.
@@ -278,9 +291,13 @@ export async function buildFixtureApp1(api, adminDbUrl, { suffix = '' } = {}) {
   await upload('fixture-ready-only');
   const withFiles = async (record, fileIds) => {
     const current = await api.expect(token, 200, `${base}/records/${record.id}`, {});
-    // Partial-form PUT (same shape the Wave B tests use): resubmit the title
-    // plus the attachment field only; computed/auto-number fields stay server-side.
-    const data = { [f.name.fieldId]: current.data[f.name.fieldId], [f.docs.fieldId]: JSON.stringify(fileIds) };
+    // Record PUT replaces the whole form: resubmit every stored value except
+    // the server-owned calculation / auto-number fields, with the new
+    // attachment list. (A partial PUT would silently drop the other fields.)
+    const data = { ...current.data };
+    delete data[f.calc.fieldId];
+    delete data[f.numbering.fieldId];
+    data[f.docs.fieldId] = JSON.stringify(fileIds);
     return api.expect(token, 200, `${base}/records/${record.id}`, { method: 'PUT', body: { revision: current.revision, data } });
   };
   await withFiles(records[0], [fileA.id, fileB.id]);
