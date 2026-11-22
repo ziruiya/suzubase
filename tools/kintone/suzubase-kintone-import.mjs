@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+const distUrl = new URL('../../apps/api/dist/kintone-import.js', import.meta.url);
+const { KintoneSourceAdapter, validateKintoneDomain } = await import(distUrl);
+
+const [command, appId] = process.argv.slice(2);
+if (!['preflight', 'extract'].includes(command) || !appId) {
+  console.error('usage: suzubase-kintone-import.mjs preflight|extract <kintone-app-id>');
+  process.exit(2);
+}
+if (!process.env.KINTONE_API_TOKEN) {
+  console.error('KINTONE_API_TOKEN is required');
+  process.exit(2);
+}
+if (!process.env.KINTONE_SOURCE_ORIGIN) {
+  console.error('KINTONE_SOURCE_ORIGIN is required');
+  process.exit(2);
+}
+
+let origin;
+try { origin = validateKintoneDomain(process.env.KINTONE_SOURCE_ORIGIN); }
+catch (error) { console.error(error instanceof Error ? error.message : 'invalid kintone source'); process.exit(2); }
+
+const adapter = new KintoneSourceAdapter(origin, process.env.KINTONE_API_TOKEN);
+try {
+  if (command === 'preflight') {
+    const result = await adapter.preflight(appId);
+    console.log(JSON.stringify({
+      appId,
+      availableApis: Object.keys(result.available),
+      unavailableApis: result.unavailable,
+      result: result.unavailable.length ? 'BLOCKED' : 'READY',
+    }, null, 2));
+  } else {
+    const frozen = process.env.KINTONE_FREEZE_WINDOW_CONFIRMED === 'true';
+    const result = await adapter.extract(appId, frozen);
+    if (!frozen) result.evidence.unavailable.push({
+      item: 'full-snapshot-consistency',
+      reason: 'KINTONE_FREEZE_WINDOW_CONFIRMED=true is required for a provable full migration snapshot',
+      evidence: null,
+    });
+    const report = {
+      ...result,
+      finalM1BusinessResult: result.packageReady && frozen ? 'PENDING_ACTIVATION' : 'BLOCKED',
+      dataCompleteness: null,
+      functionEquivalenceCount: result.compatibility.filter((item) => item.status === 'EQUIVALENT').length,
+      unresolvedDependencyCount: result.compatibility.filter((item) => item.status === 'UNRESOLVED').length,
+      unsupportedCount: result.compatibility.filter((item) => item.status === 'UNSUPPORTED').length,
+      sourceUnavailableCount: result.evidence.unavailable.length,
+    };
+    const outDir = resolve(process.env.KINTONE_REPORT_DIR ?? './kintone-reports');
+    mkdirSync(outDir, { recursive: true });
+    const out = resolve(outDir, `kintone-${appId}-${Date.now()}.json`);
+    writeFileSync(out, JSON.stringify(report, null, 2));
+    console.log(JSON.stringify({ report: out, result: report.finalM1BusinessResult,
+      recordsExtracted: result.records.length, compatibility: report.functionEquivalenceCount }));
+  }
+} catch (error) {
+  console.error(error instanceof Error ? error.message : 'kintone extraction failed');
+  process.exit(1);
+}
