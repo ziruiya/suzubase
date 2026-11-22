@@ -99,6 +99,9 @@ export function ImportWizard({ session }: { session: Session }) {
     <p className="muted">Restore an application from a sealed migration package exported by another
       deployment. The package contains complete business data and must be handled as sensitive data.
       Imports always create a new application; nothing is overwritten.</p>
+    <p className="muted">Boundary: this migration package is not a disaster backup, and a deployment
+      backup is not a migration tool. Use deployment backups for disaster recovery of a whole
+      deployment; use this package only to move one application.</p>
     <label>Package file (.zip)
       <input type="file" accept=".zip,application/zip" disabled={busy} onChange={(event) => {
         const file = event.target.files?.[0];
@@ -362,6 +365,9 @@ export function ExportPanel({ app, session }: { app: App; session: Session }) {
     <p className="muted">A sealed package carries the complete application — schema, records,
       subtables, attachments, comments, history, workflows and configuration — for restore on
       another deployment. It contains sensitive business data.</p>
+    <p className="muted">Boundary: this migration package is not a disaster backup, and a deployment
+      backup is not a migration tool. Disaster recovery of a whole deployment uses deployment
+      backups, never this package.</p>
     {error && <p role="alert" className="error">{error}</p>}
     <div className="inline">
       <button type="button" className="primary" disabled={busy} onClick={() => void run(() =>
