@@ -64,9 +64,11 @@
 - P2 backup alert persistence test: pass.
 - P2 kintone source safety/mapping test: pass.
 - API and DB builds/typechecks pass.
-- Full database integration suite could not run locally because
-  `MIGRATION_DATABASE_URL` and the PostgreSQL test environment are not available
-  in the current shell.
+- Integrated Docker/PostgreSQL suite: `96/96` pass.
+- Migration `0034_gate2_system_notifications.sql` is registered in
+  `meta/_journal.json` and applied in the local integration database.
+- A post-migration OpenAPI contract regression was found and fixed for
+  `/notifications/system/deliver`; the full suite passed after the fix.
 
 ## Explicit degradations and unavailable items
 
