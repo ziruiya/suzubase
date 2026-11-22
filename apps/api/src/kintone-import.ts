@@ -91,6 +91,31 @@ export interface KintoneSubtableRow {
   attachments: { fileKey: string; sha256: string | null; bytes: number | null }[];
 }
 
+export interface KintoneSubtableState {
+  sourceRecordId: string;
+  sourceTableCode: string;
+  valueState: 'NULL' | 'EMPTY' | 'ROWS';
+  rowCount: number;
+}
+
+export interface KintoneExtractionCheckpoint {
+  appId: string;
+  lastRecordId: string | null;
+  records: any[];
+  comments: any[];
+  attachments: KintoneExtractionResult['attachments'];
+  subtableRows: KintoneSubtableRow[];
+  subtableStates: KintoneSubtableState[];
+  unavailable: SourceEvidence['unavailable'];
+}
+
+export interface KintoneAttachmentReference {
+  recordId: string;
+  fieldCode: string;
+  fileKey: string;
+  name?: string | null;
+}
+
 function isPrivateHostname(hostname: string): boolean {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (lower === 'localhost' || lower.endsWith('.localhost')) return true;
@@ -232,6 +257,7 @@ export interface KintoneExtractionResult {
     body?: Uint8Array;
   }[];
   subtableRows: KintoneSubtableRow[];
+  subtableStates: KintoneSubtableState[];
   blocking: FieldCompatibility[];
   packageReady: boolean;
 }
@@ -349,6 +375,7 @@ export function buildM1CompatiblePackage(
     sourceEvidence: extraction.evidence,
     fields: extraction.compatibility,
     subtableRows: extraction.subtableRows,
+    subtableStates: extraction.subtableStates,
     attachments: extraction.attachments.map(({ body: _body, ...file }) => file),
     comments: extraction.comments,
   };
@@ -434,7 +461,8 @@ export class KintoneSourceAdapter {
   private readonly origin: string;
 
   constructor(origin: string, private readonly apiToken: string,
-    private readonly timeoutMs = 15000, private readonly maxRetries = 2) {
+    private readonly timeoutMs = 15000, private readonly maxRetries = 2,
+    private readonly fetcher: typeof fetch = fetch) {
     this.origin = validateKintoneDomain(origin);
   }
 
@@ -442,7 +470,7 @@ export class KintoneSourceAdapter {
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       let response: Response;
       try {
-        response = await fetch(this.origin + path, {
+        response = await this.fetcher(this.origin + path, {
           method,
           headers: { 'X-Cybozu-API-Token': this.apiToken, 'Content-Type': 'application/json' },
           body: body === undefined ? undefined : JSON.stringify(body),
@@ -462,6 +490,35 @@ export class KintoneSourceAdapter {
       return response.headers.get('content-type')?.includes('application/json') ? response.json() : response.arrayBuffer();
     }
     throw new Error('kintone request retry limit exceeded');
+  }
+
+  async downloadAttachment(fileKey: string) {
+    const downloaded = await this.request('GET', `/k/v1/file.json?fileKey=${encodeURIComponent(fileKey)}`);
+    return downloaded instanceof ArrayBuffer ? new Uint8Array(downloaded) : null;
+  }
+
+  async retryAttachment(checkpoint: KintoneExtractionCheckpoint, reference: KintoneAttachmentReference) {
+    const bytes = await this.downloadAttachment(reference.fileKey);
+    if (!bytes) throw new Error('kintone attachment response did not contain a byte stream');
+    const sha256 = sha256Buffer(bytes);
+    const item = `attachment:${reference.recordId}:${reference.fieldCode}:${reference.fileKey}`;
+    const attachments = checkpoint.attachments.filter((file) =>
+      file.recordId !== reference.recordId || file.fieldCode !== reference.fieldCode ||
+      file.fileKey !== reference.fileKey);
+    attachments.push({
+      recordId: reference.recordId, fieldCode: reference.fieldCode, fileKey: reference.fileKey,
+      name: reference.name ?? null, bytes: bytes.byteLength, sha256, body: bytes,
+    });
+    const subtableRows = checkpoint.subtableRows.map((row) => row.sourceRecordId !== reference.recordId ||
+      !reference.fieldCode.startsWith(`${row.sourceTableCode}.`) ? row : {
+        ...row,
+        attachments: row.attachments.map((file) => file.fileKey === reference.fileKey
+          ? { fileKey: file.fileKey, bytes: bytes.byteLength, sha256 } : file),
+      });
+    return {
+      ...checkpoint, attachments, subtableRows,
+      unavailable: checkpoint.unavailable.filter((entry) => entry.item !== item),
+    };
   }
 
   async preflight(appId: string) {
@@ -486,7 +543,14 @@ export class KintoneSourceAdapter {
     return { available, unavailable };
   }
 
-  async extract(appId: string, frozenWindow = false, options: { acceptCalcDataOnly?: boolean } = {}) {
+  async extract(appId: string, frozenWindow = false, options: {
+    acceptCalcDataOnly?: boolean;
+    checkpoint?: KintoneExtractionCheckpoint;
+    onCheckpoint?: (checkpoint: KintoneExtractionCheckpoint) => void | Promise<void>;
+  } = {}) {
+    if (options.checkpoint && options.checkpoint.appId !== appId) {
+      throw new Error('kintone checkpoint belongs to a different source application');
+    }
     const preflight = await this.preflight(appId);
     if (!preflight.available.app) throw new Error('kintone app metadata unavailable; extraction blocked');
     const app = preflight.available.app as any;
@@ -495,64 +559,91 @@ export class KintoneSourceAdapter {
     const compatibility = fields.map((field) => mapKintoneField(field, {
       fields, acceptCalcDataOnly: options.acceptCalcDataOnly,
     }));
-    const records: any[] = [];
-    const comments: any[] = [];
-    const attachments: any[] = [];
-    const subtableRows: KintoneSubtableRow[] = [];
+    const checkpoint = options.checkpoint;
+    const records: any[] = [...(checkpoint?.records ?? [])];
+    const comments: any[] = [...(checkpoint?.comments ?? [])];
+    const attachments: KintoneExtractionResult['attachments'] = [...(checkpoint?.attachments ?? [])];
+    const subtableRows: KintoneSubtableRow[] = [...(checkpoint?.subtableRows ?? [])];
+    const subtableStates: KintoneSubtableState[] = [...(checkpoint?.subtableStates ?? [])];
+    preflight.unavailable.push(...(checkpoint?.unavailable ?? []).filter(({ item }) => item !== 'records'));
+    let lastRecordId = checkpoint?.lastRecordId ?? null;
+    const captureAttachment = async (recordId: string, fieldCode: string, file: any) => {
+      if (!file.fileKey) return null;
+      try {
+        const bytes = await this.downloadAttachment(file.fileKey);
+        if (!bytes) throw new Error('kintone attachment response did not contain a byte stream');
+        attachments.push({
+          recordId, fieldCode, fileKey: file.fileKey,
+          name: file.name ?? null, bytes: bytes.byteLength, sha256: sha256Buffer(bytes), body: bytes,
+        });
+        return { fileKey: file.fileKey, sha256: sha256Buffer(bytes), bytes: bytes.byteLength };
+      } catch (error) {
+        preflight.unavailable.push({
+          item: `attachment:${recordId}:${fieldCode}:${file.fileKey}`,
+          reason: error instanceof Error ? error.message : 'attachment unavailable',
+          evidence: null,
+        });
+        return { fileKey: file.fileKey, sha256: null, bytes: null };
+      }
+    };
     let cursorId: string | undefined;
     try {
+      if (lastRecordId !== null && !/^\d+$/.test(lastRecordId)) {
+        throw new Error('kintone checkpoint source record ID is not a numeric cursor boundary');
+      }
       const cursor = await this.request('POST', '/k/v1/records/cursor.json', {
         app: appId,
         fields: ['$', '$id', '$revision', ...fields.map((field) => field.code)],
         size: 500,
+        ...(lastRecordId === null ? { query: '$id > 0 order by $id asc' } :
+          { query: `$id > ${lastRecordId} order by $id asc` }),
       }) as any;
       cursorId = cursor.id;
       while (cursorId) {
         const page = await this.request('POST', '/k/v1/records/cursor.json', { id: cursorId }) as any;
-        records.push(...(page.records ?? []));
         if (!page.records || !Array.isArray(page.records)) {
           preflight.unavailable.push({ item: 'records', reason: 'cursor returned a non-record page', evidence: { next: page.next } });
           break;
         }
+        records.push(...page.records);
         for (const record of page.records ?? []) {
           const recordId = String(record.$id?.value ?? '');
           for (const field of fields) {
             if (field.type === 'SUBTABLE') {
-              const rows = record[field.code]?.value ?? [];
-              rows.forEach((row: any, rowOrder: number) => {
+              const rawRows = record[field.code]?.value;
+              const rows = Array.isArray(rawRows) ? rawRows : [];
+              subtableStates.push({
+                sourceRecordId: recordId, sourceTableCode: field.code,
+                valueState: rawRows === null || rawRows === undefined ? 'NULL' : rows.length ? 'ROWS' : 'EMPTY',
+                rowCount: rows.length,
+              });
+              for (const [rowOrder, row] of rows.entries()) {
+                const sourceRowId = String(row.id ?? `${recordId}:${field.code}:${rowOrder}`);
+                const rowAttachments = [];
+                for (const [childCode, value] of Object.entries(row.value ?? {}) as [string, any][]) {
+                  if (Array.isArray(value?.value)) {
+                    for (const file of value.value.filter((item: any) => item?.fileKey)) {
+                      const attachment = await captureAttachment(recordId, `${field.code}.${childCode}`, file);
+                      if (attachment) rowAttachments.push(attachment);
+                    }
+                  }
+                }
                 subtableRows.push({
                   sourceRecordId: recordId,
                   sourceTableCode: field.code,
-                  sourceRowId: String(row.id ?? `${recordId}:${field.code}:${rowOrder}`),
-                  targetRowId: stableSourceUuid(`${appId}:${recordId}:${field.code}:${String(row.id ?? `${recordId}:${field.code}:${rowOrder}`)}`),
+                  sourceRowId,
+                  targetRowId: stableSourceUuid(
+                    `kintone:${appId}:record:${recordId}:table:${field.code}:row:${sourceRowId}`,
+                  ),
                   rowOrder,
                   data: row.value ?? {},
-                  attachments: Object.values(row.value ?? {}).flatMap((value: any) =>
-                    Array.isArray(value?.value) && value?.value?.every?.((item: any) => item.fileKey)
-                      ? value.value.map((item: any) => ({ fileKey: item.fileKey, sha256: null, bytes: null }))
-                      : []),
+                  attachments: rowAttachments,
                 });
-              });
+              }
             }
             if (field.type === 'FILE') {
               for (const file of record[field.code]?.value ?? []) {
-                if (!file.fileKey) continue;
-                try {
-                  const downloaded = await this.request('GET', `/k/v1/file.json?fileKey=${encodeURIComponent(file.fileKey)}`);
-                  const bytes = downloaded instanceof ArrayBuffer ? new Uint8Array(downloaded) : null;
-                  attachments.push({
-                    recordId, fieldCode: field.code, fileKey: file.fileKey,
-                    name: file.name ?? null, bytes: bytes?.byteLength ?? null,
-                    sha256: bytes ? sha256Buffer(bytes) : null,
-                    body: bytes,
-                  });
-                } catch (error) {
-                  preflight.unavailable.push({
-                    item: `attachment:${recordId}:${field.code}:${file.fileKey}`,
-                    reason: error instanceof Error ? error.message : 'attachment unavailable',
-                    evidence: null,
-                  });
-                }
+                await captureAttachment(recordId, field.code, file);
               }
             }
           }
@@ -577,6 +668,21 @@ export class KintoneSourceAdapter {
             });
           }
         }
+        if (page.records.length) {
+          const pageIds = page.records.map((record: any) => String(record.$id?.value ?? ''));
+          if (pageIds.some((id: string) => !/^\d+$/.test(id))) {
+            preflight.unavailable.push({
+              item: 'records', reason: 'source record IDs cannot form a safe resume cursor', evidence: pageIds,
+            });
+            break;
+          }
+          lastRecordId = pageIds.reduce((largest: string, id: string) =>
+            BigInt(id) > BigInt(largest) ? id : largest, pageIds[0]);
+          await options.onCheckpoint?.({
+            appId, lastRecordId, records, comments, attachments, subtableRows, subtableStates,
+            unavailable: preflight.unavailable,
+          });
+        }
         if (!page.next) break;
       }
       if (cursorId) await this.request('DELETE', '/k/v1/records/cursor.json', { id: cursorId }).catch(() => undefined);
@@ -586,11 +692,14 @@ export class KintoneSourceAdapter {
     const evidence: SourceEvidence = {
       source: 'kintone', appId, appName: String(app.name ?? ''),
       extractedAt: new Date().toISOString(), settingVersion: null,
-      recordIdRange: records.length ? { min: String(records[0].$id?.value ?? ''), max: String(records.at(-1)?.$id?.value ?? '') } : null,
+      recordIdRange: records.length ? {
+        min: records.map((record) => String(record.$id?.value ?? '')).sort((a, b) => BigInt(a) < BigInt(b) ? -1 : 1)[0],
+        max: records.map((record) => String(record.$id?.value ?? '')).sort((a, b) => BigInt(a) > BigInt(b) ? -1 : 1).at(0)!,
+      } : null,
       frozenWindow, unavailable: preflight.unavailable,
     };
     const blocking = compatibility.filter(({ status }) => status === 'UNSUPPORTED');
-    return { evidence, compatibility, records, comments, attachments, subtableRows, blocking,
+    return { evidence, compatibility, records, comments, attachments, subtableRows, subtableStates, blocking,
       packageReady: blocking.length === 0 &&
         preflight.unavailable.length === 0 &&
         Boolean(frozenWindow) &&
