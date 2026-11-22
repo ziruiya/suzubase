@@ -336,10 +336,13 @@
   verified functional equivalence **26/43 fields**; unresolved dependencies
   **15** (14 adapter-reported identity/choice/subtable mappings plus the
   unavailable lookup structure); unsupported fields **2** (`类别`, one per
-  app); explicit accepted downgrades **5** (A permissions 3 entries, workflow
+  app); permission/workflow/layout differences **5 groups** (A permissions 3 entries, workflow
   5 entries, layout 22 items; B permissions 2 entries, layout 5 items).
-  Downgrades were gate-accepted for reporting but none were materialized in a
-  target because neither package passed the M1 field/dependency gates.
+  These differences were originally drafted as gate-accepted downgrades;
+  acceptance ruling (Muse, 2026-11-23): reclassified as UNRESOLVED - the
+  converged brief forbids downgrading permissions and workflow, so nothing
+  was accepted. Consistently, none were materialized in a target because
+  neither package passed the M1 field/dependency gates.
 - **Final M1 business result:** App A: **PENDING_COMPLETION** (lookup,
   identity/choice mappings, category, and table-file mapping); App B:
   **PENDING_COMPLETION** (category and identity mappings). No M1 package was
