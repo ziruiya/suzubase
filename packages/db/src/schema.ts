@@ -653,7 +653,7 @@ export const csvJobs = pgTable('csv_jobs', {
   id: uuid().notNull().defaultRandom(),
   userId: uuid('user_id').notNull(),
   schemaVersion: integer('schema_version').notNull(),
-  rows: jsonb().$type<{ line: number; data: RecordData }[]>().notNull(),
+  rows: jsonb().$type<{ line: number; data: RecordData; recordNo?: string; lines?: number[] }[]>().notNull(),
   headers: jsonb().$type<string[]>().notNull(),
   errors: jsonb().$type<{ line: number; cells: string[]; issues: unknown[] }[]>().notNull(),
   lookupColumns: jsonb('lookup_columns').$type<string[]>().notNull(),

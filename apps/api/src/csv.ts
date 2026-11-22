@@ -4,12 +4,13 @@ import {
   NotFoundException, Param, Post, Query, ServiceUnavailableException, StreamableFile, UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiProduces, ApiTags } from '@nestjs/swagger';
-import { and, csvJobs, eq, records, sql, TenantContext, TenantTransaction, withTenantTransaction } from '@suzubase/db';
-import { relatedCountHelp, RecordData, RelatedConfiguration } from '@suzubase/shared-types';
+import { and, csvJobs, eq, inArray, records, recordTableRows, sql, TenantContext, TenantTransaction, withTenantTransaction } from '@suzubase/db';
+import { lookupTargets, relatedCountHelp, RecordData, RelatedConfiguration } from '@suzubase/shared-types';
 import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 import { zipSync } from 'fflate';
 import { z } from 'zod';
+import { mapCsvRows, tableHeaders, type CsvRow } from './csv-rows';
 import { AppSchemaService } from './app-schema';
 import { FileService } from './files';
 import { AuthenticatedTenant, SessionGuard } from './identity';
@@ -32,7 +33,6 @@ export const csvHttp = { preflightInput, batchInput, exportQuery };
 type Job = typeof csvJobs.$inferSelect;
 
 class PreflightRollback extends Error {}
-class RowRollback extends Error {}
 
 function csvFile(rows: string[][], name: string) {
   return new StreamableFile(Buffer.from(stringify(rows, { escape_formulas: true })), {
@@ -60,6 +60,8 @@ function jobSummary(job: Job) {
   return {
     id: job.id, schemaVersion: job.schemaVersion, eligible: job.rows.length, failed: job.errors.length,
     imported: job.imported, remaining: job.rows.length - job.imported, lookupColumns: job.lookupColumns,
+    eligibleRows: job.rows.reduce((sum, row) => sum + (row.lines?.length ?? 1), 0),
+    importedRows: job.rows.slice(0, job.imported).reduce((sum, row) => sum + (row.lines?.length ?? 1), 0),
     errorReport: job.errors.map(({ line, issues }) => ({ line, issues })),
   };
 }
@@ -79,43 +81,26 @@ export class CsvService {
     return withTenantTransaction(context, async (tx) => {
       const grant = await this.schema.writable(tx, context, appId, 'import');
       const { app, fields } = grant;
-      const target = (header: string) => Object.hasOwn(input.mapping, header) ? input.mapping[header] : null;
-      const lookupColumns = headers.filter((header) => target(header) === 'lookup' || /^lookup:/i.test(header));
-      const mapping = headers.map((header) => lookupColumns.includes(header) ? null : target(header));
-      const targets = mapping.filter((id): id is string => id !== null);
-      if (targets.some((id) => !fields.some(({ fieldId, type }) => fieldId === id && type !== 'layout' && type !== 'calculation' && type !== 'related' && type !== 'table')) || new Set(targets).size !== targets.length) {
-        throw new BadRequestException('Map each column to a distinct published field');
-      }
-      if (!targets.length && !lookupColumns.length) throw new BadRequestException('Map at least one column');
-      const errors: Job['errors'] = [];
+      const { candidates, errors, lookupColumns } = mapCsvRows(headers, data, input.mapping, fields);
+      const lookupIds = new Set(fields.flatMap(({ lookup }) => lookup ? [lookup.localKeyFieldId] : []));
       const rows: Job['rows'] = [];
       try {
         // Nested Drizzle transactions are savepoints under the same tenant transaction.
         // Keep accepted trial rows visible to later trials for duplicate detection, then remove all trial writes.
         await tx.transaction(async (trial) => {
-          for (const [index, cells] of data.entries()) {
-            const line = index + 2;
-            const values: RecordData = {};
-            for (const [i, fieldId] of mapping.entries()) {
-              if (fieldId && cells[i] !== '') {
-                const field = fields.find((entry) => entry.fieldId === fieldId)!;
-                values[fieldId] = field.type === 'richText'
-                  ? '<p>' + cells[i].replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replace(/\r?\n/g, '<br>') + '</p>'
-                  : cells[i];
-              }
-            }
-            const issues: unknown[] = lookupColumns.filter((name) => cells[headers.indexOf(name)] !== '')
-              .map((column) => ({ column, message: 'Lookup columns are unavailable in Gate 1' }));
+          for (const candidate of candidates) {
             try {
-              await trial.transaction(async (row) => {
-                await this.records.persistCreate(row, context, appId, values, grant, 'import');
-                if (issues.length) throw new RowRollback();
-              });
-              rows.push({ line, data: values });
+              await trial.transaction((row) => this.writeCsvRow(row, context, appId, candidate, grant));
+              rows.push(candidate);
             } catch (error) {
-              if (error instanceof HttpException && error.getStatus() < 500) issues.push(error.getResponse());
-              else if (!(error instanceof RowRollback)) throw error;
-              errors.push({ line, cells, issues });
+              if (!(error instanceof HttpException) || error.getStatus() >= 500) throw error;
+              const response = error.getResponse();
+              const issues = ['object' === typeof response && response !== null && 'message' in response && Array.isArray(response.message)
+                ? { ...response, message: response.message.map((item) =>
+                  item && typeof item === 'object' && 'field' in item && lookupIds.has(item.field) && candidate.data[item.field] !== undefined
+                    ? { ...item, keyValue: candidate.data[item.field] } : item) }
+                : response];
+              for (const line of candidate.lines ?? [candidate.line]) errors.push({ line, cells: data[line - 2], issues });
             }
           }
           throw new PreflightRollback();
@@ -125,10 +110,17 @@ export class CsvService {
       }
       const [job] = await tx.insert(csvJobs).values({
         tenantId: context.tenantId, appId, userId: context.userId, schemaVersion: app.publishedSchemaVersion,
-        headers, rows, errors, lookupColumns,
+        headers, rows, errors: errors.sort((a, b) => a.line - b.line), lookupColumns,
       }).returning();
       return jobSummary(job);
     });
+  }
+
+  private async writeCsvRow(tx: TenantTransaction, context: TenantContext, appId: string, row: CsvRow,
+    grant: Awaited<ReturnType<AppSchemaService['writable']>>,
+  ) {
+    if (row.recordNo) await this.records.replaceImportedRows(tx, context, appId, row.recordNo, row.data);
+    else await this.records.persistCreate(tx, context, appId, row.data, grant, 'import');
   }
 
   private scope(context: TenantContext, appId: string, id: string) {
@@ -151,12 +143,12 @@ export class CsvService {
       if (offset !== job.imported) throw new ConflictException({ message: 'Resume at the current import offset', imported: job.imported });
       if (job.schemaVersion !== grant.app.publishedSchemaVersion) throw new ConflictException('Schema changed. Run preflight again.');
       const batch = job.rows.slice(offset, offset + size);
-      for (const { line, data } of batch) {
+      for (const row of batch) {
         try {
-          await this.records.persistCreate(tx, context, appId, data, grant, 'import');
+          await this.writeCsvRow(tx, context, appId, row, grant);
         } catch (error) {
           if (!(error instanceof HttpException) || error.getStatus() >= 500) throw error;
-          throw new ConflictException({ message: 'Batch rolled back', line, offset, issues: error.getResponse() });
+          throw new ConflictException({ message: 'Batch rolled back', line: row.line, offset, issues: error.getResponse() });
         }
       }
       const [updated] = await tx.update(csvJobs).set({ imported: offset + batch.length })
@@ -201,12 +193,17 @@ export class CsvService {
 
   async export(context: TenantContext, appId: string, { view: viewId, attachments, ...filters }: z.infer<typeof exportQuery>) {
     const bundle = attachments === 'true';
-    const { csv, attachmentIds, richText } = await withTenantTransaction(context, async (tx) => {
+    const { csv, attachmentIds, richText, snapshots, hasTables } = await withTenantTransaction(context, async (tx) => {
       const { where, fields, data, view, sort, descending } = await this.query.scope(tx, context, appId, viewId, 'export');
-      const selected = (view?.columns.length
-        ? view.columns.map(({ fieldId }) => fields.find((field) => field.fieldId === fieldId)!)
-        : fields).filter(({ type }) => type !== 'layout');
-      const eligible = tx.select({ data, schemaVersion: records.schemaVersion }).from(records).$dynamic();
+      const visible = new Map(fields.map((field) => [field.fieldId, field]));
+      const columns = view?.columns.length ? view.columns.map(({ fieldId }) => visible.get(fieldId)!) : fields;
+      const selectedIds = new Set(columns.flatMap((field) => field.lookup
+        ? [field.lookup.localKeyFieldId, ...field.lookup.copies.map(({ targetFieldId }) => targetFieldId)] : [field.fieldId]));
+      const selected = [...selectedIds].flatMap((id) => {
+        const field = visible.get(id);
+        return field && field.type !== 'layout' ? [field] : [];
+      });
+      const eligible = tx.select({ id: records.id, recordNo: records.recordNo, data, schemaVersion: records.schemaVersion }).from(records).$dynamic();
       const search = 'field' in filters ? filters : undefined;
       if (search) {
         const hits = this.search.matchingRecords(tx, context, appId, fields, search);
@@ -217,8 +214,28 @@ export class CsvService {
         .orderBy(...(sort ? [sql`${sort} ${descending ? sql`DESC` : sql`ASC`} NULLS LAST`, records.recordNo] : [records.recordNo]))
         .limit(10001);
       if (rows.length > 10000) throw new BadRequestException('Export exceeds 10,000 rows. Narrow the view filters.');
-      const csv = [selected.map(({ code }) => code)];
-      const visible = new Set(fields.map(({ fieldId }) => fieldId));
+      const parentFields = selected.filter(({ table }) => !table);
+      const snapshotIds = lookupTargets(fields);
+      const snapshots = parentFields.some(({ fieldId }) => snapshotIds.has(fieldId));
+      const tables = selected.flatMap((field) => field.table ? [{ ...field, table: field.table }] : []);
+      const hasTables = tables.length > 0;
+      const childColumns = tables.flatMap(({ fieldId, code, table }) => table.fields.map((child) =>
+        ({ tableId: fieldId, childId: child.fieldId, header: code + '.' + child.code })));
+      const parentHeaders = parentFields.map(({ code, fieldId }) =>
+        snapshotIds.has(fieldId) ? 'snapshot:' + code : hasTables ? 'field:' + code : code);
+      const csv = [hasTables ? [...tableHeaders, ...parentHeaders, ...childColumns.map(({ header }) => header)] : parentHeaders];
+      const tableRows = hasTables && rows.length ? await tx.select().from(recordTableRows).where(and(
+        eq(recordTableRows.tenantId, context.tenantId), eq(recordTableRows.appId, appId),
+        inArray(recordTableRows.recordId, rows.map(({ id }) => id)), inArray(recordTableRows.fieldId, tables.map(({ fieldId }) => fieldId)),
+      )).orderBy(recordTableRows.fieldId, recordTableRows.rowOrder).limit(10001) : [];
+      if (tableRows.length > 10000) throw new BadRequestException('Flattened export exceeds 10,000 rows');
+      const byRecord = new Map<string, typeof tableRows>();
+      for (const tableRow of tableRows) {
+        const children = byRecord.get(tableRow.recordId);
+        if (children) children.push(tableRow);
+        else byRecord.set(tableRow.recordId, [tableRow]);
+      }
+      const tableById = new Map(tables.map((field) => [field.fieldId, field]));
       const hasRelated = selected.some(({ type }) => type === 'related');
       const schemas = new Map<number, Awaited<ReturnType<AppSchemaService['getFields']>>>();
       for (const row of rows) {
@@ -226,16 +243,27 @@ export class CsvService {
           schemas.set(row.schemaVersion, await this.schema.getFields(tx, context, appId, row.schemaVersion));
         }
         const cells = [];
-        for (const { fieldId, type } of selected) {
+        for (const { fieldId, type } of parentFields) {
           const raw = row.data[fieldId] ?? '';
           const related = type === 'related' && schemas.get(row.schemaVersion)?.find((field) => field.fieldId === fieldId)?.related;
           cells.push(related && visible.has(related.localFieldId) ? await this.exportRelated(tx, context, related, row.data)
             : type === 'richText' ? richTextPlain(raw) : raw);
         }
-        csv.push(cells);
+        if (!hasTables) csv.push(cells);
+        else {
+          const childRows = byRecord.get(row.id) ?? [];
+          const recordNo = row.recordNo.toString();
+          if (!childRows.length) csv.push([recordNo, '', '', '', ...cells, ...childColumns.map(() => '')]);
+          for (const { fieldId, rowOrder, data } of childRows) {
+            const table = tableById.get(fieldId)!;
+            csv.push([recordNo, table.code, table.name, String(rowOrder + 1), ...cells,
+              ...childColumns.map(({ tableId, childId }) => tableId === fieldId ? data[childId] ?? '' : '')]);
+          }
+          if (csv.length > 10001) throw new BadRequestException('Flattened export exceeds 10,000 rows');
+        }
       }
       return {
-        csv,
+        csv, snapshots, hasTables,
         richText: selected.some(({ type }) => type === 'richText'),
         attachmentIds: bundle ? [...new Set(rows.flatMap(({ data }) => selected
           .filter(({ type }) => type === 'attachment').flatMap(({ fieldId }) => JSON.parse(data[fieldId] || '[]') as string[])))] : [],
@@ -244,10 +272,18 @@ export class CsvService {
       if (postgresErrorCode(error) === '57014') throw new ServiceUnavailableException('Export timed out. Narrow the filters and retry.');
       throw error;
     });
-    if (!bundle) return csvFile(csv, richText ? 'records-rich-text-exported-as-plain-text.csv' : 'records.csv');
+    if (!bundle) {
+      const notes = [hasTables && 'subtable-rows', snapshots && 'lookup-snapshots', richText && 'rich-text-exported-as-plain-text'].filter(Boolean);
+      return csvFile(csv, 'records' + (notes.length ? '-' + notes.join('-') : '') + '.csv');
+    }
     if (attachmentIds.length > 256) throw new BadRequestException('Attachment bundle exceeds 256 files. Narrow the view filters.');
     const bytes: Record<string, Uint8Array> = { 'records.csv': Buffer.from(stringify(csv, { escape_formulas: true })) };
-    if (richText) bytes['export-notes.txt'] = Buffer.from('Rich text fields were exported as plain text.\n');
+    const notes = [
+      richText && 'Rich text fields were exported as plain text.',
+      snapshots && 'Columns prefixed snapshot: contain read-only lookup snapshots.',
+      hasTables && 'Subtable rows repeat parent values. To import rows, preserve record_no and __table, and use an existing parent.',
+    ].filter(Boolean);
+    if (notes.length) bytes['export-notes.txt'] = Buffer.from(notes.join('\n') + '\n');
     const manifest = [['id', 'name', 'sha256', 'bytes', 'path']];
     let total = 0;
     for (const id of attachmentIds) {

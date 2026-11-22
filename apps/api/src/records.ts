@@ -236,6 +236,41 @@ export class RecordService {
     return this.withTableRows(tx, context, this.visibleRecord(access, record), access);
   }
 
+  // Gate 2 decision (GATE2-REPORT.md): grouped subtable CSV import uses REPLACE
+  // semantics per table field present in the file — the file's grouped rows become
+  // that table's rows, so an export → import round trip is idempotent.
+  async replaceImportedRows(tx: TenantTransaction, context: TenantContext, appId: string, recordNo: string, tables: RecordData) {
+    const { access } = await this.appSchema.access(tx, context, appId, 'edit');
+    const [entry] = await tx.select({ id: records.id }).from(records).where(and(eq(records.tenantId, context.tenantId),
+      eq(records.appId, appId), eq(records.recordNo, BigInt(recordNo)), isNull(records.deletedAt),
+      this.authorization.recordScope(access, 'view'), this.authorization.recordScope(access, 'edit')));
+    if (!entry) throw new BadRequestException('No visible editable parent matches record number ' + recordNo);
+    const current = await this.findRecord(tx, context, appId, entry.id, 'edit', false, true);
+    const definitions = await this.appSchema.getFields(tx, context, appId, current.schemaVersion);
+    const tableIds = Object.keys(tables);
+    const before = await this.readTableRows(tx, context, appId, entry.id, tableIds);
+    const candidate: RecordData = {};
+    for (const fieldId of tableIds) {
+      const table = definitions.find((field) => field.fieldId === fieldId)?.table;
+      if (!table || !access.types.has(fieldId)) throw new BadRequestException('The parent record does not use this subtable');
+      if (!this.authorization.editable(access, fieldId)) throw new ForbiddenException('无权限');
+      const writable = new Set(table.fields.filter(({ type }) => type !== 'calculation').map((field) => field.fieldId));
+      const incoming = (JSON.parse(tables[fieldId]) as TableRow[]).map(({ rowId, data }) => ({
+        rowId, data: Object.fromEntries(Object.entries(data).filter(([id]) => writable.has(id))),
+      }));
+      candidate[fieldId] = JSON.stringify(incoming);
+    }
+    const { replacements, changes } = await prepareTableRows(definitions, candidate, before, false, (type, value) =>
+      this.validDirectoryValue(tx, context, type, value));
+    const scope = { tenantId: context.tenantId, appId, recordId: entry.id };
+    const [updated] = await tx.update(records).set({ revision: sql`${records.revision} + 1`,
+      updatedBy: context.userId, updatedAt: sql`clock_timestamp()` }).where(and(eq(records.tenantId, scope.tenantId),
+      eq(records.appId, scope.appId), eq(records.id, scope.recordId), eq(records.revision, current.revision))).returning();
+    if (!updated) throw new ConflictException('The parent record changed. Run preflight again.');
+    await replaceTableRows(tx, scope, replacements);
+    await writeRecordEvent(tx, context, serializeRecord(updated), 'updated', changes, 'import');
+  }
+
   async get(context: TenantContext, appId: string, recordId: string) {
     return withTenantTransaction(context, (tx) => this.findRecord(tx, context, appId, recordId));
   }

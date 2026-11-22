@@ -143,6 +143,7 @@ const directory = z.object({
 const file = z.object({ id, state: z.literal('READY'), name: text, bytes: integer, sha256: text });
 const importJob = z.object({
   id, schemaVersion: integer, eligible: integer, failed: integer, imported: integer, remaining: integer,
+  eligibleRows: integer, importedRows: integer,
   lookupColumns: z.array(text),
   errorReport: z.array(z.object({ line: integer, issues: z.array(z.union([errorSchema, z.object({ column: text, message: text })])) })),
 });
