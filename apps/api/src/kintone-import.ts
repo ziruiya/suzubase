@@ -27,6 +27,58 @@ export interface FieldCompatibility {
   sourceConfig: unknown;
   sourceUnavailable: boolean;
   upgradeRequired: boolean;
+  formula?: KintoneFormulaToken[] | null;
+}
+
+type KintoneFormulaToken = { kind: 'field'; fieldId: string } |
+  { kind: 'number'; value: string } |
+  { kind: 'operator'; operator: '+' | '-' | '*' | '/' };
+
+function convertCalcExpression(expression: string, fields: any[]): KintoneFormulaToken[] | null {
+  const tokens = expression.match(/[A-Za-z_][A-Za-z0-9_]*|(?:\d+(?:\.\d*)?|\.\d+)|[()+*/-]/g);
+  if (!tokens || tokens.join('') !== expression.replace(/\s+/g, '')) return null;
+  const byCode = new Map(fields.map((field) => [field.code, field]));
+  const output: KintoneFormulaToken[] = [];
+  const operators: string[] = [];
+  const precedence: Record<string, number> = { '+': 1, '-': 1, '*': 2, '/': 2 };
+  let expectsValue = true;
+  for (const token of tokens) {
+    if (/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(token)) {
+      if (!expectsValue) return null;
+      output.push({ kind: 'number', value: token });
+      expectsValue = false;
+    } else if (/^[A-Za-z_]/.test(token)) {
+      const field = byCode.get(token);
+      if (!expectsValue || field?.type !== 'NUMBER') return null;
+      output.push({ kind: 'field', fieldId: token });
+      expectsValue = false;
+    } else if (token === '(') {
+      if (!expectsValue) return null;
+      operators.push(token);
+    } else if (token === ')') {
+      if (expectsValue) return null;
+      while (operators.length && operators.at(-1) !== '(') {
+        output.push({ kind: 'operator', operator: operators.pop() as '+' | '-' | '*' | '/' });
+      }
+      if (operators.pop() !== '(') return null;
+      expectsValue = false;
+    } else {
+      if (expectsValue) return null;
+      while (operators.length && operators.at(-1) !== '(' &&
+        (precedence[operators.at(-1)!] ?? 0) >= precedence[token]!) {
+        output.push({ kind: 'operator', operator: operators.pop() as '+' | '-' | '*' | '/' });
+      }
+      operators.push(token);
+      expectsValue = true;
+    }
+  }
+  if (expectsValue) return null;
+  while (operators.length) {
+    const operator = operators.pop()!;
+    if (operator === '(') return null;
+    output.push({ kind: 'operator', operator: operator as '+' | '-' | '*' | '/' });
+  }
+  return output;
 }
 
 export interface KintoneSubtableRow {
@@ -81,7 +133,10 @@ export function validateKintoneDomain(input: string, allowedHosts = process.env.
   return url.origin;
 }
 
-export function mapKintoneField(source: any): FieldCompatibility {
+export function mapKintoneField(source: any, options: {
+  fields?: any[];
+  acceptCalcDataOnly?: boolean;
+} = {}): FieldCompatibility {
   const code = String(source.code ?? source.fieldCode ?? '');
   const type = String(source.type ?? 'UNKNOWN');
   const base = { sourceFieldCode: code, sourceType: type, sourceConfig: source };
@@ -103,11 +158,26 @@ export function mapKintoneField(source: any): FieldCompatibility {
       : 'Lookup target application is missing; completion is pending',
     sourceUnavailable: false, upgradeRequired: false,
   };
-  if (type === 'CALC') return {
-    ...base, targetType: 'calculation', status: 'UNRESOLVED',
-    reason: 'Formula requires equivalence analysis or explicit administrator snapshot downgrade',
-    sourceUnavailable: false, upgradeRequired: false,
-  };
+  if (type === 'CALC') {
+    const formula = source.format === 'NUMBER'
+      ? convertCalcExpression(String(source.expression ?? ''), options.fields ?? [])
+      : null;
+    if (formula) return {
+      ...base, targetType: 'calculation', status: 'EQUIVALENT',
+      reason: 'Numeric formula converted to SuzuBase postfix calculation tokens',
+      sourceUnavailable: false, upgradeRequired: false, formula,
+    };
+    if (options.acceptCalcDataOnly) return {
+      ...base, targetType: 'number', status: 'DATA_ONLY',
+      reason: 'Administrator accepted a value-only downgrade; source formula is retained in sourceConfig',
+      sourceUnavailable: false, upgradeRequired: false, formula: null,
+    };
+    return {
+      ...base, targetType: 'calculation', status: 'UNRESOLVED',
+      reason: 'Formula is not directly convertible; explicit administrator DATA_ONLY acceptance is required',
+      sourceUnavailable: false, upgradeRequired: false, formula: null,
+    };
+  }
   if (type === 'CATEGORY') return {
     ...base, targetType: null, status: 'UNSUPPORTED',
     reason: 'P2 category tree is not implemented; dropdown downgrade is not equivalent',
@@ -184,7 +254,7 @@ export function buildM1CompatiblePackage(
   if (extraction.evidence.unavailable.length) {
     throw new Error('kintone package blocked: source unavailable items exist');
   }
-  if (extraction.blocking.length) {
+  if (extraction.blocking.length || extraction.compatibility.some(({ status }) => status === 'UNRESOLVED')) {
     throw new Error('kintone package blocked: unsupported or unresolved mappings exist');
   }
   if (extraction.attachments.some((file) => !file.sha256 || !file.body)) {
@@ -202,7 +272,7 @@ export function buildM1CompatiblePackage(
     required: false,
     uniqueValue: false,
     searchMode: null,
-    formula: null,
+    formula: item.formula ?? null,
     lookup: null,
     related: null,
     table: null,
@@ -416,13 +486,15 @@ export class KintoneSourceAdapter {
     return { available, unavailable };
   }
 
-  async extract(appId: string, frozenWindow = false) {
+  async extract(appId: string, frozenWindow = false, options: { acceptCalcDataOnly?: boolean } = {}) {
     const preflight = await this.preflight(appId);
     if (!preflight.available.app) throw new Error('kintone app metadata unavailable; extraction blocked');
     const app = preflight.available.app as any;
     const fieldsPayload = preflight.available.fields as any;
     const fields = Object.entries(fieldsPayload?.properties ?? {}).map(([code, field]: [string, any]) => ({ ...field, code }));
-    const compatibility = fields.map(mapKintoneField);
+    const compatibility = fields.map((field) => mapKintoneField(field, {
+      fields, acceptCalcDataOnly: options.acceptCalcDataOnly,
+    }));
     const records: any[] = [];
     const comments: any[] = [];
     const attachments: any[] = [];

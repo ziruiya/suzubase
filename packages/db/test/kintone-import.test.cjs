@@ -18,9 +18,24 @@ test('P2-M3 kintone source safety and field mapping are explicit', async () => {
     else process.env.KINTONE_ALLOWED_HOSTS = previousAllowlist;
   }
 
-  const calc = mapKintoneField({ code: 'total', type: 'CALC', expression: 'SUM(qty)' });
-  assert.equal(calc.status, 'UNRESOLVED');
-  assert.equal(calc.targetType, 'calculation');
+  const calcFields = [{ code: 'qty', type: 'NUMBER' }, { code: 'price', type: 'NUMBER' }];
+  const calc = mapKintoneField({
+    code: 'total', type: 'CALC', format: 'NUMBER', expression: 'qty * (price + 2)',
+  }, { fields: calcFields });
+  assert.equal(calc.status, 'EQUIVALENT');
+  assert.deepEqual(calc.formula, [
+    { kind: 'field', fieldId: 'qty' },
+    { kind: 'field', fieldId: 'price' },
+    { kind: 'number', value: '2' },
+    { kind: 'operator', operator: '+' },
+    { kind: 'operator', operator: '*' },
+  ]);
+  const nonConvertibleCalc = { code: 'total', type: 'CALC', expression: 'SUM(qty)' };
+  assert.equal(mapKintoneField(nonConvertibleCalc).status, 'UNRESOLVED');
+  const acceptedCalc = mapKintoneField(nonConvertibleCalc, { acceptCalcDataOnly: true });
+  assert.equal(acceptedCalc.status, 'DATA_ONLY');
+  assert.equal(acceptedCalc.sourceConfig.expression, 'SUM(qty)');
+  assert.match(acceptedCalc.reason, /Administrator accepted/);
   assert.equal(mapKintoneField({ code: 'category', type: 'CATEGORY' }).status, 'UNSUPPORTED');
   assert.equal(mapKintoneField({ code: 'owner', type: 'USER_SELECT' }).status, 'UNRESOLVED');
   assert.equal(mapKintoneField({ code: 'title', type: 'SINGLE_LINE_TEXT' }).status, 'EQUIVALENT');
@@ -34,7 +49,12 @@ test('P2-M3 kintone source safety and field mapping are explicit', async () => {
     'GROUP', 'LABEL', 'SPACER', 'HR',
   ];
   for (const type of requiredTypes) {
-    assert.notEqual(mapKintoneField({ code: type.toLowerCase(), type }).status, undefined, type);
+    assert.ok(
+      ['EQUIVALENT', 'DATA_ONLY', 'UNRESOLVED', 'UNSUPPORTED'].includes(
+        mapKintoneField({ code: type.toLowerCase(), type }).status,
+      ),
+      `Missing explicit compatibility result for ${type}`,
+    );
   }
   assert.equal(mapKintoneField({
     code: 'lookup_without_target', type: 'SINGLE_LINE_TEXT', lookup: {},
