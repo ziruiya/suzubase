@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
-  and, apiTokens, apps, appVersions, commentMentions, eq, exportJobs, fields as fieldRows, files, groupMembers,
+  and, apiTokens, apps, appVersions, commentMentions, eq, exportJobs, fields as fieldRows, files, groupMembers, inArray,
   memberGroups, organizations, recordComments, recordEvents, recordReferences, recordTableRows, recordWorkflowState,
   appCounters, autoNumberCounters, records, sql, tenantMembers, users, workflowAssignments, workflowDefinitions, workflowEvents,
   deploymentInstance, withTenantTransaction, type TenantContext, type TenantTransaction,
@@ -388,11 +388,11 @@ export class ExportService {
       disabled: sql<boolean>`${tenantMembers.disabledAt} IS NOT NULL`,
     }).from(users).innerJoin(tenantMembers, and(
       eq(tenantMembers.tenantId, users.tenantId), eq(tenantMembers.userId, users.id)))
-      .where(and(eq(users.tenantId, tenantId), sql`${users.id} = ANY(${[...userIds]}::uuid[])`)) : [];
+      .where(and(eq(users.tenantId, tenantId), inArray(users.id, [...userIds]))) : [];
     const directoryGroups = groupIds.size ? await tx.select().from(memberGroups)
-      .where(and(eq(memberGroups.tenantId, tenantId), sql`${memberGroups.id} = ANY(${[...groupIds]}::uuid[])`)) : [];
+      .where(and(eq(memberGroups.tenantId, tenantId), inArray(memberGroups.id, [...groupIds]))) : [];
     const directoryOrganizations = organizationIds.size ? await tx.select().from(organizations)
-      .where(and(eq(organizations.tenantId, tenantId), sql`${organizations.id} = ANY(${[...organizationIds]}::uuid[])`)) : [];
+      .where(and(eq(organizations.tenantId, tenantId), inArray(organizations.id, [...organizationIds]))) : [];
     const groupMemberRows = directoryGroups.length ? await tx.select().from(groupMembers)
       .where(eq(groupMembers.tenantId, tenantId)) : [];
 

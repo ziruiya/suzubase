@@ -173,6 +173,14 @@ type Contract = {
   binaryBody?: boolean;
 };
 
+const exportJob = z.object({
+  id, appId: id, status: z.enum(['queued', 'running', 'sealed', 'failed', 'cancelled']),
+  stage: text, progress: z.record(text, integer), snapshotCutoff: timestamp.nullable(),
+  attempts: integer, error: text.nullable(), packageSha256: text.nullable(), packageBytes: integer.nullable(),
+  createdAt: timestamp, updatedAt: timestamp, sealedAt: timestamp.nullable(), sensitiveDataNotice: text,
+});
+const exportDetail = exportJob.extend({ manifest: z.looseObject({}).nullable() });
+
 const applications = '/apps/{appId}';
 const records = applications + '/records';
 const entry = records + '/{recordId}';
@@ -314,6 +322,16 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   },
   [indexes + '/{indexId}/retry']: { post: { reply: runtimeIndex, conflict: errorSchema } },
   [indexes + '/{indexId}']: { delete: { reply: runtimeIndex } },
+  [applications + '/exports']: {
+    get: { reply: z.array(exportJob) },
+    post: { reply: exportJob, description: 'Creates a background export job. The package contains complete business data and must be handled as sensitive data.' },
+  },
+  [applications + '/exports/{exportId}']: { get: { reply: exportDetail } },
+  [applications + '/exports/{exportId}/run']: { post: { reply: exportDetail } },
+  [applications + '/exports/{exportId}/resume']: { post: { reply: exportJob, conflict: errorSchema } },
+  [applications + '/exports/{exportId}/cancel']: { post: { reply: exportJob, conflict: errorSchema } },
+  [applications + '/exports/{exportId}/package']: { get: { download: ['application/zip'],
+    description: 'Downloads the sealed package. Only sealed packages can be downloaded.' } },
 };
 
 function schema(value: z.ZodType, io: 'input' | 'output' = 'output'): SchemaObject {
