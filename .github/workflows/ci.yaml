@@ -44,20 +44,31 @@ jobs:
       - run: pnpm -r --workspace-concurrency=1 build
       - run: pnpm -r --workspace-concurrency=1 typecheck
       - run: pnpm exec playwright install --with-deps chromium
-      - name: Migrate and run integration and browser tests
+      - name: Migrate and start API
         run: |
           pnpm --filter @suzubase/db migrate
           node apps/api/dist/main.js > "$RUNNER_TEMP/suzubase-api.log" 2>&1 &
-          api_pid=$!
-          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+          echo $! > "$RUNNER_TEMP/suzubase-api.pid"
           curl --retry 12 --retry-all-errors --retry-delay 1 -fsS "$TEST_API_URL/health"
-          pnpm test
-          node tools/audit/audit-integrity.mjs --sample 20
+      - name: Integration tests
+        run: pnpm test
+      - name: Audit integrity (post-suite database)
+        run: node tools/audit/audit-integrity.mjs --sample 20
+      - name: Start web preview
+        run: |
           pnpm --filter @suzubase/web exec vite preview --host 127.0.0.1 --port 5173 > "$RUNNER_TEMP/suzubase-web.log" 2>&1 &
-          web_pid=$!
-          trap 'kill "$web_pid" "$api_pid" 2>/dev/null || true' EXIT
+          echo $! > "$RUNNER_TEMP/suzubase-web.pid"
           curl --retry 12 --retry-all-errors --retry-delay 1 -fsS "$TEST_WEB_URL/api/health"
-          pnpm test:browser
+      - name: Browser tests
+        run: pnpm test:browser
+      - name: Stop background servers
+        if: always()
+        run: |
+          for name in api web; do
+            pid_file="$RUNNER_TEMP/suzubase-$name.pid"
+            test ! -f "$pid_file" || kill "$(cat "$pid_file")" 2>/dev/null || true
+          done
+          pkill -f "vite preview" 2>/dev/null || true
       - name: Application logs
         if: failure()
         run: |
