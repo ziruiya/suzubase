@@ -183,35 +183,179 @@
   record/subtable/attachment/comment source and target counts. This does not
   substitute for the real fixture run.
 
-### M3-C real-run checklist
+### M3-C real run
 
-- Before starting, arrange a freeze window: nobody else may write to either
-  fixture app from extraction start through extraction end. Confirm the freeze
-  with `KINTONE_FREEZE_WINDOW_CONFIRMED=true`.
-- Supply `KINTONE_SUBDOMAIN`, `KINTONE_APP_A_ID`, `KINTONE_APP_B_ID`,
-  `KINTONE_API_TOKEN_A`, `KINTONE_API_TOKEN_B`, `KINTONE_ALLOWED_HOSTS`,
-  `SUZUBASE_TARGET_API_ORIGIN`, `SUZUBASE_TARGET_ACCESS_TOKEN`, and
-  `SUZUBASE_TARGET_ISOLATED=true` via the process environment/secret manager.
-  Keep the target isolated and use HTTPS. Never put tokens in arguments, source
-  files, or report notes.
-- Run `node tools/kintone/run-m3-c.mjs`; inspect its report for precheck and
-  extraction start/end timestamps, each app's source record-ID range, package
-  verification, import status, all separate reconciliation dimensions,
-  completeness, unresolved dependencies, explicit downgrades, and source gaps.
-  Resolve pending completion items explicitly and retain the generated report.
-- The report must record extraction start/end times and source ID ranges for
-  both apps. Keep the fixture write freeze in effect for the entire extraction
-  window; release it only after extraction has ended and evidence is recorded.
+- **Target and freeze:** Ran against a newly built, isolated local Compose
+  instance at `http://127.0.0.1:23183` (`suzubase-m3-c-real`), not the demo
+  deployment. Both source apps were frozen for extraction. Source:
+  `https://8xymf703g7p3.cybozu.com`.
+- **Extraction window (UTC; JST):**
 
-**Remaining:** M3-C real run pending kintone fixture app IDs + API tokens (being prepared by the owner side).
+  | App | ID range | Start | End |
+  |---|---:|---|---|
+  | A (案件管理, app 2) | 2–13 | 2026-11-22 16:23:56.386Z (11-23 01:23:56.386 JST) | 2026-11-22 16:23:59.997Z (11-23 01:23:59.997 JST) |
+  | B (得意先マスタ, app 1) | 2–6 | 2026-11-22 16:24:01.570Z (11-23 01:24:01.570 JST) | 2026-11-22 16:24:04.380Z (11-23 01:24:04.380 JST) |
+
+- **Runner corrections found in the live run:** Kintone rejects a GET carrying
+  `Content-Type: application/json` (`CB_IL02`); the adapter now sends that
+  header only with a body. `/k/v1/app.json` requires `id=`, not `app=`.
+  Cursor pages and deletion use `GET`/`DELETE .../records/cursor.json?id=...`,
+  not POST bodies. Regression tests cover the corrected requests. Both
+  applications were re-extracted after these fixes.
+- **Extraction totals:** A: 30 fields, 12 records, 17 subtable rows, 4
+  downloaded attachments, 3 comments. B: 13 fields, 5 records, no subtables,
+  attachments, or comments. Source data completeness is **41/41 = 100%**
+  (17 records + 17 rows + 4 byte/hash-verified files + 3 comments). This is
+  extraction completeness, not target import completeness; **0/41 data items
+  were imported** because the M1 gates did not pass.
+- **Structure and constraints:** A's field codes/types are `attachments:FILE`,
+  `assignee_user:USER_SELECT`, `assignee_org:ORGANIZATION_SELECT`,
+  `contact_phone:LINK(CALL)`, `状态:STATUS`, `title:SINGLE_LINE_TEXT`,
+  `assignee_group:GROUP_SELECT`, `details:SUBTABLE`,
+  `创建人:CREATOR`, `customer_code:SINGLE_LINE_TEXT`, `类别:CATEGORY`,
+  `summary:MULTI_LINE_TEXT`, `执行者:STATUS_ASSIGNEE`, `amount:CALC`,
+  `quantity:NUMBER`, `registered_at:DATETIME`, `kind:DROP_DOWN`,
+  `ref_url:LINK(WEB)`, `unit_price:NUMBER`, `priority:RADIO_BUTTON`,
+  `doc_types:MULTI_SELECT`, `更新时间:UPDATED_TIME`, `更新人:MODIFIER`,
+  `start_time:TIME`, `记录编号:RECORD_NUMBER`, `channels:CHECK_BOX`,
+  `创建时间:CREATED_TIME`, `detail:RICH_TEXT`, `customer_name:SINGLE_LINE_TEXT`,
+  `wish_date:DATE`. `details` children are `item_file:FILE`,
+  `item_subtotal:CALC`, `item_price:NUMBER`, `item_name:SINGLE_LINE_TEXT`,
+  `item_qty:NUMBER`.
+  B's codes/types are `note:MULTI_LINE_TEXT`, `执行者:STATUS_ASSIGNEE`,
+  `contact_name:SINGLE_LINE_TEXT`, `状态:STATUS`, `更新时间:UPDATED_TIME`,
+  `更新人:MODIFIER`, `记录编号:RECORD_NUMBER`, `phone:SINGLE_LINE_TEXT`,
+  `创建时间:CREATED_TIME`, `创建人:CREATOR`,
+  `customer_name:SINGLE_LINE_TEXT`, `customer_code:SINGLE_LINE_TEXT`,
+  `类别:CATEGORY`.
+- App A requires `title` and `priority`; `priority` defaults to `中` with
+  `高/中/低`. `kind` options are `保守/修理/新規/その他`, `doc_types` are
+  `見積書/請求書/契約書/写真`, and `channels` are `電話/訪問/メール/オンライン`.
+  `amount` is a numeric calculation `unit_price * quantity`. App B requires
+  `customer_code` and `customer_name`; `customer_code` is unique, max length
+  64. Both apps specify 16-digit numeric precision, 4 decimal places, and
+  HALF_EVEN rounding. Layout item counts are A=22 and B=5; title fields are
+  A=`title`, B=`customer_code`.
+- **Compatibility states:** the adapter's field mapper returned A 18
+  EQUIVALENT / 11 UNRESOLVED / 1 UNSUPPORTED and B 9 / 3 / 1. Its apparent
+  EQUIVALENT for A's `customer_code` is not accepted: the source field is
+  lookup-backed but its lookup object is null to this token. Corrected
+  semantic totals are **26 EQUIVALENT, 15 UNRESOLVED, 2 UNSUPPORTED** across
+  43 fields. A's unresolved fields are `assignee_user`, `assignee_org`,
+  `assignee_group`, `details` (FILE child unsupported in target subtables),
+  `创建人`, `执行者`, `kind`, `priority`, `doc_types`, `更新人`, `channels`,
+  plus the unavailable lookup dependency. B's unresolved fields are
+  `执行者`, `更新人`, `创建人`. Both `类别` fields are UNSUPPORTED: the P2
+  category tree is not implemented. Non-ASCII choice values are unresolved
+  rather than silently rewritten.
+- **Records and lookup-value reconciliation:** source IDs map directly to the
+  same fixture record IDs; A has 2–13 and B has 2–6. A's
+  `customer_code/customer_name` snapshots matched B's master records **12/12**:
+  `TOK-001`→B2 `株式会社山田商事`, `TOK-002`→B3 `鈴木製作所株式会社`,
+  `TOK-003`→B4 `有限会社佐藤運輸`, `TOK-004`→B5 `高橋電気株式会社`,
+  `TOK-005`→B6 `名古屋フーズ株式会社`.
+
+  | A ID | Code | Title | Amount | Status |
+  |---:|---|---|---:|---|
+  | 2 | TOK-001 | POSレジ入替の見積 | 240000 | 対応中 |
+  | 3 | TOK-002 | 冷蔵ケース修理依頼 | 45000 | 完了 |
+  | 4 | TOK-003 | 新規出店の内装相談 | 800000 | 未処理 |
+  | 5 | TOK-004 | 看板デザイン更新 | 60000 | 未処理 |
+  | 6 | TOK-005 | 駐車場ライン引き直し | 90000 | 未処理 |
+  | 7 | TOK-001 | 空調フィルター交換 | 48000 | 未処理 |
+  | 8 | TOK-002 | 防犯カメラ増設 | 220000 | 未処理 |
+  | 9 | TOK-003 | レジ周り配線整理 | 25000 | 未処理 |
+  | 10 | TOK-004 | 店舗Wi-Fi更改相談 | 15000 | 未処理 |
+  | 11 | TOK-005 | 冷凍庫温度異常の点検 | 38000 | 未処理 |
+  | 12 | TOK-001 | 年末大掃除の手配 | 90000 | 未処理 |
+  | 13 | TOK-002 | POP・ポスター差し替え | 60000 | 未処理 |
+
+  B values were also read in full: ID 2 TOK-001 / 株式会社山田商事 /
+  山田太郎 / 052-111-2222 / 名古屋市内の老舗卸売業; ID 3 TOK-002 /
+  鈴木製作所株式会社 / 鈴木一郎 / 052-333-4444 / 金属加工; ID 4 TOK-003 /
+  有限会社佐藤運輸 / 佐藤健 / 0561-55-6666 / 運送業; ID 5 TOK-004 /
+  高橋電気株式会社 / 高橋美咲 / 052-777-8888 / 電気工事; ID 6 TOK-005 /
+  名古屋フーズ株式会社 / 田中誠 / 052-999-0000 / 食品卸 (name, contact,
+  phone, note).
+- **Subtable rows:** extracted order, source row ID, item, quantity, unit
+  price, subtotal: A2 `17` POSレジ本体 2/98000/196000, `18` 設置作業
+  1/20000/20000; A3 `24` コンプレッサー交換 1/45000/45000; A4 `32`
+  内装工事一式 1/650000/650000, `33` 照明器具 1/120000/120000,
+  `35` サイン工事 1/30000/30000; A5 `41` デザイン費 1/60000/60000;
+  A6 `94` blank item/qty/price with subtotal 0; A7 `52` フィルター
+  6/8000/48000; A8 `59` カメラ本体 4/40000/160000, `60` 配線工事
+  1/15000/15000; A9 `65` 配線整理作業 1/25000/25000; A10 `71`
+  現地調査 1/15000/15000; A11 `78` 点検作業 1/20000/20000, `79`
+  温度センサー交換 1/18000/18000; A12 `86` 清掃作業一式 1/90000/90000;
+  A13 `91` 印刷費 5/12000/60000.
+
+  **Fixture discrepancy:** the handover expected an empty subtable on A6 and
+  only A2/A4/A8 to have 2–3 rows. Both the cursor extraction and an independent
+  records-list read instead returned a blank-valued row 94 on A6 and a second
+  row on A11 (78/79). Observed distribution is 0 empty, 4 multi-row
+  (A2/A4/A8/A11), and 8 one-row records, total 17 rows. No source mutation or
+  row deletion was attempted.
+- **Attachments:** all four downloads had bytes and SHA-256. Record-level:
+  A2 `attachments/att1.txt`, 42 bytes,
+  `336dba6a006986c9889bc0d46b477836444ff7a6769fd417c70ab72b5a545f01`;
+  A7 `attachments/att2.txt`, 45 bytes,
+  `3cf2ea9aa0e96c9a4e3d5596e249d9265f65aca2000faf883c1a5d4f2dad4fbf`.
+  Subtable: A4 row 33 `details.item_file/att3.txt`, 42 bytes,
+  `051d0756376cad41c1d8fda08c2eebe01edf31e75ffd14ab5042479a3c4575c2`;
+  A11 row 79 `details.item_file/att4.txt`, 43 bytes,
+  `181612bc29c4ea8d448a6136051f09ee5c3509f4716effd5987bf037ccb235a7`.
+- **Comments:** three on A2/A4/A8; none on B. All authored by
+  `Administrator`. A2 at `2026-11-22T15:51:49Z`:
+  `蘇 子睿 見積を作成しました。内容をご確認ください。`; its @mention
+  resolves to the configured login user. A4 at `15:51:50Z`:
+  `現地調査の日程を調整中です。`; A8 at `15:51:51Z`:
+  `カメラの設置位置について先方と合意済み。`. A4/A8 have no mentions.
+- **Workflow:** actual status field code is `状态`, assignee field code
+  `执行者`. A's current values are `未处理` 10, `対応中` 1 (ID 2), `完了` 1
+  (ID 3); this preserves the exact source spelling (`未处理`, rather than the
+  Japanese spelling in the handover). ID 2's `执行者` is the login user, ID 3
+  has no assignee, and IDs 4–13 have `Administrator`; `assignee_user` separately
+  contains the login user on all 12 records. B workflow is disabled. The
+  `app/processes.json` history/definitions endpoint returned HTTP 404 for both
+  apps and is marked SOURCE_UNAVAILABLE, not treated as empty history.
+- **Permissions:** app, record, and field ACL endpoints all returned data.
+  Both apps have two app rules: CREATOR has all app/record rights true;
+  GROUP `everyone` has `appEditable=false`, record view/add/edit/delete true,
+  import/export false. Record ACL is empty for both. A has one field rule on
+  `detail`: USER `miuraharudori@gmail.com` WRITE and GROUP `everyone` NONE.
+  B has no field ACL rules. No ACL endpoint or principal remained unresolved.
+- **External dependency and SOURCE_UNAVAILABLE:** App A's `customer_code`
+  field response has `lookup: null`; `relatedApp` and `fieldMappings` are
+  unavailable to this token. It is explicitly **SOURCE_UNAVAILABLE** and is
+  not treated as a plain-text equivalent. Only the key and copied
+  `customer_name` snapshots are reconciled (12/12 above). The full unavailable
+  list is: (1) A `customer_code` lookup structure; (2) A workflow
+  process/history endpoint (`/k/v1/app/processes.json`, HTTP 404); (3) B same
+  workflow endpoint (HTTP 404).
+- **Separate final results:** source data completeness **100% (41/41)**;
+  verified functional equivalence **26/43 fields**; unresolved dependencies
+  **15** (14 adapter-reported identity/choice/subtable mappings plus the
+  unavailable lookup structure); unsupported fields **2** (`类别`, one per
+  app); explicit accepted downgrades **5** (A permissions 3 entries, workflow
+  5 entries, layout 22 items; B permissions 2 entries, layout 5 items).
+  Downgrades were gate-accepted for reporting but none were materialized in a
+  target because neither package passed the M1 field/dependency gates.
+- **Final M1 business result:** App A: **PENDING_COMPLETION** (lookup,
+  identity/choice mappings, category, and table-file mapping); App B:
+  **PENDING_COMPLETION** (category and identity mappings). No M1 package was
+  sealed or uploaded; there are no import jobs, activated apps, or target
+  records. App A's lookup requires an authorized mapping; it was not guessed.
+  Private generated reports/checkpoints remain under
+  `/tmp/kintone-m3-c-real-20261123`; they contain no API tokens.
 
 ## Acceptance evidence
 
 - Targeted backup CLI tests: 4/4 pass, including the P2 backup alert case.
 - P2 kintone source safety/mapping test: pass.
 - API and DB builds/typechecks pass.
-- Full integrated Docker/PostgreSQL suite: `99/99` pass, including the M3-C
-  mock extraction/import and the Gate 3 package regression.
+- Full integrated Docker/PostgreSQL suite after the live-run adapter fixes:
+  `99/99` pass, including M3-C cursor-resume and mock import regressions and the
+  Gate 3 package regression.
 - Migration `0034_gate2_system_notifications.sql` is registered in
   `meta/_journal.json` and applied in the local integration database.
 - A post-migration OpenAPI contract regression was found and fixed for
@@ -221,13 +365,14 @@
 
 - Stand-in notification: database unavailable can delay in-app delivery; local
   `alerts.jsonl` and `system-alert-outbox.jsonl` remain the disaster evidence.
-- M3-C still needs the owner-provided fixture app IDs and API tokens for its
-  real source freeze and real-app acceptance run; no live kintone run was
-  attempted without them.
+- M3-C real extraction is complete. Real target import remains pending due the
+  unresolved mappings, unsupported category fields, and source-unavailable
+  lookup structure described above.
 - Demo host scheduling remains inactive pending the root-only unit installation
   above; the existing demo backup set was verified and exercised only in a
   local isolated restore target.
-- Real kintone migration and restore drills are not verified.
+- A real kintone import/activation or restore drill is not verified; no
+  source records were imported into the isolated target.
 
 ## Not done
 
