@@ -16,8 +16,13 @@ test('GF-11 Gate 1 OpenAPI documents live request, query, and response contracts
       assert.ok(content && Object.values(content).every(({ schema }) => Object.keys(schema).length > 0), method + ' ' + path);
     }
     for (const match of path.matchAll(/\{([^}]+)\}/g)) {
+      // Gate 2 correction: `version` is a legitimately integer workflow version
+      // number whose schema carries type 'integer' and no format (see
+      // GATE2-REPORT.md); every other path parameter is a uuid.
       assert.ok(parameters.some((parameter) => parameter.name === match[1] && parameter.in === 'path' &&
-        parameter.required && parameter.schema.format === 'uuid'), path);
+        parameter.required && (match[1] === 'version'
+          ? parameter.schema.type === 'integer'
+          : parameter.schema.format === 'uuid')), path);
     }
   }
   const getSchema = (operation, status, media = 'application/json') => operation.responses[status].content[media].schema;
@@ -36,5 +41,15 @@ test('GF-11 Gate 1 OpenAPI documents live request, query, and response contracts
   assert.equal(getSchema(paths[root + '/csv/export'].get, '200', 'application/zip').format, 'binary');
   assert.ok(getSchema(paths[root + '/tokens'].post, '201').properties.token);
   assert.equal(getSchema(paths[root + '/tokens'].get, '200').items.properties.token, undefined);
+  // Gate 2 routes carry complete contracts too.
+  for (const gate2Path of [root + '/workflow/publish', root + '/workflow/versions/{version}',
+    record + '/workflow/repair', record + '/workflow/history', '/workflow/tasks',
+    record + '/lookups/{fieldId}/refresh', record + '/comments', '/notifications']) {
+    assert.ok(paths[gate2Path], gate2Path);
+  }
+  assert.ok(getSchema(paths[root + '/workflow/publish'].post, '201').properties);
+  assert.ok(getSchema(paths['/workflow/tasks'].get, '200').properties.items);
+  const preflightSchema = getSchema(paths[root + '/csv/preflight'].post, '201');
+  assert.ok(preflightSchema.properties.eligibleRows && preflightSchema.properties.importedRows);
   t.diagnostic(operations.length + ' live operations with response schemas');
 });
