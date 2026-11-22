@@ -12,6 +12,7 @@ import { NotificationPlanner } from './notification-planner';
 import { CommentController, CommentService } from './comments';
 import { CsvController, CsvService } from './csv';
 import { ExportController, ExportService } from './export';
+import { ImportController, ImportExecutionService, ImportFinalizer, ImportOrchestrator, ImportService, MigrationController, MigrationGuard, TokenReissueController } from './import';
 import { RuntimeIndexController, RuntimeIndexService } from './runtime-indexes';
 import { SearchService } from './search';
 import { RecordQueryService } from './record-query';
@@ -46,8 +47,8 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, WorkflowDefinitionController, WorkflowRuntimeController, TenantAdminController, FileController, NotificationController, CommentController, CsvController, ApiTokenController, RuntimeIndexController, ExportController],
-  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, WorkflowDefinitionService, WorkflowRuntimeService, TenantAdminService, FileService, SearchService, NotificationService, NotificationPlanner, CommentService, CsvService, ApiTokenService, RuntimeIndexService, ExportService],
+  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, WorkflowDefinitionController, WorkflowRuntimeController, TenantAdminController, FileController, NotificationController, CommentController, CsvController, ApiTokenController, RuntimeIndexController, ExportController, ImportController, MigrationController, TokenReissueController],
+  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, WorkflowDefinitionService, WorkflowRuntimeService, TenantAdminService, FileService, SearchService, NotificationService, NotificationPlanner, CommentService, CsvService, ApiTokenService, RuntimeIndexService, ExportService, ImportService, ImportExecutionService, ImportFinalizer, ImportOrchestrator, MigrationGuard],
 })
 class AppModule {}
 

@@ -316,19 +316,14 @@ export class ExportService {
     const workflowEventRows = eventRows.length ? await tx.select().from(workflowEvents).where(and(
       eq(workflowEvents.tenantId, tenantId), eq(workflowEvents.appId, appId))) : [];
     const workflowEventById = new Map(workflowEventRows.map((row) => [row.eventId, row]));
-    const exportedEvents = eventRows.map((row) => {
-      const extra = row as unknown as Record<string, unknown>;
-      return {
-        eventId: row.eventId, recordId: row.recordId, recordRevision: row.recordRevision,
-        schemaVersion: row.schemaVersion, actorId: row.actorId, source: row.source, kind: row.kind,
-        objectType: row.objectType, objectId: row.objectId, occurredAt: row.occurredAt, changes: row.changes,
-        // Migration-source chain (contracts 4 SS4.5.3): carried as-is when the
-        // source event has one; never rewritten into a local event.
-        importJobId: (extra.importJobId as string | null) ?? null,
-        sourceActorId: (extra.sourceActorId as string | null) ?? null,
-        sourceTimestamp: (extra.sourceTimestamp as string | null) ?? null,
-      };
-    });
+    const exportedEvents = eventRows.map((row) => ({
+      eventId: row.eventId, recordId: row.recordId, recordRevision: row.recordRevision,
+      schemaVersion: row.schemaVersion, actorId: row.actorId, source: row.source, kind: row.kind,
+      objectType: row.objectType, objectId: row.objectId, occurredAt: row.occurredAt, changes: row.changes,
+      // Migration-source chain (contracts 4 SS4.5.3): carried as-is when the
+      // source event has one; never rewritten into a local event.
+      importJobId: row.importJobId, sourceActorId: row.sourceActorId, sourceTimestamp: row.sourceTimestamp,
+    }));
     const exportedWorkflowEvents = workflowEventRows
       .filter(({ eventId }) => exportedEvents.some((event) => event.eventId === eventId))
       .map((row) => ({

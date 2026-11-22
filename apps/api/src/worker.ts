@@ -4,6 +4,7 @@ import { runIndexJob } from './runtime-index-worker';
 import { deliverNotificationEmail, deliverNotifications, smtpSender } from './notification-worker';
 import { cleanupFiles } from './file-maintenance';
 import { ExportService } from './export';
+import { ImportExecutionService, ImportFinalizer, ImportOrchestrator, ImportService } from './import';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
 
@@ -56,6 +57,22 @@ async function main() {
           }
         } catch (error) {
           console.error('Export worker failed', { tenantId: context.tenantId, error });
+          if (once) process.exitCode = 1;
+        }
+        try {
+          const authorization = new AuthorizationService();
+          const schema = new AppSchemaService(authorization);
+          const imports = new ImportService(schema);
+          const orchestrator = new ImportOrchestrator(
+            new ImportExecutionService(schema, authorization, imports),
+            new ImportFinalizer(schema, authorization, imports), imports, schema);
+          const done = await orchestrator.processQueued(context);
+          for (const job of done) {
+            if (job.status === 'ready') console.info('Import staged', { tenantId: context.tenantId, ...job });
+            else if (job.status === 'failed') console.error('Import failed', { tenantId: context.tenantId, ...job });
+          }
+        } catch (error) {
+          console.error('Import worker failed', { tenantId: context.tenantId, error });
           if (once) process.exitCode = 1;
         }
         try {
