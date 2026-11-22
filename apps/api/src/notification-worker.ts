@@ -54,13 +54,18 @@ const schema = new AppSchemaService(auth);
 export async function deliverNotificationEmail(context: TenantContext, send: NonNullable<ReturnType<typeof smtpSender>>) {
   return withTenantTransaction(context, async (tx) => {
     const [row] = await tx.select({
-      id: notifications.id, userId: notifications.userId, appId: notifications.appId,
+      id: notifications.id, sourceType: notifications.sourceType, userId: notifications.userId, appId: notifications.appId,
       recordId: notifications.recordId, attempts: notifications.emailAttempts, email: users.email,
     }).from(notifications).innerJoin(users, and(eq(users.tenantId, notifications.tenantId), eq(users.id, notifications.userId)))
-      .where(and(eq(notifications.tenantId, context.tenantId), eq(notifications.emailState, 'pending'),
+      .where(and(eq(notifications.tenantId, context.tenantId), eq(notifications.sourceType, 'RECORD'), eq(notifications.emailState, 'pending'),
         sql`${notifications.emailNextAt} <= clock_timestamp()`))
       .orderBy(notifications.emailNextAt, notifications.id).limit(1).for('update', { of: notifications, skipLocked: true });
     if (!row) return false;
+    if (row.sourceType === 'SYSTEM' || !row.appId || !row.recordId) {
+      await tx.update(notifications).set({ emailState: 'skipped' }).where(and(
+        eq(notifications.tenantId, context.tenantId), eq(notifications.id, row.id)));
+      return true;
+    }
     const recipient = { tenantId: context.tenantId, userId: row.userId };
     const grant = await schema.access(tx, recipient, row.appId, 'view').catch((error: unknown) => {
       if (error instanceof NotFoundException) return undefined;

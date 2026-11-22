@@ -5,7 +5,7 @@
 // deployment-host tools, not test-container tools.
 const assert = require('node:assert/strict');
 const { execFile } = require('node:child_process');
-const { createHash } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join, resolve } = require('node:path');
@@ -72,4 +72,33 @@ test('G3-13 list reports sets as sensitive data', async () => {
   const sets = JSON.parse(result.stdout);
   assert.equal(sets.length, 1);
   assert.equal(sets[0].sensitiveData, true);
+});
+
+test('P2-T2 backup failure retains a system alert and warns on local write failure', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'suzubase-backup-alert-'));
+  const tenantId = randomUUID();
+  const env = {
+    SUZUBASE_BACKUP_DIR: dir,
+    SUZUBASE_TENANT_ID: tenantId,
+  };
+  const missing = join(dir, 'missing-set');
+  const result = await cliRun(['verify', missing], env);
+  assert.equal(result.code, 1);
+  assert.ok(existsSync(join(dir, 'alerts.jsonl')));
+  assert.ok(existsSync(join(dir, 'system-alert-outbox.jsonl')));
+  const local = JSON.parse(readFileSync(join(dir, 'alerts.jsonl'), 'utf8').trim().split('\n').at(-1));
+  assert.equal(local.audience, 'tenant-administrators');
+  const pending = JSON.parse(readFileSync(join(dir, 'system-alert-outbox.jsonl'), 'utf8').trim().split('\n').at(-1));
+  assert.equal(pending.tenantId, tenantId);
+  assert.equal(pending.eventType, 'BACKUP_FAILED');
+  assert.equal(pending.targetRole, 'TENANT_ADMIN');
+  assert.deepEqual(pending.payload, { operation: 'verify', status: 'failed' });
+
+  const failedDir = join(dir, 'alerts-write-failure');
+  writeFileSync(failedDir, 'not a directory');
+  const failed = await cliRun(['verify', missing], {
+    SUZUBASE_BACKUP_DIR: join(failedDir, 'nested'),
+  });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /ALERT FAILED|FAILED:|local alert/i);
 });

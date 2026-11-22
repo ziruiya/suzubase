@@ -7,7 +7,7 @@ import { AuthorizationService } from './authorization';
 import { AppSchemaController, AppSchemaService } from './app-schema';
 import { FileController, FileService, maxAttachmentBytes } from './files';
 import { ApiTokenController, ApiTokenService } from './api-tokens';
-import { NotificationController, NotificationService } from './notifications';
+import { NotificationController, NotificationService, SystemNotificationController } from './notifications';
 import { NotificationPlanner } from './notification-planner';
 import { CommentController, CommentService } from './comments';
 import { CsvController, CsvService } from './csv';
@@ -47,7 +47,7 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, WorkflowDefinitionController, WorkflowRuntimeController, TenantAdminController, FileController, NotificationController, CommentController, CsvController, ApiTokenController, RuntimeIndexController, ExportController, ImportController, MigrationController, TokenReissueController],
+  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, WorkflowDefinitionController, WorkflowRuntimeController, TenantAdminController, FileController, NotificationController, SystemNotificationController, CommentController, CsvController, ApiTokenController, RuntimeIndexController, ExportController, ImportController, MigrationController, TokenReissueController],
   providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, WorkflowDefinitionService, WorkflowRuntimeService, TenantAdminService, FileService, SearchService, NotificationService, NotificationPlanner, CommentService, CsvService, ApiTokenService, RuntimeIndexService, ExportService, ImportService, ImportExecutionService, ImportFinalizer, ImportOrchestrator, MigrationGuard],
 })
 class AppModule {}

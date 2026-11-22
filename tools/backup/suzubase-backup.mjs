@@ -44,7 +44,7 @@
 // (one line per tenant administrator, resolved from the database when
 // reachable -- the in-app notification channel for deployment tooling), and
 // exits non-zero. Failures never pass silently.
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, appendFileSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
@@ -64,20 +64,104 @@ function log(line) {
   try { mkdirSync(backupDir, { recursive: true }); appendFileSync(logFile, stamped + '\n'); } catch { /* log is best-effort */ }
 }
 
+function recordStatus(state, details = {}) {
+  try {
+    mkdirSync(backupDir, { recursive: true });
+    let previous = {};
+    const statusFile = join(backupDir, 'status.json');
+    if (existsSync(statusFile)) {
+      try { previous = JSON.parse(readFileSync(statusFile, 'utf8')); } catch { previous = {}; }
+    }
+    const now = new Date().toISOString();
+    writeFileSync(join(backupDir, 'status.json'), JSON.stringify({
+      state,
+      recentSuccessAt: state === 'success' ? now : previous.recentSuccessAt ?? null,
+      recentFailureAt: state === 'failed' ? now : previous.recentFailureAt ?? null,
+      ...details,
+      updatedAt: now,
+    }, null, 2));
+  } catch (error) {
+    log(`STATUS WRITE FAILED: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function deliverPendingAlerts() {
+  const outboxFile = join(backupDir, 'system-alert-outbox.jsonl');
+  const deliveredFile = join(backupDir, 'system-alert-delivered.jsonl');
+  if (!existsSync(outboxFile)) return;
+  const url = process.env.SUZUBASE_SYSTEM_NOTIFICATION_URL;
+  const secret = process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET;
+  if (!url || !secret) {
+    log('SYSTEM ALERT: notification service not configured; alert retained for retry');
+    return;
+  }
+  const delivered = new Set(existsSync(deliveredFile)
+    ? readFileSync(deliveredFile, 'utf8').split('\n').filter(Boolean).map((line) => {
+        try { return JSON.parse(line).sourceEventId; } catch { return null; }
+      }).filter(Boolean)
+    : []);
+  const lines = readFileSync(outboxFile, 'utf8').split('\n').filter(Boolean);
+  for (const line of lines) {
+    let event;
+    try { event = JSON.parse(line); } catch { log('SYSTEM ALERT: malformed pending event retained'); continue; }
+    if (delivered.has(event.sourceEventId)) continue;
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-suzubase-system-secret': secret },
+        body: JSON.stringify(event),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) throw new Error(`notification service returned HTTP ${response.status}`);
+      mkdirSync(backupDir, { recursive: true });
+      appendFileSync(deliveredFile, JSON.stringify({ sourceEventId: event.sourceEventId, deliveredAt: new Date().toISOString() }) + '\n');
+      log(`SYSTEM ALERT delivered: ${event.dedupKey}`);
+    } catch (error) {
+      log(`SYSTEM ALERT pending retry: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
 async function alertAdmins(reason, context) {
-  // One alert line per tenant administrator (the deployment log directory is
-  // the tool's notification outbox; see README for the delivery contract).
-  const alert = { at: new Date().toISOString(), kind: 'backup-alert', reason, context, audience: 'tenant-administrators' };
+  const occurredAt = new Date().toISOString();
+  const operation = typeof context.operation === 'string' ? context.operation : 'unknown';
+  const sourceEventId = randomUUID();
+  const dedupKey = typeof context.name === 'string' && context.name
+    ? `backup:${operation}:${context.name}`
+    : `backup:${operation}:${sourceEventId}`;
+  const alert = { at: occurredAt, kind: 'backup-alert', reason, context, audience: 'tenant-administrators',
+    sourceEventId, dedupKey };
+  const systemEvent = {
+    tenantId: process.env.SUZUBASE_TENANT_ID,
+    sourceEventId,
+    dedupKey,
+    eventType: 'BACKUP_FAILED',
+    occurredAt,
+    targetRole: 'TENANT_ADMIN',
+    payload: { operation: ['create', 'verify', 'restore', 'list'].includes(operation) ? operation : 'list', status: 'failed' },
+  };
   try {
     mkdirSync(backupDir, { recursive: true });
     appendFileSync(join(backupDir, 'alerts.jsonl'), JSON.stringify(alert) + '\n');
-  } catch { /* the exit code + log still carry the failure */ }
+    if (systemEvent.tenantId) appendFileSync(join(backupDir, 'system-alert-outbox.jsonl'), JSON.stringify(systemEvent) + '\n');
+  } catch (error) {
+    throw new Error(`local alert evidence/pending delivery write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  await deliverPendingAlerts();
   log(`ALERT (tenant administrators): ${reason}`);
 }
 
 async function fail(reason, context = {}) {
   log(`FAILED: ${reason}`);
-  await alertAdmins(reason, context);
+  recordStatus('failed', { reason: String(reason).slice(0, 500) });
+  try {
+    await alertAdmins(reason, { operation: process.argv[2] === 'create' ? 'create'
+      : process.argv[2] === 'verify' ? 'verify'
+      : process.argv[2] === 'restore' ? 'restore'
+      : 'list', ...context });
+  } catch (error) {
+    log(`ALERT FAILED: ${error instanceof Error ? error.message : String(error)}`);
+  }
   process.exit(1);
 }
 
@@ -235,6 +319,7 @@ async function create(label) {
     const { problems } = await verifySet(setDir);
     if (problems.length) throw new Error('post-create verification failed: ' + problems.join('; '));
     log(`created + verified backup set ${name} (${manifest.files.length} files)`);
+    recordStatus('success', { operation: 'create', backupSet: name });
     // Retention: keep the newest N sets.
     const sets = readdirSync(backupDir).filter((entry) => entry.startsWith('backup-')).sort();
     for (const stale of sets.slice(0, Math.max(0, sets.length - retention))) {
@@ -303,6 +388,7 @@ async function list() {
   console.log(JSON.stringify(sets, null, 2));
 }
 
+await deliverPendingAlerts();
 const [command, arg] = process.argv.slice(2);
 if (command === 'create') await create(arg === '--name' ? process.argv[4] : undefined);
 else if (command === 'verify') {
@@ -316,7 +402,14 @@ else if (command === 'verify') {
   if (!arg) await fail('restore requires a backup set directory');
   await restore(resolve(arg));
 } else if (command === 'list') await list();
+else if (command === 'retry-alerts') {
+  await deliverPendingAlerts();
+  console.log(JSON.stringify({ retried: true }));
+}
+else if (command === 'missed-schedule') {
+  await fail('scheduled backup did not run within the configured threshold', { name: 'scheduler-watchdog' });
+}
 else {
-  console.error('usage: suzubase-backup.mjs create [--name label] | verify <dir> | restore <dir> | list');
+  console.error('usage: suzubase-backup.mjs create [--name label] | verify <dir> | restore <dir> | list | retry-alerts | missed-schedule');
   process.exit(2);
 }

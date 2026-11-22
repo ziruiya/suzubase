@@ -1,9 +1,9 @@
 import {
-  BadRequestException, Body, Controller, Get, Injectable, NotFoundException, Param, Post, Put, Query, UseGuards,
+  BadRequestException, Body, Controller, Get, Headers, Injectable, NotFoundException, Param, Post, Put, Query, UnauthorizedException, UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
-  and, apps, appVersions, eq, isNull, notifications, records, sql, workflowActions, workflowDefinitions,
+  and, apps, appVersions, eq, isNull, notifications, records, sql, tenantMembers, workflowActions, workflowDefinitions,
   withTenantTransaction, type TenantContext, type TenantTransaction,
 } from '@suzubase/db';
 import { fieldContract, notificationPlaceholders, notificationTriggers, type NotificationRule } from '@suzubase/shared-types';
@@ -31,7 +31,7 @@ const rulesInput = z.strictObject({ rules: z.array(ruleInput).max(50).refine((ru
 const appFilter = z.strictObject({ appId: identifier.optional() });
 const centerFilter = appFilter.extend({ after: identifier.optional(), read: z.enum(['read', 'unread']).optional() });
 const noticeItem = z.object({
-  id: identifier, appId: identifier, createdAt: z.string(), readAt: z.string().nullable(),
+  id: identifier, appId: identifier.nullable(), createdAt: z.string(), readAt: z.string().nullable(),
   appName: z.string(), title: z.string(), body: z.string(),
 });
 const centerReply = z.object({ items: z.array(noticeItem), next: identifier.nullable() });
@@ -130,14 +130,20 @@ export class NotificationService {
       const limit = 30;
       const rows = await tx.select({
         id: notifications.id, appId: notifications.appId, recordId: notifications.recordId, appName: apps.name,
+        sourceType: notifications.sourceType,
         title: notifications.title, body: notifications.body, readAt: notifications.readAt, createdAt: notifications.createdAt,
-      }).from(notifications).innerJoin(apps, and(eq(apps.tenantId, notifications.tenantId), eq(apps.id, notifications.appId)))
+      }).from(notifications).leftJoin(apps, and(eq(apps.tenantId, notifications.tenantId), eq(apps.id, notifications.appId)))
         .where(and(scope, anchor ? sql`(${notifications.createdAt}, ${notifications.id}) < (${anchor.createdAt}::timestamptz, ${anchor.id}::uuid)` : undefined))
         .orderBy(sql`${notifications.createdAt} DESC, ${notifications.id} DESC`).limit(limit + 1);
       const page = rows.slice(0, limit);
       const items = [];
       const cache = new Map<string, Awaited<ReturnType<NotificationService['recordAccess']>>>();
-      for (const { recordId, ...item } of page) {
+      for (const { recordId, sourceType, ...item } of page) {
+        if (sourceType === 'SYSTEM') {
+          items.push({ ...item, appId: null, appName: 'System', recordId: null });
+          continue;
+        }
+        if (!item.appId || !recordId) continue;
         const key = item.appId + recordId;
         if (!cache.has(key)) cache.set(key, await this.recordAccess(tx, context, item.appId, recordId));
         items.push(cache.get(key) ? item : { ...item, appName: '', title: 'Notification', body: '' });
@@ -157,9 +163,14 @@ export class NotificationService {
 
   open(context: TenantContext, id: string) {
     return withTenantTransaction(context, async (tx) => {
-      const [link] = await tx.select({ appId: notifications.appId, recordId: notifications.recordId }).from(notifications)
+      const [link] = await tx.select({
+        appId: notifications.appId, recordId: notifications.recordId, sourceType: notifications.sourceType,
+      }).from(notifications)
         .where(and(own(context), eq(notifications.id, id)));
-      if (!link || !await this.recordAccess(tx, context, link.appId, link.recordId)) throw new NotFoundException('无权限');
+      if (!link) throw new NotFoundException('无权限');
+      if (link.sourceType === 'RECORD') {
+        if (!link.appId || !link.recordId || !await this.recordAccess(tx, context, link.appId, link.recordId)) throw new NotFoundException('无权限');
+      }
       await tx.update(notifications).set({ readAt: sql`COALESCE(${notifications.readAt}, clock_timestamp())` })
         .where(and(own(context), eq(notifications.id, id)));
       return link;
@@ -213,5 +224,56 @@ export class NotificationController {
   @Post('notifications/:id/open')
   open(@AuthenticatedTenant() context: TenantContext, @Param('id') id: string) {
     return this.notifications.open(context, parseInput(identifier, id));
+  }
+}
+
+const systemNotificationInput = z.strictObject({
+  tenantId: identifier,
+  sourceEventId: identifier,
+  dedupKey: z.string().min(1).max(200),
+  eventType: z.literal('BACKUP_FAILED'),
+  occurredAt: z.string().datetime(),
+  targetRole: z.literal('TENANT_ADMIN'),
+  payload: z.strictObject({
+    operation: z.enum(['create', 'verify', 'restore', 'list']),
+    status: z.literal('failed'),
+  }),
+});
+
+@ApiTags('system notifications')
+@Controller()
+export class SystemNotificationController {
+  @Post('notifications/system/deliver')
+  async deliver(@Headers('x-suzubase-system-secret') secret: string | undefined, @Body() body: unknown) {
+    const configured = process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET;
+    if (!configured || !secret || secret !== configured) throw new UnauthorizedException('Invalid system notification credential');
+    const event = parseInput(systemNotificationInput, body);
+    return withTenantTransaction({ tenantId: event.tenantId, userId: '00000000-0000-0000-0000-000000000000' }, async (tx) => {
+      const admins = await tx.select({ userId: tenantMembers.userId }).from(tenantMembers)
+        .where(and(eq(tenantMembers.tenantId, event.tenantId), eq(tenantMembers.isAdmin, true)));
+      let inserted = 0;
+      for (const admin of admins) {
+        const result = await tx.insert(notifications).values({
+          tenantId: event.tenantId,
+          sourceType: 'SYSTEM',
+          appId: null,
+          recordId: null,
+          eventId: null,
+          userId: admin.userId,
+          ruleKey: 'system:' + event.eventType,
+          title: 'Deployment backup failed',
+          body: 'A backup operation failed. Check deployment logs and local alerts for diagnostics.',
+          sourceEventId: event.sourceEventId,
+          dedupKey: event.dedupKey,
+          eventType: event.eventType,
+          targetRole: event.targetRole,
+          payload: event.payload,
+          occurredAt: event.occurredAt,
+          emailState: 'skipped',
+        }).onConflictDoNothing();
+        inserted += result.rowCount ?? 0;
+      }
+      return { delivered: admins.length, inserted };
+    });
   }
 }

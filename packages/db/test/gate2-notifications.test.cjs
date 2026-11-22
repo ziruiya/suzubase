@@ -82,3 +82,47 @@ test('G2-09 notification outbox captures authorized recipients and field project
   t.diagnostic(JSON.stringify({ eventId: comment.eventId, authorized: delivered.inserted, unauthorized: 0,
     ruleNotice: created, unreadAfterMark: 1, unreadAfterAll: 0, revoked, csvDelivered: 0, email: 'skipped' }));
 });
+
+test('P2-T2 system notifications are tenant-scoped, role-resolved, and deduplicated', async () => {
+  configureRuntime();
+  const admin = await provision({ isAdmin: true });
+  const member = await provision({ tenantId: admin.tenantId });
+  const otherTenant = await provision();
+  const sourceEventId = randomUUID();
+  const dedupKey = `backup:create:${randomUUID()}`;
+  const sql = new Client({ connectionString: process.env.ADMIN_DATABASE_URL });
+  await sql.connect();
+  let duplicateFailed = false;
+  try {
+    await sql.query(`INSERT INTO notifications (
+      tenant_id, source_type, app_id, record_id, event_id, user_id, rule_key,
+      title, body, source_event_id, dedup_key, event_type, target_role, payload, email_state
+    ) VALUES ($1, 'SYSTEM', NULL, NULL, NULL, $2, 'system:BACKUP_FAILED',
+      'Deployment backup failed', 'A backup operation failed.', $3, $4, 'BACKUP_FAILED', 'TENANT_ADMIN',
+      '{"operation":"create","status":"failed"}', 'skipped')`, [admin.tenantId, admin.userId, sourceEventId, dedupKey]);
+    try {
+      await sql.query(`INSERT INTO notifications (
+      tenant_id, source_type, app_id, record_id, event_id, user_id, rule_key,
+      title, body, source_event_id, dedup_key, event_type, target_role, payload, email_state
+    ) VALUES ($1, 'SYSTEM', NULL, NULL, NULL, $2, 'system:BACKUP_FAILED',
+      'Deployment backup failed', 'A backup operation failed.', $3, $4, 'BACKUP_FAILED', 'TENANT_ADMIN',
+      '{"operation":"create","status":"failed"}', 'skipped')`, [admin.tenantId, admin.userId, sourceEventId, dedupKey])
+    } catch (error) {
+      duplicateFailed = true;
+      assert.equal(error.code, '23505');
+    }
+    assert.equal(duplicateFailed, true);
+  } finally {
+    await sql.end();
+  }
+  const adminToken = await login(admin);
+  const memberToken = await login(member);
+  const outsiderToken = await login(otherTenant);
+  assert.equal((await expectRequest(200, '/notifications/unread', { token: adminToken })).count, '1');
+  assert.equal((await expectRequest(200, '/notifications/unread', { token: memberToken })).count, '0');
+  assert.equal((await expectRequest(200, '/notifications/unread', { token: outsiderToken })).count, '0');
+  const inbox = await expectRequest(200, '/notifications', { token: adminToken });
+  assert.equal(inbox.items.length, 1);
+  assert.equal(inbox.items[0].appId, null);
+  assert.equal(inbox.items[0].appName, 'System');
+});
