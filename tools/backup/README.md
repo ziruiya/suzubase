@@ -51,6 +51,22 @@ them as sensitive data.
 | `SUZUBASE_CONFIG_FILES` | comma-separated config files included in each set | — |
 | `SUZUBASE_APP_VERSION` | application version stamped into the manifest | `unknown` |
 | `SUZUBASE_HEALTH_URL` | health endpoint checked after a restore | — |
+| `SUZUBASE_POST_RESTORE_SQL_CMD` | command template receiving `{file}` = `tools/backup/post-restore-normalize.sql`; **required after every restore** | — |
+
+### Post-restore ownership normalization (required step)
+
+`pg_restore` recreates objects owned by the restoring (bootstrap/admin)
+role, while a fresh deployment's objects belong to the least-privilege
+migration role (`suzubase_migration`) that the migrator connects as. Without
+normalization the restored deployment cannot apply migrations
+(`permission denied for schema drizzle`, SQLSTATE 42501).
+`suzubase-backup restore` runs `tools/backup/post-restore-normalize.sql`
+whenever `SUZUBASE_POST_RESTORE_SQL_CMD` is set — direct mode:
+`psql "$ADMIN_DATABASE_URL" -f {file}`; container mode:
+`docker exec -i <postgres-container> psql -U suzubase -d suzubase < {file}` —
+handing schemas, tables, views, sequences, functions and enum types in the
+application schemas back to the migration role. Run restores with the
+application stack stopped, then start it.
 | `SUZUBASE_PG_DUMP_CMD` / `SUZUBASE_PG_RESTORE_CMD` / `SUZUBASE_PGSQL_CMD` | command templates for containerised deployments, e.g. `docker exec -i <postgres-container> pg_dump -U suzubase -d suzubase -Fc` | — |
 | `SUZUBASE_ATTACH_EXPORT_CMD` / `SUZUBASE_ATTACH_IMPORT_CMD` | command templates copying attachments out of / into the running deployment (`{dir}` = staging directory) | — |
 

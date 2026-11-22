@@ -195,11 +195,16 @@ async function verifySet(setDir) {
     if (actual !== file.sha256) problems.push(`hash mismatch ${file.path}`);
     if (statSync(path).size !== file.bytes) problems.push(`size mismatch ${file.path}`);
   }
-  // Readability of the dump itself (pg_restore --list) in direct mode.
+  // Readability of the dump itself (pg_restore --list) when a pg_restore
+  // binary is available on this host; in container mode the restore-time
+  // pg_restore run is the readability proof, and hashes still apply here.
   const dumpPath = join(setDir, 'database.dump');
   if (existsSync(dumpPath) && !process.env.SUZUBASE_PG_RESTORE_CMD) {
-    await run('pg_restore', ['--list', dumpPath], { maxBuffer: 1024 * 1024 * 64 })
-      .catch(() => problems.push('database.dump is not readable by pg_restore'));
+    const available = await run('pg_restore', ['--version']).then(() => true).catch(() => false);
+    if (available) {
+      await run('pg_restore', ['--list', dumpPath], { maxBuffer: 1024 * 1024 * 64 })
+        .catch(() => problems.push('database.dump is not readable by pg_restore'));
+    }
   }
   return { manifest, problems };
 }
@@ -259,6 +264,15 @@ async function restore(setDir) {
     }
     await restoreDatabase(join(setDir, 'database.dump'));
     await copyAttachmentsIn(join(setDir, 'attachments'));
+    // Ownership normalization (REQUIRED after every restore — see
+    // tools/backup/README.md): pg_restore recreated objects owned by the
+    // restoring role; hand them back to the migration role so the restored
+    // deployment matches a fresh deployment and can migrate again.
+    // SUZUBASE_POST_RESTORE_SQL_CMD receives {file} = the SQL file path.
+    if (process.env.SUZUBASE_POST_RESTORE_SQL_CMD) {
+      const sqlPath = new URL('./post-restore-normalize.sql', import.meta.url).pathname;
+      await shellCommand(process.env.SUZUBASE_POST_RESTORE_SQL_CMD, { file: sqlPath });
+    }
     // Health check + core smoke after restore.
     const healthUrl = process.env.SUZUBASE_HEALTH_URL;
     if (healthUrl) {
