@@ -52,6 +52,7 @@ jobs:
           trap 'kill "$api_pid" 2>/dev/null || true' EXIT
           curl --retry 12 --retry-all-errors --retry-delay 1 -fsS "$TEST_API_URL/health"
           pnpm test
+          node tools/audit/audit-integrity.mjs --sample 20
           pnpm --filter @suzubase/web exec vite preview --host 127.0.0.1 --port 5173 > "$RUNNER_TEMP/suzubase-web.log" 2>&1 &
           web_pid=$!
           trap 'kill "$web_pid" "$api_pid" 2>/dev/null || true' EXIT
