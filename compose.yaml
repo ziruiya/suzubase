@@ -25,6 +25,7 @@ services:
       ADMIN_DATABASE_URL: postgres://suzubase:suzubase-dev@postgres:5432/suzubase
       MIGRATION_DATABASE_URL: postgres://suzubase_migration:suzubase-migration-dev@postgres:5432/suzubase
       RUNTIME_DATABASE_PASSWORD: suzubase-runtime-dev
+      SUZUBASE_SYSTEM_NOTIFICATION_SECRET: ${SUZUBASE_SYSTEM_NOTIFICATION_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -35,6 +36,7 @@ services:
       ATTACHMENT_DIRECTORY: /workspace/attachments
       SEARCH_TIMING: ${SEARCH_TIMING:-0}
       DATABASE_URL: postgres://suzubase_runtime:suzubase-runtime-dev@postgres:5432/suzubase
+      SUZUBASE_SYSTEM_NOTIFICATION_SECRET: ${SUZUBASE_SYSTEM_NOTIFICATION_SECRET:-}
     volumes:
       - attachment-data:/workspace/attachments
     depends_on:

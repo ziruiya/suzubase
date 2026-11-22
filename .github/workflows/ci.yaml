@@ -44,6 +44,8 @@ jobs:
       - run: pnpm -r --workspace-concurrency=1 build
       - run: pnpm -r --workspace-concurrency=1 typecheck
       - run: pnpm exec playwright install --with-deps chromium
+      - name: Set integration system notification credential
+        run: printf 'SUZUBASE_SYSTEM_NOTIFICATION_SECRET=%s\n' "$(openssl rand -hex 32)" >> "$GITHUB_ENV"
       - name: Migrate and start API
         run: |
           pnpm --filter @suzubase/db migrate

@@ -27,6 +27,7 @@ Use those credentials with `POST /auth/login`, then send the returned session to
 pnpm install --frozen-lockfile
 pnpm -r build
 pnpm -r typecheck
+SUZUBASE_SYSTEM_NOTIFICATION_SECRET=p2-t2-integration-secret export SUZUBASE_SYSTEM_NOTIFICATION_SECRET="$(openssl rand -hex 32)"
 API_PORT=13000 WEB_PORT=15173 docker compose -p suzubase-ci up -d --build --wait
 docker compose -p suzubase-ci run --rm migrate pnpm test
 docker compose -p suzubase-ci down

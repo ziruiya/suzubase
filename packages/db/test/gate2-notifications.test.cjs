@@ -83,38 +83,55 @@ test('G2-09 notification outbox captures authorized recipients and field project
     ruleNotice: created, unreadAfterMark: 1, unreadAfterAll: 0, revoked, csvDelivered: 0, email: 'skipped' }));
 });
 
-test('P2-T2 system notifications are tenant-scoped, role-resolved, and deduplicated', async () => {
+test('P2-T2 system notifications are tenant-scoped, role-resolved, and deduplicated', async (t) => {
   configureRuntime();
-  const admin = await provision({ isAdmin: true });
-  const member = await provision({ tenantId: admin.tenantId });
-  const otherTenant = await provision();
-  const sourceEventId = randomUUID();
-  const dedupKey = `backup:create:${randomUUID()}`;
+  const systemSecret = process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET;
+  assert.ok(systemSecret, 'integration system notification credential must be configured');
+  const event = process.env.P2_T2_SYSTEM_EVENT_JSON
+    ? JSON.parse(process.env.P2_T2_SYSTEM_EVENT_JSON)
+    : {
+        tenantId: randomUUID(),
+        sourceEventId: randomUUID(),
+        dedupKey: `backup:create:${randomUUID()}`,
+        eventType: 'BACKUP_FAILED',
+        occurredAt: new Date().toISOString(),
+        targetRole: 'TENANT_ADMIN',
+        payload: { operation: 'create', status: 'failed' },
+      };
   const sql = new Client({ connectionString: process.env.ADMIN_DATABASE_URL });
   await sql.connect();
-  let duplicateFailed = false;
   try {
-    await sql.query(`INSERT INTO notifications (
-      tenant_id, source_type, app_id, record_id, event_id, user_id, rule_key,
-      title, body, source_event_id, dedup_key, event_type, target_role, payload, email_state
-    ) VALUES ($1, 'SYSTEM', NULL, NULL, NULL, $2, 'system:BACKUP_FAILED',
-      'Deployment backup failed', 'A backup operation failed.', $3, $4, 'BACKUP_FAILED', 'TENANT_ADMIN',
-      '{"operation":"create","status":"failed"}', 'skipped')`, [admin.tenantId, admin.userId, sourceEventId, dedupKey]);
-    try {
-      await sql.query(`INSERT INTO notifications (
-      tenant_id, source_type, app_id, record_id, event_id, user_id, rule_key,
-      title, body, source_event_id, dedup_key, event_type, target_role, payload, email_state
-    ) VALUES ($1, 'SYSTEM', NULL, NULL, NULL, $2, 'system:BACKUP_FAILED',
-      'Deployment backup failed', 'A backup operation failed.', $3, $4, 'BACKUP_FAILED', 'TENANT_ADMIN',
-      '{"operation":"create","status":"failed"}', 'skipped')`, [admin.tenantId, admin.userId, sourceEventId, dedupKey])
-    } catch (error) {
-      duplicateFailed = true;
-      assert.equal(error.code, '23505');
-    }
-    assert.equal(duplicateFailed, true);
+    await sql.query('INSERT INTO tenants (id, name) VALUES ($1, $2)', [event.tenantId, 'P2 T2 system event tenant']);
   } finally {
     await sql.end();
   }
+  const admin = await provision({ tenantId: event.tenantId, isAdmin: true });
+  const member = await provision({ tenantId: admin.tenantId });
+  const otherTenant = await provision({ isAdmin: true });
+  const deliver = () => expectRequest(201, '/notifications/system/deliver', {
+    method: 'POST',
+    headers: { 'x-suzubase-system-secret': systemSecret },
+    body: event,
+  });
+  assert.deepEqual(await deliver(), { delivered: 1, inserted: 1 });
+  assert.deepEqual(await deliver(), { delivered: 1, inserted: 0 });
+
+  const audit = new Client({ connectionString: process.env.ADMIN_DATABASE_URL });
+  await audit.connect();
+  try {
+    const { rows } = await audit.query(
+      'SELECT source_type AS "sourceType", user_id AS "userId", payload FROM notifications WHERE tenant_id = $1 AND source_event_id = $2',
+      [admin.tenantId, event.sourceEventId],
+    );
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].sourceType, 'SYSTEM');
+    assert.equal(rows[0].userId, admin.userId);
+    assert.deepEqual(rows[0].payload, { operation: 'create', status: 'failed' });
+    assert.deepEqual(Object.keys(rows[0].payload).sort(), ['operation', 'status']);
+  } finally {
+    await audit.end();
+  }
+
   const adminToken = await login(admin);
   const memberToken = await login(member);
   const outsiderToken = await login(otherTenant);
@@ -122,7 +139,18 @@ test('P2-T2 system notifications are tenant-scoped, role-resolved, and deduplica
   assert.equal((await expectRequest(200, '/notifications/unread', { token: memberToken })).count, '0');
   assert.equal((await expectRequest(200, '/notifications/unread', { token: outsiderToken })).count, '0');
   const inbox = await expectRequest(200, '/notifications', { token: adminToken });
+  const memberInbox = await expectRequest(200, '/notifications', { token: memberToken });
+  const outsiderInbox = await expectRequest(200, '/notifications', { token: outsiderToken });
   assert.equal(inbox.items.length, 1);
   assert.equal(inbox.items[0].appId, null);
   assert.equal(inbox.items[0].appName, 'System');
+  assert.equal(inbox.items[0].title, 'Deployment backup failed');
+  assert.equal(memberInbox.items.length, 0);
+  assert.equal(outsiderInbox.items.length, 0);
+  t.diagnostic(JSON.stringify({
+    sourceEventId: event.sourceEventId, firstDeliveryInserted: 1, replayInserted: 0,
+    adminSystemNotifications: inbox.items.length, adminUnread: '1',
+    memberNotifications: memberInbox.items.length, otherTenantAdminNotifications: outsiderInbox.items.length,
+    payload: { operation: 'create', status: 'failed' },
+  }));
 });
