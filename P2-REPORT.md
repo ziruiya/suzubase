@@ -27,21 +27,76 @@
 
 ## T3 - Scheduled backups
 
-- Added systemd service/timer and watchdog service/timer files as the only
-  formal scheduling implementation.
-- The scheduled service reuses `suzubase-backup.mjs create`, uses `flock` anti-
-  reentry, and has a 2-hour timeout.
-- Backup CLI status now preserves recent success and failure timestamps.
-- The watchdog detects missing status or a success older than 26 hours and uses
-  the existing failure-alert path.
-- Deployment host OS/scheduler access was not available from this worktree, so
-  `suzubase.suzu.life` host capability could not be independently confirmed.
-  The systemd units are therefore implementation-ready but deployment
-  activation and real-host verification remain explicitly pending.
-- No real production restore drill was performed in this batch. The existing
-  backup/restore implementation and local tests remain, but database/attachment/
-  configuration real-host verification is pending because no isolated target
-  environment or production credentials were available.
+- Host capability probes (SSH `suzubase-lab`, as `sbdeploy`; output verbatim):
+  ```
+  === docker ps ===
+  permission denied while trying to connect to the docker API at unix:///var/run/docker.sock
+  docker_exit=1
+  === /etc/systemd/system writable ===
+  write_test_exit=1
+  === systemctl --user ===
+  running
+  user_systemctl_exit=0
+  ```
+- Before deployment, the host's three existing backup tool files were copied to
+  `/opt/suzubase/backups/pre-p2-tools-backup/` (`README.md`,
+  `post-restore-normalize.sql`, and `suzubase-backup.mjs`); all remain there.
+- Staged the updated CLI, watchdog, and four unit files in
+  `/opt/suzubase/tools/backup/`. The service units explicitly run as root for
+  Docker access. Backup `ExecStart` uses the host CLI path with `flock -n` and
+  `RuntimeMaxSec=2h`; both unit files and the watchdog use `/opt/suzubase`.
+  SHA-256 values were checked against this branch:
+  - `suzubase-backup.mjs`: `7874e2b2dfc67a51b98b0c97eb81d3a7284a35b4015245e2594f138ab1aa552e`
+  - `suzubase-backup-watchdog.mjs`: `1055f42cdb7c54c0109a840e552f5a97fa35e3e30a4174bac91cb3b1ccd22171`
+  - `suzubase-backup.service`: `65ca767a0fe718e2372dd57695dbbd82d6945bf80d73d2ba311c05213614e7b2`
+  - `suzubase-backup.timer`: `1f4d928eb34ad42f91c73b091c02ebdc9c8fa927f1e502d3ce46b65ff39efe21`
+  - `suzubase-backup-watchdog.service`: `533695c80042b550c72f6fbc6b5632c0012c1ab9494e92e7bd8bae174e8f1098`
+  - `suzubase-backup-watchdog.timer`: `cb9f4da1f9cee37ba60d2928df09f589c474005b2d913d2cc1c27ee4e4ae71ac`
+- `sbctl daemon-reload` succeeded (`daemon_reload_exit=0`). Enabling the
+  scheduled timer failed with `Failed to enable unit: Unit
+  suzubase-backup.timer does not exist` (`enable_timer_exit=1`); the scoped
+  wrapper's timer list showed no SuzuBase backup timers. `sbdeploy` cannot
+  write `/etc/systemd/system` (`write_test_exit=1`), so no escalation or
+  alternate install path was attempted.
+- Ran the backup service's exact `ExecStart` command under `sbdeploy` with its
+  backup directory redirected to a host `/tmp` scratch directory. It reached
+  the CLI but failed at `docker exec` with the same Docker socket permission
+  denial (`exact_execstart_exit=1`). It did not write into the live backups
+  directory or contact the live database.
+- Copied the existing host set
+  `backup-2026-11-22T08-11-17-329Z-demo-initial` to a local isolated drill
+  directory. CLI `verify` passed: 7 manifest files, `problems=[]`. Manifest
+  metadata: `appVersion=3528953`, `databaseMigrations=34`; files comprise the
+  database dump, five attachments, and `config/compose.yaml`. All seven
+  manifest file SHA-256 values matched. The manifest contains no row/object
+  count fields.
+- CLI `restore` correctly refused before database changes because
+  `appVersion=3528953` is unsupported by its compatibility gate (supported
+  majors are `1`). For raw dump reconciliation, restored that unchanged dump
+  directly with `pg_restore --clean --if-exists --no-owner` into a temporary
+  local PostgreSQL 16 container (`--network none`, 512 MiB limit, no published
+  ports), created the two deployment roles required by the dump/policies, and
+  ran `post-restore-normalize.sql` successfully. The scratch database contained:
+  `public` 38 tables / 1,122 rows; `authentication` 3 / 2; `drizzle` 1 / 34;
+  total 42 tables / 1,158 rows. PostgreSQL application-schema object counts:
+  42 table relations, 70 indexes, 2 sequences.
+- All 5 restored attachment files matched their manifest SHA-256 values:
+  `23b88a70000127a5b494459fcfef13a4d94e50fe51b3d37e1ccb735bf82ba06b`,
+  `8bd90eb287e9efaad0b778bd54156e8784d4f702ffb2c5e94f5252e1053e3060`,
+  `577cc461fd455eb5a0a01ec58258e04f2e20690b7c067ef416d3ef8d19703a13`,
+  `c749cb27834d668c59b15e1d77a6751c29aaec26f336a4060915114206079ce5`,
+  `311487125c3cef3740d50ef586a5e849757448a5db661af38ac7d485aa271f01`.
+  `config/compose.yaml` was present and matched SHA-256
+  `30475034e7f9fff235eb32259ae41d4bfe78c6642d84bac93fd92e1c609e8ce1`.
+  The local container and scratch copy were removed; the running demo was not
+  restored to or otherwise changed.
+- Watchdog scratch checks: fresh `recentSuccessAt` exited 0 with no
+  `alerts.jsonl`; a 48-hour-old status exited 1 and created exactly one
+  `backup-alert` row (`scheduled backup did not run within the configured
+  threshold`). The non-zero stale result is the CLI failure path propagated by
+  the watchdog; the live status file was not touched.
+- Root-only installation remains pending. Exact required step:
+  `PENDING-ROOT: cp /opt/suzubase/tools/backup/suzubase-backup.service /opt/suzubase/tools/backup/suzubase-backup.timer /opt/suzubase/tools/backup/suzubase-backup-watchdog.service /opt/suzubase/tools/backup/suzubase-backup-watchdog.timer /etc/systemd/system/ && sbctl daemon-reload && sbctl enable --now suzubase-backup.timer && sbctl enable --now suzubase-backup-watchdog.timer`
 
 ## M3 - kintone import adapter
 
@@ -69,8 +124,7 @@
 
 ## Acceptance evidence
 
-- Targeted backup tests: 3/3 pass.
-- P2 backup alert persistence test: pass.
+- Targeted backup CLI tests: 4/4 pass, including the P2 backup alert case.
 - P2 kintone source safety/mapping test: pass.
 - API and DB builds/typechecks pass.
 - Integrated Docker/PostgreSQL suite: `96/96` pass.
@@ -88,8 +142,9 @@
   resolved or blocked.
 - P2 category tree remains unsupported and blocks activation rather than using
   dropdown downgrade.
-- Real deployment host OS, systemd availability and `suzubase.suzu.life`
-  activation are not verified.
+- Demo host scheduling remains inactive pending the root-only unit installation
+  above; the existing demo backup set was verified and exercised only in a
+  local isolated restore target.
 - Real kintone migration and restore drills are not verified.
 
 ## Not done
