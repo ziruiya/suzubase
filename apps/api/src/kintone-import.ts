@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isIP } from 'node:net';
 import {
   emptyCounts, MINIMUM_PROGRAM_VERSION, PACKAGE_FORMAT_VERSION, SENSITIVE_DATA_NOTICE, sealPackage,
   type ObjectCounts,
@@ -38,11 +39,33 @@ export interface KintoneSubtableRow {
   attachments: { fileKey: string; sha256: string | null; bytes: number | null }[];
 }
 
-function isPrivateHostname(hostname: string) {
-  const lower = hostname.toLowerCase();
-  return lower === 'localhost' || lower.endsWith('.localhost') || lower.startsWith('127.') ||
-    lower.startsWith('10.') || lower.startsWith('192.168.') || /^172\.(1[6-9]|2\d|3[01])\./.test(lower) ||
-    lower.includes(':');
+function isPrivateHostname(hostname: string): boolean {
+  const lower = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (lower === 'localhost' || lower.endsWith('.localhost')) return true;
+  const version = isIP(lower);
+  if (version === 4) {
+    const [a, b] = lower.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 0) ||
+      (a === 192 && b === 168);
+  }
+  if (version === 6) {
+    const normalized = lower;
+    if (normalized === '::' || normalized === '::1' || normalized.startsWith('fc') ||
+      normalized.startsWith('fd') || normalized.startsWith('fe8') ||
+      normalized.startsWith('fe9') || normalized.startsWith('fea') ||
+      normalized.startsWith('feb') || normalized.startsWith('ff')) return true;
+    const mapped = normalized.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return isPrivateHostname(mapped[1]);
+    const mappedHex = normalized.match(/::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (mappedHex) {
+      const high = Number.parseInt(mappedHex[1], 16);
+      const low = Number.parseInt(mappedHex[2], 16);
+      return isPrivateHostname(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+    }
+  }
+  return false;
 }
 
 export function validateKintoneDomain(input: string, allowedHosts = process.env.KINTONE_ALLOWED_HOSTS) {
@@ -73,6 +96,13 @@ export function mapKintoneField(source: any): FieldCompatibility {
     STATUS_ASSIGNEE: 'user', CATEGORY: 'layout', GROUP: 'layout', LABEL: 'layout',
     SPACER: 'layout', HR: 'layout',
   };
+  if (source.lookup) return {
+    ...base, targetType: 'lookup', status: 'UNRESOLVED',
+    reason: source.lookup.relatedApp?.app
+      ? 'Lookup target application and key mapping require dependency resolution'
+      : 'Lookup target application is missing; completion is pending',
+    sourceUnavailable: false, upgradeRequired: false,
+  };
   if (type === 'CALC') return {
     ...base, targetType: 'calculation', status: 'UNRESOLVED',
     reason: 'Formula requires equivalence analysis or explicit administrator snapshot downgrade',
@@ -94,11 +124,6 @@ export function mapKintoneField(source: any): FieldCompatibility {
       status: 'EQUIVALENT', reason: 'Link protocol preserves typed semantics',
       sourceUnavailable: false, upgradeRequired: false };
   }
-  if (type === 'SINGLE_LINE_TEXT' && (source.lookup || source.expression)) return {
-    ...base, targetType: 'lookup', status: 'UNRESOLVED',
-    reason: 'Lookup or automatic expression configuration requires dependency analysis',
-    sourceUnavailable: false, upgradeRequired: false,
-  };
   if (type === 'REFERENCE_TABLE') return {
     ...base, targetType: 'related', status: 'UNRESOLVED',
     reason: 'Cross-app reference requires target application mapping',
@@ -336,8 +361,12 @@ export function buildM1CompatiblePackage(
 }
 
 export class KintoneSourceAdapter {
-  constructor(private readonly origin: string, private readonly apiToken: string,
-    private readonly timeoutMs = 15000, private readonly maxRetries = 2) {}
+  private readonly origin: string;
+
+  constructor(origin: string, private readonly apiToken: string,
+    private readonly timeoutMs = 15000, private readonly maxRetries = 2) {
+    this.origin = validateKintoneDomain(origin);
+  }
 
   private async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown) {
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {

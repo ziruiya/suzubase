@@ -2,11 +2,21 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 
 test('P2-M3 kintone source safety and field mapping are explicit', async () => {
-  const { validateKintoneDomain, mapKintoneField, stableSourceUuid } = await import('../../../apps/api/dist/kintone-import.js');
+  const { KintoneSourceAdapter, validateKintoneDomain, mapKintoneField, stableSourceUuid } = await import('../../../apps/api/dist/kintone-import.js');
   assert.equal(validateKintoneDomain('https://example.cybozu.com', 'example.cybozu.com'), 'https://example.cybozu.com');
   assert.throws(() => validateKintoneDomain('http://example.cybozu.com', 'example.cybozu.com'), /HTTPS/);
   assert.throws(() => validateKintoneDomain('https://127.0.0.1', '127.0.0.1'), /public origin/);
+  assert.throws(() => validateKintoneDomain('https://[::1]', '[::1]'), /public origin/);
+  assert.throws(() => validateKintoneDomain('https://[::ffff:127.0.0.1]', '[::ffff:127.0.0.1]'), /public origin/);
   assert.throws(() => validateKintoneDomain('https://evil.example', 'example.cybozu.com'), /allowlisted/);
+  const previousAllowlist = process.env.KINTONE_ALLOWED_HOSTS;
+  process.env.KINTONE_ALLOWED_HOSTS = '127.0.0.1';
+  try {
+    assert.throws(() => new KintoneSourceAdapter('https://127.0.0.1', 'never-used'), /public origin/);
+  } finally {
+    if (previousAllowlist === undefined) delete process.env.KINTONE_ALLOWED_HOSTS;
+    else process.env.KINTONE_ALLOWED_HOSTS = previousAllowlist;
+  }
 
   const calc = mapKintoneField({ code: 'total', type: 'CALC', expression: 'SUM(qty)' });
   assert.equal(calc.status, 'UNRESOLVED');
@@ -15,6 +25,20 @@ test('P2-M3 kintone source safety and field mapping are explicit', async () => {
   assert.equal(mapKintoneField({ code: 'owner', type: 'USER_SELECT' }).status, 'UNRESOLVED');
   assert.equal(mapKintoneField({ code: 'title', type: 'SINGLE_LINE_TEXT' }).status, 'EQUIVALENT');
   assert.equal(mapKintoneField({ code: 'mystery', type: 'NEW_TYPE' }).status, 'UNSUPPORTED');
+  const requiredTypes = [
+    'SINGLE_LINE_TEXT', 'MULTI_LINE_TEXT', 'RICH_TEXT', 'NUMBER', 'CALC',
+    'RADIO_BUTTON', 'DROP_DOWN', 'CHECK_BOX', 'MULTI_SELECT', 'DATE', 'TIME',
+    'DATETIME', 'LINK', 'USER_SELECT', 'ORGANIZATION_SELECT', 'GROUP_SELECT',
+    'FILE', 'SUBTABLE', 'REFERENCE_TABLE', 'RECORD_NUMBER', 'CREATOR', 'MODIFIER',
+    'CREATED_TIME', 'UPDATED_TIME', 'STATUS', 'STATUS_ASSIGNEE', 'CATEGORY',
+    'GROUP', 'LABEL', 'SPACER', 'HR',
+  ];
+  for (const type of requiredTypes) {
+    assert.notEqual(mapKintoneField({ code: type.toLowerCase(), type }).status, undefined, type);
+  }
+  assert.equal(mapKintoneField({
+    code: 'lookup_without_target', type: 'SINGLE_LINE_TEXT', lookup: {},
+  }).status, 'UNRESOLVED');
   assert.equal(stableSourceUuid('app:record:table:row'), stableSourceUuid('app:record:table:row'));
   assert.notEqual(stableSourceUuid('app:record:table:row'), stableSourceUuid('app:record:table:row2'));
 });
