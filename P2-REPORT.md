@@ -135,34 +135,83 @@
 
 ## M3 - kintone import adapter
 
-- Added SSRF-safe kintone domain validation and a source adapter for app,
-  fields, layout, settings, ACL, records cursor, comments and attachments.
-- Added explicit four-state field compatibility analysis and source-unavailable
-  evidence. Unsupported and blocked dependencies are not silently downgraded.
-- The kintone CLI creates a report rather than a false full-success result.
-  It requires `KINTONE_FREEZE_WINDOW_CONFIRMED=true` and an allowlisted HTTPS
-  source domain.
-- Subtable row identities and attachment SHA-256 extraction are represented,
-  with source row/record/table evidence.
-- Record cursor pagination now uses the kintone cursor POST contract, cursor
-  deletion uses the supported DELETE contract, and subtable target row IDs are
-  deterministic from source app/record/table/row identity.
-- The extract CLI writes a secret-free checkpoint summary containing counts and
-  source availability state, while each detailed report is written separately.
-- With `KINTONE_BUILD_M1_PACKAGE=true`, the CLI seals a M1 1.0-compatible zip
-  only after frozen-snapshot and all source/field/dependency gates pass.
-  `verifyPackage` must report zero problems before the CLI returns pending
-  activation; failed generation is retained as a blocked task, never success.
-- M3 does not yet claim final M1 activation. M1 package production, real
-  kintone credential/permission execution and the complex real-app acceptance
-  drill require source credentials and an isolated target application.
+- **M3-A/M3-B local gates:** the following are covered by implementation and
+  focused regression tests. Fixes are committed separately:
+  - SSRF/domain validation rejects non-allowlisted hosts, non-HTTPS production
+    URLs, private/internal IPs, DNS results resolving internally, and redirects
+    before making source requests (`c192ad6`).
+  - Required-source 403s remain source-unavailable evidence, not empty data;
+    unavailable/missing-permission fields are omitted rather than written as
+    null (`a293a8f`, `5f48190`).
+  - Cursor pagination and checkpoint resume preserve the full record tail
+    without duplicates; failed attachment downloads can be retried
+    independently and retain byte length, SHA-256 and source record reference
+    (`a293a8f`).
+  - Every brief field type gets an explicit compatibility result. Safe CALC
+    formulas stay live; non-convertible formulas require acceptance as
+    DATA_ONLY and retain the formula/warning. CATEGORY blocks or requires an
+    approved downgrade. Lookup detection uses the lookup property and a missing
+    target remains UNRESOLVED/pending, not plain text (`c192ad6`, `242f189`,
+    `5f48190`).
+  - Deterministic subtable IDs use source app/record/table/row identity; row
+    ordering and NULL-versus-empty reconciliation states are preserved
+    (`a293a8f`).
+  - M1 sealing requires all package gates and zero `verifyPackage` problems;
+    failures remain blocked. The existing Gate 3 package import has a passing
+    regression test (`242f189`, `a293a8f`; regression: `G3-11 golden package
+    imports cleanly with current code`).
+  - Comment ordering/pagination, identity-resolvable mentions and record
+    linkage are retained; deleted/invisible comments are reported as source
+    gaps rather than fabricated (`5f48190`).
+- **M3-C runner:** `tools/kintone/run-m3-c.mjs` accepts app IDs, source tokens,
+  allowed hosts and target credentials only through environment variables; it
+  never prints tokens. It performs precheck, extraction/checkpointing and
+  independent attachment retries, M1 package build/verification, isolated
+  target import, activation or pending-completion handling, then writes a
+  private per-run report. Reconciliation separates structure, records,
+  subtable rows, attachments, comments, workflow, permissions, external
+  dependencies and source gaps; it reports completeness, functional-equivalence
+  and unresolved-dependency counts, explicit downgrades, and source-unavailable
+  items independently.
+- **M3-C dry run:** the full script ran against a local mock kintone HTTP
+  fixture and a fresh isolated local SuzuBase Compose target. Both fixture apps
+  (synthetic IDs `100` and `200`) activated; each had 1 record, 1 subtable row,
+  1 attachment and 1 comment imported and reconciled. Package verification had
+  zero problems, completeness was 100%, and source gaps were zero. The test
+  asserts extraction timestamps and source ID ranges (`1`–`1`) are present,
+  reports tokens only through HTTP authentication (not logs), and verifies
+  record/subtable/attachment/comment source and target counts. This does not
+  substitute for the real fixture run.
+
+### M3-C real-run checklist
+
+- Before starting, arrange a freeze window: nobody else may write to either
+  fixture app from extraction start through extraction end. Confirm the freeze
+  with `KINTONE_FREEZE_WINDOW_CONFIRMED=true`.
+- Supply `KINTONE_SUBDOMAIN`, `KINTONE_APP_A_ID`, `KINTONE_APP_B_ID`,
+  `KINTONE_API_TOKEN_A`, `KINTONE_API_TOKEN_B`, `KINTONE_ALLOWED_HOSTS`,
+  `SUZUBASE_TARGET_API_ORIGIN`, `SUZUBASE_TARGET_ACCESS_TOKEN`, and
+  `SUZUBASE_TARGET_ISOLATED=true` via the process environment/secret manager.
+  Keep the target isolated and use HTTPS. Never put tokens in arguments, source
+  files, or report notes.
+- Run `node tools/kintone/run-m3-c.mjs`; inspect its report for precheck and
+  extraction start/end timestamps, each app's source record-ID range, package
+  verification, import status, all separate reconciliation dimensions,
+  completeness, unresolved dependencies, explicit downgrades, and source gaps.
+  Resolve pending completion items explicitly and retain the generated report.
+- The report must record extraction start/end times and source ID ranges for
+  both apps. Keep the fixture write freeze in effect for the entire extraction
+  window; release it only after extraction has ended and evidence is recorded.
+
+**Remaining:** M3-C real run pending kintone fixture app IDs + API tokens (being prepared by the owner side).
 
 ## Acceptance evidence
 
 - Targeted backup CLI tests: 4/4 pass, including the P2 backup alert case.
 - P2 kintone source safety/mapping test: pass.
 - API and DB builds/typechecks pass.
-- Integrated Docker/PostgreSQL suite: `96/96` pass.
+- Full integrated Docker/PostgreSQL suite: `99/99` pass, including the M3-C
+  mock extraction/import and the Gate 3 package regression.
 - Migration `0034_gate2_system_notifications.sql` is registered in
   `meta/_journal.json` and applied in the local integration database.
 - A post-migration OpenAPI contract regression was found and fixed for
@@ -172,11 +221,9 @@
 
 - Stand-in notification: database unavailable can delay in-app delivery; local
   `alerts.jsonl` and `system-alert-outbox.jsonl` remain the disaster evidence.
-- M3 real source freeze, permissions, formula equivalence, identity mapping,
-  workflow history and cross-app lookup activation remain administrator-
-  resolved or blocked.
-- P2 category tree remains unsupported and blocks activation rather than using
-  dropdown downgrade.
+- M3-C still needs the owner-provided fixture app IDs and API tokens for its
+  real source freeze and real-app acceptance run; no live kintone run was
+  attempted without them.
 - Demo host scheduling remains inactive pending the root-only unit installation
   above; the existing demo backup set was verified and exercised only in a
   local isolated restore target.
