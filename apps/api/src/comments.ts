@@ -68,6 +68,8 @@ export class CommentService {
         deleted: sql<boolean>`${recordComments.deletedAt} IS NOT NULL`,
         body: sql<string | null>`CASE WHEN ${recordComments.deletedAt} IS NULL THEN ${recordComments.body} END`,
         author: sql<string>`${name} || CASE WHEN ${tenantMembers.disabledAt} IS NULL THEN '' ELSE '（已停用）' END`,
+        importJobId: recordComments.importJobId, sourceActorId: recordComments.sourceActorId,
+        sourceActorName: recordComments.sourceActorName, sourceTimestamp: recordComments.sourceTimestamp,
       }).from(recordComments).innerJoin(users, and(eq(users.tenantId, recordComments.tenantId), eq(users.id, recordComments.authorId)))
         .innerJoin(tenantMembers, and(eq(tenantMembers.tenantId, users.tenantId), eq(tenantMembers.userId, users.id)))
         .where(and(scope, anchor ? sql`(${recordComments.createdAt}, ${recordComments.id}) < (${anchor.createdAt}::timestamptz, ${anchor.id}::uuid)` : undefined))
@@ -81,6 +83,16 @@ export class CommentService {
         .where(and(eq(commentMentions.tenantId, context.tenantId), eq(commentMentions.appId, appId), eq(commentMentions.recordId, recordId),
           inArray(commentMentions.commentId, visible))).orderBy(commentMentions.offset) : [];
       const items = page.map(({ body, ...comment }) => {
+        // A migrated comment keeps its original author and time visible and
+        // is marked as migration-sourced; it never poses as a local comment.
+        const rendered = comment.importJobId ? {
+          ...comment,
+          author: comment.sourceActorName ?? comment.sourceActorId ?? comment.author,
+          migration: {
+            importJobId: comment.importJobId, sourceActorId: comment.sourceActorId,
+            sourceTimestamp: comment.sourceTimestamp,
+          },
+        } : comment;
         const parts: Part[] = [];
         let offset = 0;
         if (body) {
@@ -91,7 +103,7 @@ export class CommentService {
           }
           if (offset < body.length) parts.push({ kind: 'text', text: body.slice(offset) });
         }
-        return { ...comment, parts, canDelete: !access.archived && !comment.deleted && (access.manage || comment.authorId === context.userId) };
+        return { ...rendered, parts, canDelete: !access.archived && !comment.deleted && (access.manage || comment.authorId === context.userId) };
       });
       return { items, next: rows.length > limit ? page[limit - 1].id : null };
     });

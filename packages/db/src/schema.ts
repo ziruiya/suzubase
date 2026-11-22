@@ -436,7 +436,6 @@ export const recordEvents = pgTable('record_events', {
     foreignColumns: [appVersions.tenantId, appVersions.appId, appVersions.version],
   }),
   foreignKey({ columns: [t.tenantId, t.actorId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
-  foreignKey({ columns: [t.tenantId, t.importJobId], foreignColumns: [importJobs.tenantId, importJobs.id] }),
 ]);
 
 export const workflowEvents = pgTable('workflow_events', {

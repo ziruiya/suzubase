@@ -55,6 +55,7 @@ CREATE POLICY tenant_scope ON import_jobs TO suzubase_runtime
   USING (tenant_id = nullif(current_setting('suzubase.tenant_id', true), '')::uuid);
 --> statement-breakpoint
 GRANT SELECT, INSERT, UPDATE, DELETE ON import_jobs TO suzubase_runtime;
+GRANT UPDATE (activation_state) ON apps TO suzubase_runtime;
 --> statement-breakpoint
 CREATE INDEX "import_jobs_duplicate_idx" ON "import_jobs" ("tenant_id", "package_sha256", "status");
 --> statement-breakpoint
@@ -118,8 +119,7 @@ ALTER TABLE "record_events" ADD COLUMN "import_job_id" uuid;
 ALTER TABLE "record_events" ADD COLUMN "source_actor_id" text;
 --> statement-breakpoint
 ALTER TABLE "record_events" ADD COLUMN "source_timestamp" timestamp with time zone;
---> statement-breakpoint
-ALTER TABLE "record_events" ADD CONSTRAINT "record_events_import_job_fk" FOREIGN KEY ("tenant_id","import_job_id") REFERENCES "public"."import_jobs"("tenant_id","id") ON DELETE no action ON UPDATE no action;
+
 --> statement-breakpoint
 -- Migration tokens (decision 7): issued only by tenant administrators, bound to
 -- one import job and (once staging creates it) its single target application.
@@ -168,3 +168,85 @@ AS $$
 $$;
 REVOKE ALL ON FUNCTION authentication.verify_migration_token(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION authentication.verify_migration_token(text) TO suzubase_runtime;
+
+-- Failure/cancel cleanup (G3-07): the runtime role intentionally has no
+-- DELETE grant on business tables, so purging a never-activated staged
+-- application runs through this definer function. It refuses to touch any
+-- application that is not still isolated as import-pending.
+CREATE OR REPLACE FUNCTION public.purge_imported_app(p_tenant_id uuid, p_app_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $purge$
+DECLARE
+  v_records int; v_comments int; v_events int; v_files int;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM apps WHERE tenant_id = p_tenant_id AND id = p_app_id
+    AND activation_state = 'import-pending') THEN
+    RETURN jsonb_build_object('purged', false, 'reason', 'application is not import-pending');
+  END IF;
+  SELECT count(*) INTO v_records FROM records WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  SELECT count(*) INTO v_comments FROM record_comments WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  SELECT count(*) INTO v_events FROM record_events WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  SELECT count(*) INTO v_files FROM files WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM permission_audit WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM record_create_keys WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM notifications WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM outbox WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM record_search_values WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM record_unique_values WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM file_references WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM comment_mentions WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM record_comments WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM workflow_events WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM record_events WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM workflow_assignments WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM record_workflow_state WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM record_references WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM record_table_rows WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM records WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM files WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM workflow_actions WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM workflow_states WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM workflow_definitions WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM issued_auto_numbers WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM auto_number_counters WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM app_counters WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM fields WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM app_versions WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM authentication.api_tokens WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM export_jobs WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM apps WHERE tenant_id = p_tenant_id AND id = p_app_id;
+  RETURN jsonb_build_object('purged', true, 'records', v_records, 'comments', v_comments,
+    'historyEvents', v_events, 'attachments', v_files);
+END $purge$;
+REVOKE ALL ON FUNCTION public.purge_imported_app(uuid, uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.purge_imported_app(uuid, uuid) TO suzubase_runtime;
+
+-- Cross-app dependency resolution (G3-08): the runtime role may not UPDATE
+-- the fields table (field edits normally live in version snapshots), so
+-- rewriting a staged field's reference configuration goes through this
+-- definer function, which only operates while the application is still
+-- isolated as import-pending.
+CREATE OR REPLACE FUNCTION public.set_imported_field_reference(
+  p_tenant_id uuid, p_app_id uuid, p_field_id uuid, p_kind text, p_config jsonb)
+RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $fn$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM apps WHERE tenant_id = p_tenant_id AND id = p_app_id
+    AND activation_state = 'import-pending') THEN
+    RETURN false;
+  END IF;
+  IF p_kind = 'lookup' THEN
+    UPDATE fields SET lookup = p_config
+      WHERE tenant_id = p_tenant_id AND app_id = p_app_id AND field_id = p_field_id;
+  ELSIF p_kind = 'related' THEN
+    UPDATE fields SET related = p_config
+      WHERE tenant_id = p_tenant_id AND app_id = p_app_id AND field_id = p_field_id;
+  ELSE
+    RETURN false;
+  END IF;
+  RETURN true;
+END $fn$;
+REVOKE ALL ON FUNCTION public.set_imported_field_reference(uuid, uuid, uuid, text, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.set_imported_field_reference(uuid, uuid, uuid, text, jsonb) TO suzubase_runtime;

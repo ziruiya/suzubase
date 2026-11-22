@@ -289,6 +289,9 @@ export class RecordService {
       schemaVersion: records.schemaVersion, revision: records.revision, status: records.status,
       createdAt: records.createdAt, createdBy: records.createdBy, updatedAt: records.updatedAt,
       updatedBy: records.updatedBy, deletedAt: records.deletedAt, deletedBy: records.deletedBy,
+      importJobId: records.importJobId, sourceActorId: records.sourceActorId,
+      sourceActorName: records.sourceActorName, sourceTimestamp: records.sourceTimestamp,
+      sourceRecordNo: records.sourceRecordNo,
       data: raw ? records.data : this.authorization.projection(access),
     }).from(records).where(and(
       eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, recordId),
@@ -301,6 +304,15 @@ export class RecordService {
       throw new NotFoundException(hasRecordRules ? '无权限' : undefined);
     }
     const record = serializeRecord(row);
+    // Migration provenance (contracts 4 SS4.5.3): a restored record is visibly
+    // marked as migration-sourced, never disguised as locally created.
+    if (row.importJobId) {
+      record.migration = {
+        importJobId: row.importJobId, sourceActorId: row.sourceActorId,
+        sourceActorName: row.sourceActorName, sourceTimestamp: row.sourceTimestamp,
+        sourceRecordNo: row.sourceRecordNo,
+      };
+    }
     return raw || deleted ? record : this.withTableRows(tx, context, record, access);
   }
 
@@ -788,6 +800,8 @@ export class RecordService {
         eventId: recordEvents.eventId, recordRevision: recordEvents.recordRevision, schemaVersion: recordEvents.schemaVersion,
         occurredAt: recordEvents.occurredAt, actorId: recordEvents.actorId, source: recordEvents.source,
         kind: recordEvents.kind, objectType: recordEvents.objectType, objectId: recordEvents.objectId, changes: visibleChanges,
+        importJobId: recordEvents.importJobId, sourceActorId: recordEvents.sourceActorId,
+        sourceTimestamp: recordEvents.sourceTimestamp,
       }, name: users.displayName, email: users.email, disabledAt: tenantMembers.disabledAt,
     }).from(recordEvents).innerJoin(users, and(
       eq(users.tenantId, recordEvents.tenantId), eq(users.id, recordEvents.actorId),
@@ -818,6 +832,12 @@ export class RecordService {
     }
     const enriched = events.map(({ event, name, email, disabledAt }) => ({
       ...event, actorLabel: (name ?? email) + (disabledAt ? '（已停用）' : ''),
+      ...(event.importJobId ? {
+        migration: {
+          importJobId: event.importJobId, sourceActorId: event.sourceActorId,
+          sourceTimestamp: event.sourceTimestamp,
+        },
+      } : {}),
       ...(workflowDetail.has(event.eventId) ? { workflow: workflowDetail.get(event.eventId)! } : {}),
     }));
     const filtered = enriched.filter((event) =>
