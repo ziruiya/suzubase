@@ -14,6 +14,7 @@ import { workflowRuntimeHttp } from './workflow-runtime';
 import { workflowHttp } from './workflow-definitions';
 import { tokenHttp } from './api-tokens';
 import { formulaInput } from './formula';
+import { importHttp, importHttp2, importHttp3 } from './import';
 import { identifier } from './validation';
 
 const id = identifier;
@@ -181,6 +182,25 @@ const exportJob = z.object({
 });
 const exportDetail = exportJob.extend({ manifest: z.looseObject({}).nullable() });
 
+const migrationJob = z.object({
+  id, status: z.enum(['uploaded', 'staging', 'ready', 'activated', 'failed', 'cancelled']),
+  stage: text, completion: z.enum(['complete', 'pending']).nullable(),
+  sourceExportId: text.nullable(), sourceInstanceId: text.nullable(), sourceTenantId: nullableId,
+  sourceAppId: nullableId, sourceAppCode: text.nullable(), packageSha256: text, packageBytes: integer,
+  targetAppId: nullableId, duplicateOf: nullableId, duplicateConfirmed: flag,
+  userMapping: z.record(text, text), groupMapping: z.record(text, text),
+  organizationMapping: z.record(text, text), dependencyDecisions: z.looseObject({}),
+  pending: z.looseObject({}), entityMapping: z.array(z.looseObject({})),
+  attempts: integer, error: text.nullable(), report: z.looseObject({}).nullable(),
+  errorReport: z.looseObject({}).nullable(),
+  createdAt: timestamp, updatedAt: timestamp, activatedAt: timestamp.nullable(),
+  sensitiveDataNotice: text,
+});
+const migrationAuditEntry = z.object({
+  id, action: text, objectType: text, objectId: text.nullable(),
+  fieldSurface: z.array(text), createdAt: timestamp,
+});
+
 const applications = '/apps/{appId}';
 const records = applications + '/records';
 const entry = records + '/{recordId}';
@@ -332,6 +352,40 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/exports/{exportId}/cancel']: { post: { reply: exportJob, conflict: errorSchema } },
   [applications + '/exports/{exportId}/package']: { get: { download: ['application/zip'],
     description: 'Downloads the sealed package. Only sealed packages can be downloaded.' } },
+  [applications + '/token-reissues']: { get: { reply: z.array(z.looseObject({})),
+    description: 'API tokens of the source deployment are never restored with secrets; this lists the metadata an administrator must re-issue (decision 6).' } },
+  [applications + '/token-reissues/{jobId}/mark']: { post: { body: importHttp2.markReissuedInput,
+    reply: z.looseObject({}), conflict: errorSchema } },
+  ['/imports']: { get: { reply: z.array(migrationJob) } },
+  ['/imports/upload']: { post: { binaryBody: true, reply: migrationJob, conflict: errorSchema,
+    description: 'Uploads a sealed migration package (zip bytes). Tenant administrators only. Re-importing the same package warns that a second copy will be created.' } },
+  ['/imports/{jobId}']: { get: { reply: migrationJob.extend({
+    suggestions: z.looseObject({}) }) } },
+  ['/imports/{jobId}/error-report']: { get: { reply: z.looseObject({}),
+    description: 'Object/row/field-level preflight error report for a failed validation.' } },
+  ['/imports/{jobId}/audit']: { get: { reply: z.array(migrationAuditEntry) } },
+  ['/imports/{jobId}/validate']: { post: { reply: migrationJob, conflict: errorSchema,
+    description: 'Runs full preflight: package integrity, version compatibility, item-by-item reference integrity and field-structure checks.' } },
+  ['/imports/{jobId}/resume']: { post: { reply: migrationJob, conflict: errorSchema } },
+  ['/imports/{jobId}/mappings']: { put: { body: importHttp.mappingsInput, reply: migrationJob, conflict: errorSchema,
+    description: 'User/group/organization mapping decisions. Targets must be existing directory entries; accounts are never created by an import (decision 4).' } },
+  ['/imports/{jobId}/migration-token']: { post: { reply: z.object({ token: text, expiresAt: timestamp }),
+    conflict: errorSchema,
+    description: 'Issues the one-time migration token for this job and target application (decision 7). The plaintext is shown only here; expiry is the earlier of 24 hours or the job reaching a terminal state.' } },
+  ['/imports/{jobId}/run']: { post: { reply: migrationJob, conflict: errorSchema,
+    description: 'Migration channel (migration token required): executes the staged restore. Idempotent; produces zero notification/outbox side effects.' } },
+  ['/imports/{jobId}/queue-run']: { post: { reply: migrationJob, conflict: errorSchema,
+    description: 'Migration channel (migration token required): queues the staged restore on the worker.' } },
+  ['/imports/{jobId}/resolve-assignees']: { post: { body: importHttp2.resolveAssigneesInput,
+    reply: migrationJob, conflict: errorSchema,
+    description: 'Migration channel: per-item assignee disposition for unmapped assignees (decision 5). userId null explicitly accepts no assignee.' } },
+  ['/imports/{jobId}/resolve-dependencies']: { post: { body: importHttp3.dependencyDecisionsInput,
+    reply: migrationJob, conflict: errorSchema,
+    description: 'Migration channel: map a cross-application lookup/related field to an existing target application, or explicitly disable/skip it (decision 4).' } },
+  ['/imports/{jobId}/activate']: { post: { reply: migrationJob, conflict: errorSchema,
+    description: 'Activates the restored application. Requires the verification and difference report to exist and every pending item to be resolved; audit-logged.' } },
+  ['/imports/{jobId}/cancel']: { post: { reply: migrationJob, conflict: errorSchema,
+    description: 'Cancels the job and purges every staged object to zero.' } },
 };
 
 function schema(value: z.ZodType, io: 'input' | 'output' = 'output'): SchemaObject {
