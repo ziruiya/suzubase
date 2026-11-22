@@ -240,6 +240,8 @@ const systemNotificationInput = z.strictObject({
   }),
 });
 
+export const systemNotificationHttp = { systemNotificationInput };
+
 @ApiTags('system notifications')
 @Controller()
 export class SystemNotificationController {

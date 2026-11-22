@@ -3,7 +3,7 @@ import { apiTokenActions, fieldTypes, indexPurposes, textSearchModes } from '@su
 import { z } from 'zod';
 import { appHttp } from './app-schema';
 import { authHttp } from './identity';
-import { notificationHttp } from './notifications';
+import { notificationHttp, systemNotificationHttp } from './notifications';
 import { commentHttp } from './comments';
 import { csvHttp } from './csv';
 import { fileHttp } from './files';
@@ -249,8 +249,12 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   '/notifications': { get: { query: notificationHttp.centerFilter, reply: notificationHttp.centerReply } },
   '/notifications/unread': { get: { query: notificationHttp.appFilter, reply: z.object({ count: recordNo }) } },
   '/notifications/read-all': { post: { query: notificationHttp.appFilter, reply: result('read') } },
+  '/notifications/system/deliver': { post: {
+    body: systemNotificationHttp.systemNotificationInput,
+    reply: z.object({ delivered: integer, inserted: integer }),
+  } },
   '/notifications/{id}/read': { post: { reply: result('read') } },
-  '/notifications/{id}/open': { post: { reply: z.object({ appId: id, recordId: id }) } },
+  '/notifications/{id}/open': { post: { reply: z.object({ appId: id.nullable(), recordId: id.nullable() }) } },
   [applications + '/workflow/directory']: { get: { reply: selectors } },
   [applications + '/workflow']: { get: { reply: workflowHttp.settings } },
   [applications + '/workflow/versions/{version}']: { get: { reply: workflowHttp.definition } },
