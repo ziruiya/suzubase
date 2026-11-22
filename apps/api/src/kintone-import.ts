@@ -1,4 +1,8 @@
 import { createHash } from 'node:crypto';
+import {
+  emptyCounts, MINIMUM_PROGRAM_VERSION, PACKAGE_FORMAT_VERSION, SENSITIVE_DATA_NOTICE, sealPackage,
+  type ObjectCounts,
+} from './export-package';
 
 export type CompatibilityStatus = 'EQUIVALENT' | 'DATA_ONLY' | 'UNRESOLVED' | 'UNSUPPORTED';
 
@@ -118,6 +122,219 @@ export function stableSourceUuid(sourceKey: string) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
+export interface KintoneExtractionResult {
+  evidence: SourceEvidence;
+  compatibility: FieldCompatibility[];
+  records: any[];
+  comments: any[];
+  attachments: {
+    recordId: string;
+    fieldCode: string;
+    fileKey: string;
+    name: string | null;
+    bytes: number | null;
+    sha256: string | null;
+    body?: Uint8Array;
+  }[];
+  subtableRows: KintoneSubtableRow[];
+  blocking: FieldCompatibility[];
+  packageReady: boolean;
+}
+
+function kintoneValue(value: any): string {
+  if (value == null) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return JSON.stringify(value);
+  if (typeof value === 'object' && 'value' in value) return kintoneValue(value.value);
+  return JSON.stringify(value);
+}
+
+export function buildM1CompatiblePackage(
+  extraction: KintoneExtractionResult,
+  options: { sourceInstanceId?: string; sourceTenantId?: string } = {},
+) {
+  if (!extraction.packageReady || !extraction.evidence.frozenWindow) {
+    throw new Error('kintone package blocked: frozen snapshot and all source/field/dependency gates are required');
+  }
+  if (extraction.evidence.unavailable.length) {
+    throw new Error('kintone package blocked: source unavailable items exist');
+  }
+  if (extraction.blocking.length) {
+    throw new Error('kintone package blocked: unsupported or unresolved mappings exist');
+  }
+  if (extraction.attachments.some((file) => !file.sha256 || !file.body)) {
+    throw new Error('kintone package blocked: an attachment entity or SHA-256 is unavailable');
+  }
+
+  const sourceAppId = extraction.evidence.appId;
+  const targetAppId = stableSourceUuid(`kintone-app:${extraction.evidence.appId}`);
+  const targetTenantId = options.sourceTenantId ?? stableSourceUuid(`kintone-tenant:${extraction.evidence.appId}`);
+  const fields = extraction.compatibility.map((item, index) => ({
+    fieldId: stableSourceUuid(`kintone:${sourceAppId}:field:${item.sourceFieldCode}`),
+    code: item.sourceFieldCode,
+    name: item.sourceFieldCode,
+    type: item.targetType,
+    required: false,
+    uniqueValue: false,
+    searchMode: null,
+    formula: null,
+    lookup: null,
+    related: null,
+    table: null,
+    layoutElement: null,
+    autoNumber: null,
+    options: [],
+    kintoneSource: {
+      sourceType: item.sourceType,
+      sourceConfig: item.sourceConfig,
+      compatibility: item.status,
+      reason: item.reason,
+    },
+  }));
+  const records = extraction.records.map((record: any) => {
+    const sourceId = String(record.$id?.value ?? '');
+    const data: Record<string, string> = {};
+    for (const item of extraction.compatibility) {
+      const source = record[item.sourceFieldCode];
+      if (source !== undefined) data[stableSourceUuid(`kintone:${sourceAppId}:field:${item.sourceFieldCode}`)] =
+        kintoneValue(source);
+    }
+    return {
+      id: stableSourceUuid(`kintone:${sourceAppId}:record:${sourceId}`),
+      recordNo: kintoneValue(record.$id),
+      data,
+      archivedData: {},
+      schemaVersion: 1,
+      revision: 1,
+      status: 'PUBLISHED',
+      createdBy: stableSourceUuid(`kintone:${sourceAppId}:creator:unknown`),
+      createdAt: extraction.evidence.extractedAt,
+      updatedBy: stableSourceUuid(`kintone:${sourceAppId}:modifier:unknown`),
+      updatedAt: extraction.evidence.extractedAt,
+      deletedBy: null,
+      deletedAt: null,
+      workflow: null,
+      kintoneSourceId: sourceId,
+    };
+  });
+  const tableRows = extraction.subtableRows.map((row) => ({
+    recordId: stableSourceUuid(`kintone:${sourceAppId}:record:${row.sourceRecordId}`),
+    fieldId: stableSourceUuid(`kintone:${sourceAppId}:field:${row.sourceTableCode}`),
+    rowId: row.targetRowId,
+    rowOrder: row.rowOrder,
+    data: Object.fromEntries(Object.entries(row.data).map(([key, value]) => [key, kintoneValue(value)])),
+  }));
+  const attachmentEntries = extraction.attachments.map((file) => ({
+    fileId: stableSourceUuid(`kintone:${sourceAppId}:file:${file.fileKey}`),
+    version: 1,
+    sha256: file.sha256!,
+    bytes: file.bytes ?? 0,
+    state: 'READY',
+    name: file.name ?? file.fileKey,
+    contentType: 'application/octet-stream',
+  }));
+  const attachmentBodies = Object.fromEntries(extraction.attachments
+    .filter((file) => file.body && file.sha256)
+    .map((file) => [`attachments/${stableSourceUuid(`kintone:${sourceAppId}:file:${file.fileKey}`)}/v1/body`, Buffer.from(file.body!)]));
+
+  const expected: ObjectCounts = emptyCounts();
+  expected.apps = 1;
+  expected.appVersions = 1;
+  expected.fieldVersionSnapshots = 1;
+  expected.fields = fields.length;
+  expected.records = records.length;
+  expected.tableRows = tableRows.length;
+  expected.attachments = attachmentEntries.length;
+  expected.attachmentVersions = attachmentEntries.length;
+  expected.comments = extraction.comments.length;
+  expected.workflowVersions = 0;
+  expected.aclEntries = 0;
+
+  const compatEvidence = {
+    sourceEvidence: extraction.evidence,
+    fields: extraction.compatibility,
+    subtableRows: extraction.subtableRows,
+    attachments: extraction.attachments.map(({ body: _body, ...file }) => file),
+    comments: extraction.comments,
+  };
+  const files = {
+    'data/app.json': JSON.stringify({
+      app: {
+        id: targetAppId, code: `kintone-${sourceAppId}`, name: extraction.evidence.appName,
+        description: 'Imported from kintone via M3 source adapter', icon: null, themeColor: null,
+        titleFieldId: null, duplicateHint: false, numericPrecision: 6,
+        attachmentMaxBytes: 8 * 1024 * 1024, attachmentMaxCount: 100,
+        attachmentTypes: [], localDrafts: true, commentsEnabled: true,
+        workflowEnabled: false, adminMemo: 'kintone migration',
+        publishedSchemaVersion: 1, draftSchemaVersion: null,
+        createdBy: stableSourceUuid(`kintone:${sourceAppId}:creator:unknown`),
+      },
+      recordCounter: String(records.length),
+      autoNumberCounters: [],
+    }),
+    'data/schema.json': JSON.stringify({
+      versions: [{ version: 1, aclConfiguration: { app: [], record: [], field: [] },
+        fieldEdits: {}, formLayout: [], notificationRules: [], viewConfiguration: { views: [] },
+        migrationReport: compatEvidence, fields }],
+      fields,
+      rawFields: fields.map((field) => ({ ...field, introducedIn: 1 })),
+      deletedFields: [], views: [], formLayout: [], viewConfiguration: { views: [] },
+    }),
+    'data/workflows.json': JSON.stringify({ definitions: [] }),
+    'data/records.json': JSON.stringify({ records }),
+    'data/table-rows.json': JSON.stringify({ rows: tableRows }),
+    'data/references.json': JSON.stringify({ references: [] }),
+    'data/attachments.json': JSON.stringify({ files: attachmentEntries }),
+    'data/comments.json': JSON.stringify({ comments: extraction.comments.map((comment: any, index: number) => ({
+      id: stableSourceUuid(`kintone:${sourceAppId}:comment:${String(comment.id ?? index)}`),
+      recordId: stableSourceUuid(`kintone:${sourceAppId}:record:${String(comment.recordId ?? comment.$id?.value ?? '')}`),
+      authorId: stableSourceUuid(`kintone:${sourceAppId}:user:${String(comment.creator?.code ?? comment.user?.code ?? 'unknown')}`),
+      createdAt: comment.createdAt ?? extraction.evidence.extractedAt,
+      deleted: false,
+      deletedAt: null,
+      body: kintoneValue(comment.content ?? comment.body ?? ''),
+      mentions: (comment.mentions ?? []).map((mention: any) => ({ userId: String(mention.code ?? mention.userId ?? '') })),
+    })) }),
+    'data/history.json': JSON.stringify({ recordEvents: [], workflowEvents: [] }),
+    'data/config.json': JSON.stringify({
+      acl: { app: [], record: [], field: [] },
+      notificationRules: [],
+      relations: [],
+      apiTokens: [],
+      kintoneCompatibility: compatEvidence,
+    }),
+    'data/directory.json': JSON.stringify({ users: [], groups: [], organizations: [] }),
+  };
+  return sealPackage({
+    manifestBase: {
+      formatVersion: PACKAGE_FORMAT_VERSION,
+      minimumProgramVersion: MINIMUM_PROGRAM_VERSION,
+      exportId: stableSourceUuid(`kintone-export:${sourceAppId}:${extraction.evidence.extractedAt}`),
+      sourceInstanceId: options.sourceInstanceId ?? stableSourceUuid(`kintone-instance:${extraction.evidence.appId}`),
+      sourceTenantId: targetTenantId,
+      sourceAppId: targetAppId,
+      sourceAppCode: `kintone-${sourceAppId}`,
+      exportedAt: extraction.evidence.extractedAt,
+      snapshotCutoff: extraction.evidence.extractedAt,
+      counts: { expected },
+      excluded: { temporaryAttachments: 0, purgedAttachments: 0 },
+      inclusion: {
+        kintoneSourceEvidence: 'included',
+        kintoneCompatibilityReport: 'included',
+        kintoneSubtables: 'included',
+        kintoneComments: 'included',
+        kintoneAttachments: extraction.attachments.length ? 'included' : 'absent',
+        kintoneWorkflow: extraction.compatibility.some((item) => ['STATUS', 'STATUS_ASSIGNEE'].includes(item.sourceType))
+          ? 'unsupported' : 'absent',
+      },
+      attachments: attachmentEntries,
+      sensitiveDataNotice: SENSITIVE_DATA_NOTICE,
+    },
+    files,
+    attachmentBodies,
+  });
+}
+
 export class KintoneSourceAdapter {
   constructor(private readonly origin: string, private readonly apiToken: string,
     private readonly timeoutMs = 15000, private readonly maxRetries = 2) {}
@@ -226,6 +443,7 @@ export class KintoneSourceAdapter {
                     recordId, fieldCode: field.code, fileKey: file.fileKey,
                     name: file.name ?? null, bytes: bytes?.byteLength ?? null,
                     sha256: bytes ? sha256Buffer(bytes) : null,
+                    body: bytes,
                   });
                 } catch (error) {
                   preflight.unavailable.push({

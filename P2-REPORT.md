@@ -59,6 +59,10 @@
   deterministic from source app/record/table/row identity.
 - The extract CLI writes a secret-free checkpoint summary containing counts and
   source availability state, while each detailed report is written separately.
+- With `KINTONE_BUILD_M1_PACKAGE=true`, the CLI seals a M1 1.0-compatible zip
+  only after frozen-snapshot and all source/field/dependency gates pass.
+  `verifyPackage` must report zero problems before the CLI returns pending
+  activation; failed generation is retained as a blocked task, never success.
 - M3 does not yet claim final M1 activation. M1 package production, real
   kintone credential/permission execution and the complex real-app acceptance
   drill require source credentials and an isolated target application.

@@ -3,7 +3,8 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const distUrl = new URL('../../apps/api/dist/kintone-import.js', import.meta.url);
-const { KintoneSourceAdapter, validateKintoneDomain } = await import(distUrl);
+const { KintoneSourceAdapter, validateKintoneDomain, buildM1CompatiblePackage } = await import(distUrl);
+const { verifyPackage } = await import(new URL('../../apps/api/dist/export-package.js', import.meta.url));
 
 const [command, appId] = process.argv.slice(2);
 if (!['preflight', 'extract'].includes(command) || !appId) {
@@ -50,6 +51,34 @@ try {
       unsupportedCount: result.compatibility.filter((item) => item.status === 'UNSUPPORTED').length,
       sourceUnavailableCount: result.evidence.unavailable.length,
     };
+    let packageOutput = null;
+    if (process.env.KINTONE_BUILD_M1_PACKAGE === 'true') {
+      try {
+        const sealed = buildM1CompatiblePackage(result, {
+          sourceInstanceId: process.env.KINTONE_SOURCE_INSTANCE_ID,
+          sourceTenantId: process.env.KINTONE_SOURCE_TENANT_ID,
+        });
+        const outDir = resolve(process.env.KINTONE_REPORT_DIR ?? './kintone-reports');
+        mkdirSync(outDir, { recursive: true });
+        packageOutput = resolve(outDir, `kintone-${appId}-${Date.now()}.m1.zip`);
+        writeFileSync(packageOutput, sealed.archive);
+        const verification = verifyPackage(sealed.archive);
+        if (verification.problems.length) throw new Error(`M1 package verification failed: ${verification.problems.join('; ')}`);
+        report.package = {
+          path: packageOutput,
+          formatVersion: sealed.manifest.formatVersion,
+          counts: sealed.manifest.counts.actual,
+          verification: 'VERIFIED',
+        };
+        report.finalM1BusinessResult = 'PENDING_ACTIVATION';
+      } catch (error) {
+        report.finalM1BusinessResult = 'BLOCKED';
+        report.package = {
+          verification: 'FAILED',
+          reason: error instanceof Error ? error.message : 'M1 package generation failed',
+        };
+      }
+    }
     const outDir = resolve(process.env.KINTONE_REPORT_DIR ?? './kintone-reports');
     mkdirSync(outDir, { recursive: true });
     const out = resolve(outDir, `kintone-${appId}-${Date.now()}.json`);
