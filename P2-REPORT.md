@@ -25,6 +25,41 @@
 - Local alert evidence write failure is explicit and produces a non-zero CLI
   exit.
 
+### T2 failure-alert end-to-end verification
+
+- On `suzubase-lab` as `sbdeploy`, the staged CLI hash matched this branch:
+  `7874e2b2dfc67a51b98b0c97eb81d3a7284a35b4015245e2594f138ab1aa552e`.
+  The controlled create used
+  `SUZUBASE_PG_DUMP_CMD='nc -z -w 1 127.0.0.1 1'`, targeting an unreachable
+  loopback port. It did not use the real database or backup directory.
+- Both create runs exited `1`. In
+  `/opt/suzubase/backups/scratch-t2-verify-unreachable`, the first run left
+  `alerts.jsonl=1` and `system-alert-outbox.jsonl=1`; the second appended one
+  each (`2` and `2`). Both outbox entries have exactly
+  `{"operation":"create","status":"failed"}` as their payload; no command or
+  connection string is included in the delivery payload. The host notification
+  service was intentionally unset, so both events remain pending in the
+  outbox. The scratch directory is retained for audit.
+- The first outbox event, `sourceEventId=9b2852a3-1389-40e2-98c4-6ac33d65b964`,
+  was delivered through `POST /notifications/system/deliver` on an isolated
+  branch API + PostgreSQL Compose stack. Tenant A used the event tenant ID and
+  had one admin and one ordinary member; tenant B had one admin. Results:
+  1. Tenant A admin received exactly one SYSTEM item and unread count `1`.
+  2. First delivery inserted `1`; replay with the same event ID inserted `0`.
+  3. Tenant A member had no system items and unread count `0`.
+  4. Tenant B admin had no system items and unread count `0`.
+  5. Persisted payload was exactly `{"operation":"create","status":"failed"}`;
+     its only keys were `operation` and `status`.
+- Replaced the prior direct-database dedup test with an endpoint-level
+  regression test and wired a generated integration credential through local
+  Compose and CI. The branch full integration suite passed: **97/97**.
+  Regression/test-configuration commit: `685bbd3`. No application delivery fix
+  was needed.
+- A preliminary scratch attempt using a bogus `ADMIN_DATABASE_URL` also failed
+  safely, but the host lacks `pg_dump` (`spawn pg_dump ENOENT`); it was followed
+  by the controlled unreachable-loopback runs above. Its separate scratch
+  evidence remains at `/opt/suzubase/backups/scratch-t2-verify`.
+
 ## T3 - Scheduled backups
 
 - Host capability probes (SSH `suzubase-lab`, as `sbdeploy`; output verbatim):
