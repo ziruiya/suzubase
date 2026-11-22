@@ -84,3 +84,24 @@ Any create/verify/restore failure does all three of:
    the Gate 3 report).
 
 Scheduled automatic backups (M4) are P2; this tool is manual + drill-driven.
+
+## P2 scheduled backups (M4)
+
+The formal default scheduler is systemd:
+
+- `suzubase-backup.service` runs the existing CLI once, with `flock` anti-reentry
+  and a 2-hour `RuntimeMaxSec`.
+- `suzubase-backup.timer` runs it daily with `Persistent=true`.
+- `suzubase-backup-watchdog.timer` detects a missing successful run for more than
+  26 hours and invokes the existing backup failure-alert path.
+
+Install the unit files in `/etc/systemd/system/`, set the deployment environment
+file and backup variables, then enable:
+
+```
+systemctl enable --now suzubase-backup.timer suzubase-backup-watchdog.timer
+```
+
+The implementation does not maintain a separate cron default. Cron may be used
+only as an explicit environment-specific fallback; it is not a second formally
+maintained implementation in this repository.

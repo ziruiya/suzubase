@@ -1,0 +1,9 @@
+[Unit]
+Description=Detect missed SuzuBase scheduled backups
+
+[Service]
+Type=oneshot
+User=suzubase
+WorkingDirectory=/opt/suzubase
+EnvironmentFile=-/opt/suzubase/deploy.env
+ExecStart=/usr/bin/node /opt/suzubase/tools/backup/suzubase-backup-watchdog.mjs

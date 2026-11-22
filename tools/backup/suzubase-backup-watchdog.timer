@@ -1,0 +1,10 @@
+[Unit]
+Description=Check SuzuBase scheduled backup health hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=suzubase-backup-watchdog.service
+
+[Install]
+WantedBy=timers.target

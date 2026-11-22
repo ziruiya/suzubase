@@ -1,0 +1,11 @@
+[Unit]
+Description=SuzuBase scheduled deployment backup
+After=network.target
+
+[Service]
+Type=oneshot
+User=suzubase
+WorkingDirectory=/opt/suzubase
+EnvironmentFile=-/opt/suzubase/deploy.env
+ExecStart=/usr/bin/flock -n /run/lock/suzubase-backup.lock /usr/bin/node /opt/suzubase/tools/backup/suzubase-backup.mjs create --name scheduled
+RuntimeMaxSec=2h
