@@ -708,3 +708,31 @@ export const runtimeIndexes = pgTable('runtime_indexes', {
   foreignKey({ columns: [t.tenantId, t.requestedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
   check('runtime_index_purpose', sql`${t.purpose} IN ('filter','sort','search')`),
 ]);
+
+export const deploymentInstance = pgTable('deployment_instance', {
+  id: integer().primaryKey().generatedAlwaysAsIdentity(),
+  instanceId: uuid('instance_id').notNull().defaultRandom(),
+});
+
+export const exportJobs = pgTable('export_jobs', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  requestedBy: uuid('requested_by').notNull(),
+  status: text().notNull().default('queued'),
+  stage: text().notNull().default('queued'),
+  progress: jsonb().$type<Record<string, number>>().notNull().default(sql`'{}'::jsonb`),
+  snapshotCutoff: time('snapshot_cutoff'),
+  manifest: jsonb().$type<unknown>(),
+  packageSha256: text('package_sha256'),
+  packageBytes: integer('package_bytes'),
+  error: text(),
+  attempts: integer().notNull().default(0),
+  createdAt: time('created_at').notNull().defaultNow(),
+  updatedAt: time('updated_at').notNull().defaultNow(),
+  sealedAt: time('sealed_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
+  foreignKey({ columns: [t.tenantId, t.requestedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);

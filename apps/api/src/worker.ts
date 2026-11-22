@@ -3,6 +3,9 @@ import { maintenanceTenants, withIndexDdl } from '@suzubase/db';
 import { runIndexJob } from './runtime-index-worker';
 import { deliverNotificationEmail, deliverNotifications, smtpSender } from './notification-worker';
 import { cleanupFiles } from './file-maintenance';
+import { ExportService } from './export';
+import { AppSchemaService } from './app-schema';
+import { AuthorizationService } from './authorization';
 
 function configuredInteger(name: string, fallback: number) {
   const value = Number(process.env[name] ?? fallback);
@@ -42,6 +45,17 @@ async function main() {
           }
         } catch (error) {
           console.error('Notification worker failed', { tenantId: context.tenantId, error });
+          if (once) process.exitCode = 1;
+        }
+        try {
+          const exports = new ExportService(new AppSchemaService(new AuthorizationService()));
+          const done = await exports.processQueued(context);
+          for (const job of done) {
+            if (job.status === 'sealed') console.info('Export sealed', { tenantId: context.tenantId, ...job });
+            else if (job.status === 'failed') console.error('Export failed', { tenantId: context.tenantId, ...job });
+          }
+        } catch (error) {
+          console.error('Export worker failed', { tenantId: context.tenantId, error });
           if (once) process.exitCode = 1;
         }
         try {
