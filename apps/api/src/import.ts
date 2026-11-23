@@ -171,6 +171,25 @@ export function importPackagePath(tenantId: string, jobId: string) {
   return resolve(importDirectory(), tenantId, `${jobId}.zip`);
 }
 
+/**
+ * Execution binding (P4-T5 finding): the package bytes on disk must be the
+ * exact bytes that were uploaded for this job. Validation persists only a
+ * preflight summary, so without this check a package file replaced after
+ * validation would be executed under the original job's staging state.
+ * Every execution-side read of the package file goes through this check
+ * and fails closed on mismatch.
+ */
+export function assertPackageMatchesJob(job: { packageSha256: string | null }, archive: Buffer): void {
+  if (!job.packageSha256) {
+    throw new BadRequestException('Import job has no recorded package hash; re-upload the package before executing');
+  }
+  const actual = createHash('sha256').update(archive).digest('hex');
+  if (actual !== job.packageSha256) {
+    throw new BadRequestException(
+      'Package file does not match the uploaded and validated package (sha256 mismatch); re-upload and validate before executing');
+  }
+}
+
 type JobRow = typeof importJobs.$inferSelect;
 
 export function jobView(job: JobRow) {
@@ -723,6 +742,7 @@ export class ImportExecutionService {
     const archive = await readFile(importPackagePath(context.tenantId, jobId)).catch(() => {
       throw new BadRequestException('Uploaded package file is missing');
     });
+    assertPackageMatchesJob(job, archive);
     let pkg: PkgPackage;
     try {
       pkg = readPackage(archive);
@@ -1604,6 +1624,7 @@ export class ImportExecutionService {
     const archive = await readFile(importPackagePath(context.tenantId, jobId)).catch(() => {
       throw new BadRequestException('Uploaded package file is missing');
     });
+    assertPackageMatchesJob(job, archive);
     const pkg = readPackage(archive);
     if (!pkg.automation) {
       return {
@@ -2227,6 +2248,10 @@ export class ImportOrchestrator {
     if (initial.duplicateOf && !initial.duplicateConfirmed) {
       throw new BadRequestException('Duplicate package: an administrator must confirm the second copy first');
     }
+    const archive = await readFile(importPackagePath(ctx.tenantId, jobId)).catch(() => {
+      throw new BadRequestException('Uploaded package file is missing');
+    });
+    assertPackageMatchesJob(initial, archive);
     // Atomic claim: a concurrent re-run of the same job observes the claim and
     // returns the in-flight state instead of writing anything twice (G3-07).
     const claimed = await withTenantTransaction(ctx, async (tx) => {
@@ -2237,7 +2262,7 @@ export class ImportOrchestrator {
       return row;
     });
     if (!claimed) return jobView(await this.loadJob(ctx, jobId));
-    const pkg = readPackage(await readFile(importPackagePath(ctx.tenantId, jobId)));
+    const pkg = readPackage(archive);
     const state: ExecState = {
       map: new IdMap(claimed.entityMapping as SourceIdMapRow[]),
       droppedAcl: [], droppedAssignees: [], disabledDependencies: [], pendingDependencies: [],
@@ -2283,7 +2308,12 @@ export class ImportOrchestrator {
 
   /** Recompute pending state + regenerate the evidence chain (G3-09). */
   async finalize(ctx: TenantContext, jobId: string, pkg?: PkgPackage) {
-    const packageData = pkg ?? readPackage(await readFile(importPackagePath(ctx.tenantId, jobId)));
+    let packageData = pkg;
+    if (!packageData) {
+      const archive = await readFile(importPackagePath(ctx.tenantId, jobId));
+      assertPackageMatchesJob(await this.loadJob(ctx, jobId), archive);
+      packageData = readPackage(archive);
+    }
     return withTenantTransaction(ctx, async (tx) => {
       const job = await this.imports.jobRow(tx, ctx, jobId);
       if (!job.targetAppId) throw new BadRequestException('The job has no staged application yet');
@@ -2352,9 +2382,11 @@ export class ImportOrchestrator {
     decisions: Record<string, DependencyDecision>) {
     if (mig.importJobId !== jobId) throw new ForbiddenException('Migration token is bound to a different import job');
     const ctx: TenantContext = { tenantId: mig.tenantId, userId: mig.userId };
-    const pkg = readPackage(await readFile(importPackagePath(ctx.tenantId, jobId)));
+    const archive = await readFile(importPackagePath(ctx.tenantId, jobId));
+    const pkg = readPackage(archive);
     await withTenantTransaction(ctx, async (tx) => {
       const job = await this.imports.jobRow(tx, mig, jobId);
+      assertPackageMatchesJob(job, archive);
       const merged = { ...job.dependencyDecisions, ...decisions };
       await tx.update(importJobs).set({
         dependencyDecisions: merged, updatedAt: sql`clock_timestamp()`,
