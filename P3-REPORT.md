@@ -1074,3 +1074,135 @@ as ordered.
 - 测试栈：独立 Postgres 容器（127.0.0.1:55438）＋本机 API 进程（:3301），全新空库迁移 **49 条从零跑通**（含 0048）。
 - 全套回归：**159/159 全绿**（基线 155 + 新增 4，零回归）；`pnpm -r typecheck` 全包干净；`pnpm -r build` 通过。
 - 环境备注：首轮全套曾出现 wave1 Webhook 11 项失败，根因为本轮测试栈 API 进程的 `SUZUBASE_SYSTEM_NOTIFICATION_SECRET` 与 wave1 测试文件内注入值不一致（密文不可读 → 投递 PERMANENT_FAILED），对齐后复跑 159/159；与代码无关，未改任何 wave1 代码/测试。
+
+
+## P3-D wave3（收官波：S 样例端到端、V/安全矩阵补强、无代码 UI 验收、附四处置）
+
+状态：施工完成，待独立验收 + GPT 整体签收。本波之后不再有 P3 施工波次；P3 是否完成由签收环节裁定，本报告不自行宣布。
+
+### 偏差置顶（先看这里）
+
+1. **托管 CI 未决（wave3-5）**：run 45133671478（HEAD c1e28ea）三次运行（含两次 rerun）均 failure，失败步均为 Integration tests（步时长约 2m28s）；同一 HEAD 在 Mac 本地 CI 等价栈两次全套 169/169 全绿（含 TZ=UTC 子集复跑 52/52）。失败用例名未能取得：CI 日志经签名 URL 下载，本波下载尝试超时且批准未获答复，未读到日志原文。定性待日志——候选为 runner（UMIDORI 自托管）环境特异性失败或负载时序 flake；本波未改任何既有测试逻辑去迁就它。签收前须取得日志定性。
+2. **V-05 口径解释（待 GPT 签收确认）**：简报 §8.2 V-05「旧任务排队时发布新版——旧任务继续绑定原版本，且仍接受当前授权校验」。本波实测并钉死两种「旧任务」形态：(i) 已生成的 run（含待重试的 FAILED run）——重试严格按 run.ruleVersion 的原始动作清单执行、且按**当前**授权状态复检（撤销原版本 grant 后重试被 409 拒绝），本波新测全项通过；(ii) 尚未被 worker 消费的 outbox 事件——按 §5.2「历史 run 永远引用**实际执行时**的规则版本」绑定消费时的 currentVersion（本波新测断言 v2 启用后产生的 run 绑定 v2）。若签收方对 (ii) 持不同解释（要求按事件产生时的版本绑定），需另立变更，本波未擅自改此语义。
+3. **S-(e) 周期汇总的实现边界（口径明示）**：平台无跨记录聚合引擎（简报 §9 明列后置）。每周汇总以「固定周期触发（周一 09:00 租户时区）+ 条件逐条筛选 + 每条命中记录一条汇总通知」实现，同一槽位的全部 run 共享 batch_id 构成可核对的汇总集合；汇总口径 = 命中条件的记录计数/清单（本波实测 3 条中 2 条 open 命中、closed 不命中、重复扫描不新增）。不存在「一条消息内含聚合数字」的汇总动作，此边界如实记录。
+4. **非 IT 真人实测未做**：UI 路径与控件接线已逐项核查通过（见下方 UI 验收节）；真人非 IT 用户实测未做，留最终签收环节。本波未虚报真人验收。
+5. **wave1 偏差 0~3 与 wave2 偏差 1 仍待复核**（未配置端点预检 WARNING 口径、Webhook 动作 SUCCEEDED=已入队语义、重试耗尽终态、非 429 4xx 归类；M1 待补全构成口径），汇总于文末索引，本波未裁决。
+
+### 本波代码变更
+
+- **附四第 4 项修正**（automation.ts）：日期相对计划的崩溃恢复采纳路径改按被采纳 run 的 startedAt 与 dueAt 之差判定 LATE，不再按恢复时刻重算；同一修正适用于插入竞态采纳分支（第 3b 项）。
+- **附四第 3a 项修正**（automation.ts）：processDateBackfill 在规则暂不合格（停用/授权撤销/版本被取代）时不再把 backfill job 标 COMPLETED——该状态对 worker 是终态（只领取 RUNNING），旧行为会让「停用期间恰好跑过一轮 worker」的存量记录在规则恢复后永远等不到计划；改为留在 RUNNING 等待（与 invalidate 钩子注释明示的「simply waits」原意一致），返回值 completed 同步改 false。
+- **附四第 2 项清理**（迁移 0049 + schema.ts）：automation_schedules.status 的 CHECK（0040 引入）删除从未有写入点的 SCHEDULED 与 SKIPPED_NONEXISTENT_TIME，收敛为实写集合 PENDING/SUCCEEDED/FAILED/INVALIDATED/MISSED/LATE/CANCELLED。**cadence 槽位表 automation_cadence_slots 的 SKIPPED_NONEXISTENT_TIME 是活值（0045 CHECK + 代码写入点），未动。**
+- **无代码规则管理 UI**（新文件 apps/web/src/automation-rule-builder.tsx，接线于 automation-settings.tsx）：此前自动化页只有运行监控，建规则/授权/预检/dry-run/发布/启用全是 API-only——与简报 §6 冲突，本波补齐（详见 UI 验收节）。
+
+### S 样例端到端（双向编号标注，全部真实链路）
+
+| 本波场景 | 简报 §8.1 编号 | 证据（p3-d-wave3.test.cjs） | 关键断言 |
+|---|---|---|---|
+| (a) 状态通知：status→「対応中」通知担当者 | S-01 | S-a 新测 | run 绑定真实 record.updated 事件（event_id 回查 record_events.kind='updated'）、rule_version 正确、action SUCCEEDED、收件人由担当者字段解析、重放后通知恒 1 条（兼 V-10） |
+| (b) 日期提醒：wish_date −3 天 09:00 Asia/Tokyo | S-02 | 既有 p3-c-date-relative S-02/V-02/V-03/24h 边界/B1/C1 共 11+ 项 + 本波 item-4 采纳恢复新测 | 时区精确 due_at、改期旧失效新安排、软删不发、迟到 24h 窗口、MISSED 不发、崩溃恢复采纳不重发且不误标 LATE、重启（worker 重入）不重复 |
+| (c) 审批结果联动：流程推进→通知申请人＋关联应用生成待办 | §8.1 S-01 家族扩展（施工单 (c)；简报三类样例未单列此场景） | S-c 新测 | 人工 workflow 动作（actor_type='USER'，自动化未伪造）触发 workflow.transitioned 规则；NOTIFY＋CREATE_RECORD 两动作顺序 SUCCEEDED；待办记录字段映射正确且仅 1 条；重放不重复 |
+| (d) 自动建单：创建案件→关联应用自动跟进记录 | S-03 | S-d 新测（与 p3-b A-3 互证） | 目标应用授权内建单、字段映射（source＋constant）、record_create_keys 业务幂等键恰 1、后续动作失败后重试不产第二张单（兼 V-01/V-09） |
+| (e) 周期汇总：每周一 cadence→上周汇总通知 | 施工单 (e)（简报 §8.1 未单列；§9 聚合后置） | S-e 新测 | 周一 09:00 JST 槽位精确（2026-12-07T00:00Z）、条件筛选逐条执行、同 batch 共享、计数可核（2/3 命中）、重复扫描 0 新增；实现边界见偏差 3 |
+
+### V-01~V-10 证据矩阵
+
+| 项 | 结论 | 证据类型 | 关键断言 |
+|---|---|---|---|
+| V-01 建单后崩溃重试不产第二单 | 通过 | 本波新测 S-d（建单已提交、后续动作失败的崩溃等价态→重试）＋既有 p3-b A-3 | records 恒 1、record_create_keys 恒 1、成功动作 attempt 不增 |
+| V-02 改期旧失效新安排 | 通过 | 既有 p3-c-date-relative V-02（引用） | 12/10→12/20 旧 due_at 失效、新计划正确 |
+| V-03 软删不发 | 通过 | 既有 p3-c-date-relative V-03（引用） | 计划 INVALIDATED、零发送 |
+| V-04 授权撤销执行拒绝 | 通过 | 既有 p3-b 权限门测试＋本波 V-05 撤销后重试 409 | 执行期复检当前 grant，撤销即拒绝 |
+| V-05 排队时发新版 | 通过（口径见偏差 2） | 本波新测 | 已生成 run 绑定原版本动作清单重试（v2 动作不泄漏）、撤销原 grant 后重试 409；未消费事件按执行时版本绑定（§5.2） |
+| V-06 Webhook 确认丢失 | 通过 | 既有 wave1 timeout/drop 两测＋本波补充新测 | 端点确已收到并处理（服务端 hit 计数增长）但响应丢失→DELIVERY_UNCERTAIN、attempt outcome=UNCERTAIN、绝不记 SUCCEEDED/PERMANENT_FAILED |
+| V-07 月末/时区/DST | 通过 | 既有 p3-c-schedules 月末/DST 两测（引用） | 2 月 31 日落月末、DST 缺口 SKIPPED_NONEXISTENT_TIME、折叠时刻只跑一次 |
+| V-08 空库恢复/M1 导入不重放 | 通过 | 既有 wave2 四测（引用） | 导入零 run/通知/投递/outbox、计划不拷贝、规则禁用草稿 |
+| V-09 失败 run 只重试失败动作 | 通过 | 既有 p3-b A-3＋本波 S-d 复核 | 成功动作 attempt_count 恒 1、失败动作 2 |
+| V-10 重复事件不重复通知 | 通过 | 既有 p3-b A-1＋本波 S-a 复核 | processOutbox 重放后通知恒 1、rule_key 去重 |
+
+### §8.3 执行安全清单
+
+| 项 | 结论 | 证据 |
+|---|---|---|
+| 确定性循环发布阻断 | 通过 | 既有 p3-a（BLOCKING_CYCLE 发布 409）＋wave2 导入环检 |
+| 潜在循环警告＋运行时安全终止 | 通过 | 既有 p3-b ping-pong（POTENTIAL 警告放行、运行时 BLOCKED_CYCLE 终止、五元组完整） |
+| 链深 5 生效、第 6 层拦截 | 通过 | 既有 p3-a 链深测试（CHAIN_DEPTH_EXCEEDED） |
+| 普通规则不能改 ACL/用户/密钥 | 通过 | 本波新测：UPDATE_ACL 类动作类型在 API Schema 层 400 拒绝（该类动作在服务端根本不存在）；grant 模型无此操作枚举 |
+| 自动流程不伪造人工审批 | 通过 | 既有 p3-b A-4（automationAllowed=false 的人工动作被 WORKFLOW_ACTION_NOT_AUTOMATION_ALLOWED 拒绝、零 workflow 事件）＋本波 S-c（触发转移 actor_type='USER'） |
+| 无变化更新不触发事件 | 通过 | 既有 p3-b A-1 no-progress（result_ref='no-progress'、更新事件恒 1） |
+| 定时 1000 批次后续跑 | 通过 | 既有 p3-c cadence/backfill 批次续跑＋100k 冒烟（引用） |
+| 单条数据错误不阻断其他记录 | 通过 | 本波新测（item 3c 后半）：坏记录（number 字段存非数字）run FAILED、其余两条 SUCCEEDED、槽位完成 |
+| 同规则并发领取不产重复 run | 通过 | 既有 p3-c cadence/date-relative 并发领取两测（引用） |
+| Webhook SSRF（DNS 重绑定/重定向/私网 IP） | 通过 | 既有 wave1 SSRF 四项（引用） |
+| 非法配置不能绕过 UI 经 API 发布 | 通过 | 本波新测三负向：未知特权动作类型 400、无 grant 发布 409、SQL 篡改草稿 actions_json（指向不存在字段）后 API 发布仍被服务端预检 409 |
+| 热日志清理不删必备审计 | 通过 | 既有 p3-b/p3-c 剪枝测试（pruneRunHistory 只删热 run 历史、审计行保留，引用） |
+| 导入默认禁用 | 通过 | 既有 wave2（引用） |
+
+### 非 IT 无代码验收（UI 路径）
+
+本波前缺口：自动化设置页只有 Overview/Run history/Manual run/Webhook/Problem chains 五个监控区，**建规则、授权确认、dry-run、发布、启用均无 UI 入口**（只能调 API）——已补齐 `AutomationRuleBuilder`（自动化页内，规则管理区）：
+
+- 建规则：触发（7 种，含 workflow 目标状态下拉、cadence/日期相对参数表单）→条件（字段/运算符/值表单）→动作（NOTIFY/UPDATE_FIELDS/CREATE_RECORD/ADVANCE_WORKFLOW/WEBHOOK 逐类型表单，可增删多动作）全表单操作，actionId 由前端生成，用户不接触 JSON；
+- 授权确认：保存草稿后自动按已配动作预填权限摘要（可读/可写字段、目标应用、操作枚举的复选单）＋明文摘要句（含「不能改权限/用户/密钥、不能代替人工审批」），一次点击批准；
+- dry-run 预览：填记录 ID 即调 dry-run 接口并展示结果，界面明示零写入；
+- 发布/启用：Preflight（findings 列表展示 publishable 与逐项结论）→Publish→Enable/Disable 按钮齐全；
+- 运行结果与失败原因：既有 Run history（状态/规则筛选、View run 动作级详情含 error_code）；
+- 允许的恢复：失败 run 的「Retry failed actions」、问题链 Resume（含「不重放」披露文案）、Webhook 人工重发（风险确认框）。
+
+接线核查（本波实测）：Web 构建产物 bundle 含全部上述控件文案；vite preview 经 /api 代理连 wave3 API 健康检查通过；builder 所调用的全部接口（rules/grants/preflight/dry-run/publish/enable/manual-runs/retry/resend/resume）均有集成测试覆盖（本波＋既有 p3-a/b/c/d 测试）。**边界：真人非 IT 用户实测未做，留最终签收环节。**
+
+### 附四准入备注汇总处置
+
+| # | 事项 | 最终结论 | 证据/理由 |
+|---|---|---|---|
+| 1 | 固定节律执行按记录重读复检 | **已实现**（wave1 初步结论记为「已接受偏差」不准确，本波复核纠正） | cadence：executeCadenceSlot 候选查询过滤 deletedAt 且以当前记录数据做两阶段条件求值；date-relative：processDateRelativePlan 执行前重读记录、校验 deletedAt/源日期/当前条件。删除或状态已变的记录不会按旧快照执行 |
+| 2 | automation_schedules 状态 CHECK 死值 SCHEDULED/SKIPPED_NONEXISTENT_TIME | **已清理（迁移 0049）** | CHECK 收敛为 7 个实写值；空库 50 条迁移从零跑通且约束定义回读核对。cadence_slots 侧 SKIPPED_NONEXISTENT_TIME 为活值，未动 |
+| 3a | 回填 COMPLETED 复活路径 | **已修复＋新测** | 旧行为：规则暂不合格时 job 被标 COMPLETED（终态），invalidate 的 RUNNING 重置会被 worker 一轮跑动翻回 COMPLETED，存量记录在规则恢复后无计划。改：不合格时留在 RUNNING 等待。新测：停用→worker 跑动→job 仍 RUNNING→重新启用→存量记录计划生成 |
+| 3b | 5 分钟租期竞态败者 FAILED 窄窗口 | **已修复** | run 插入冲突（竞态败者）改为按同一 identity 采纳胜者 run 结果（与既有采纳路径同口径、LATE 按 run 开始时刻判定），不再无条件标 FAILED；无胜者时才 FAILED |
+| 3c | 节律槽恢复未重检规则状态 | **已由既有机制等价覆盖＋本波新测钉死** | resume 路径双重门：Pass-1 查询与领取 UPDATE 均要求 plan ACTIVE；停用/撤销/版本取代都会把 plan 置 INVALIDATED；resume 内另有 grant 存在性＋grantCoversExecution 复检。新测：槽位 CLAIMED 后停用规则、租期过期后跑动零新增 run；重新启用后经 resume 完成剩余记录 |
+| 4 | 崩溃恢复采纳旧 run 时 late 按恢复时刻重算 | **已修正＋新测**（二选一取修正） | 改按被采纳 run 的 startedAt 判定；新测：准时执行（+5min）的 run 在 +20min 恢复采纳时计划落 SUCCEEDED 而非 LATE、通知/run 恒 1。影响边界：仅计划状态标注口径变化，执行与通知行为不变 |
+
+### 提交清单
+
+- `ccb1303` 附四修正（3a/3b/第 4 项）＋迁移 0049＋无代码规则管理 UI
+- `4a9d618` wave3 测试（10 项）
+- `c1e28ea` wave3 测试栈密钥口径对齐（环境修正，非逻辑变更）
+- （本报告提交见 git log）
+
+### 测试证据
+
+- 新增 `packages/db/test/p3-d-wave3.test.cjs`：10 项全绿（S-a/S-c/S-d/S-e、V-05、§8.3 负向三连、附四第 4 项、附四 3a、附四 3c＋错误隔离、V-06 补充）。
+- 测试栈：独立 Postgres 容器（127.0.0.1:55439）＋本机 API 进程（:3302），全新空库迁移 **50 条从零跑通**（含 0049），约束定义回读核对；审计完整性工具（CI 同款）failures=0。
+- 全套回归：**169/169 全绿**（基线 159 + 新增 10，零回归）；`pnpm -r typecheck` 全包干净；`pnpm -r build` 通过。注记：首轮全套曾出现 12 项失败，定性为本机栈环境口径问题（API 密钥与 wave1 测试注入值不一致致 11 项 Webhook SECRET_UNREADABLE、迁移用户非 suzubase_migration 致迁移所有权断言失败），与 wave2 记录过的同类环境坑一致；按 CI 口径统一 env 后复跑 169/169，另以 TZ=UTC 复跑 wave3＋webhook＋p3-c 子集 52/52。
+- 托管 CI：run 45133671478（HEAD c1e28ea）三次运行均 failure 于 Integration tests 步——**未决，见偏差置顶 1**；不以本地绿替代 CI 绿宣称。
+
+## P3 全阶段总结（A–D 对照简报 §10）
+
+| 阶段 | §10 IN 范围完成度 | 门禁 | 证据索引 |
+|---|---|---|---|
+| P3-A 地基 | 核心表（8 表含审计表）/Schema/不可变版本/事件绑定/两阶段判定/Service Principal 解释（批准者委托重检）/授权预检＋运行时复核/静态环检/因果传播/run-action 状态/幂等/Dry-run/审计——全 IN | 重复触发不产重复 run、旧版本绑定、权限撤销有效、确定性循环阻断、潜在循环警告、因果传播、跨应用授权配置与预检——全过（GPT 附条件 PASS＋Muse 验收，附二裁定已落实） | 分支 p3-a-automation-foundation；测试 99 基线内含 p3-a 套件；报告 P3-A 段 |
+| P3-B 本地动作 | A-1~A-4/T-4/顺序执行/动作级幂等/失败停止与恢复/流程机器授权/运行历史/非原子风险说明——全 IN（A-6 邮件按 §1.3 正式后置） | 重试不重复建单、增减不重复累计、恢复不重放成功动作、权限不足不写入、不伪造审批、无进展不循环——全过；C2~C8 准入条件于 P3-C 批关闭 | 分支 p3-b-automation-actions @0dc4140；108/108；托管 CI success；报告 P3-B 段 |
+| P3-C 定时 | T-3 双形态/持久化计划/改期取消/24h 补发/月末 DST/积压监控/稳定游标/1000 批次/checkpoint/领取恢复——全 IN；C-0 系统 actor、C-1 手动去重、C-2 状态清理、C-3 小项全关；GPT 阻塞缺陷 B1 已修＋C1 宽限边界＋C2 10 万冒烟 | 日期改旧失效、删除不发、24h 边界、错过默认跳过、月末 DST、重启不重复、10 万受控批次续跑——全过 | 分支 p3-c-automation-schedules @7520b0d（含修复批）；134/134；托管 CI success；报告 P3-C 各段 |
+| P3-D Webhook/M1/整体验收 | A-5 Webhook（HMAC/轮换/双策略/状态分类/SSRF）＋M1 导出导入（禁用/重授权/凭据占位）＋S 样例＋V-01~V-10＋空库复跑＋无代码 UI——全 IN | Webhook 分类重试正确、不确定不伪装、旧 M1 包不回归、导入不自动激活——全过；整体验收矩阵见 wave3 段（S/V/§8.3）。**托管 CI 在 P3-D 末端 HEAD 未取得绿（wave3-5 未决），此项如实保留，不宣称门禁全过** | 分支 p3-d-automation-webhooks @c1e28ea（+报告提交）；169/169 本地全绿；托管 CI run 45133671478 failure ×3；报告 P3-D wave1/wave2/wave3 段 |
+
+四阶段证据索引（分支/HEAD/测试数/CI）：A——p3-a-automation-foundation，99 基线，CI 绿（验收以托管 CI 同 HEAD 全绿替代本地复跑，见验收注）；B——p3-b-automation-actions @0dc4140，108/108，CI success；C——p3-c-automation-schedules @7520b0d，134/134，CI success；D——p3-d-automation-webhooks @c1e28ea，169/169 本地，CI run 45133671478 failure ×3（未决）。P3-C 验收的「独立全新栈复跑」缺位已由 wave3 在 P3 末端 HEAD 以全新空库（50 迁移）＋全套回归补齐（附四验收条件 1 闭环；托管 CI 项除外）。
+
+### 遗留与后置清单（批次外，不属 P3 未完成项）
+
+- A-6 邮件动作：简报 §9 正式后置（进入条件：真实外部通知需求＋统一邮件基础设施）。
+- 真人非 IT 用户实测：UI 路径已核查，实测留最终签收环节由真人完成。
+- M3 既有激活三阻断：分类树未建、子表 FILE 子字段、Lookup 对应用级令牌不可见——按各自批次处理，非 P3 范围。
+- 分类树、子表 FILE 支持：SuzuBase 平台后续批次（P2 遗留顺序）。
+- 审计 check 1 的 M3 暂存导入人群 flake（约 10% 误命中）：挂账口径不变（红时原样重跑，报告注明），修复归 M3 后续批次。注：本波 CI 红在 Integration tests 步、非审计步，与该 flake 不是同一形态。
+
+### wave1/wave2/wave3 待复核偏差汇总索引（留 GPT 签收裁决，本波未裁决）
+
+- wave1 偏差 0：未配置端点的 WEBHOOK 动作——预检 WARNING＋执行失败关闭（WEBHOOK_ENDPOINT_NOT_CONFIGURED）；已配置不安全端点仍 BLOCKING。
+- wave1 偏差 1：WEBHOOK 动作 SUCCEEDED 语义 = 投递已可靠入队，HTTP 结果以 delivery 行为唯一事实源。
+- wave1 偏差 2：AUTO 策略重试耗尽终态——确定性失败 PERMANENT_FAILED（RETRY_BUDGET_EXHAUSTED 前缀）、不确定结果 MANUAL_REVIEW_REQUIRED。
+- wave1 偏差 3：非 429 的 4xx 归 PERMANENT_FAILURE（0 重试）。
+- wave2 偏差 1：「待补全」构成——未解决引用＋BLOCKING 环检阻塞激活；授权重审与凭据补录入 manualActions 不阻塞激活（闸在规则启用侧）。
+- wave2 偏差 2~4：跨应用引用只按既往导入任务解析、未映射接收人剔除不改指、组合规则拆分（既有 grant 模型约束）。
+- wave3 偏差 2：V-05 未消费事件按执行时版本绑定（§5.2 解释）。
+- wave3 偏差 3：S-(e) 周期汇总的实现边界（逐条通知＋同 batch 集合，无聚合引擎）。
+- wave3 偏差 5（未决置顶）：托管 CI run 45133671478 三次 failure 于 Integration tests 步，本地同 HEAD 两次 169/169；日志未取得，定性待签收环节处理。
