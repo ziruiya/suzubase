@@ -10,7 +10,11 @@ const { addField, configureRuntime, createApp, expectRequest, login, provision, 
 // SSRF depth, delivery idempotency and manual resend. All HTTP goes to a
 // local fake endpoint through an injected transport; the SSRF gate runs
 // against an injected resolver. No real external calls are made.
-process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET = 'p3d-test-system-secret';
+// Use the stack-provided credential when one is exported: the API server
+// encrypts webhook endpoint secrets with it, so the in-process delivery
+// engine must derive the same key (CI provisions a fresh random value
+// per run). The fixed value is only a fallback for local stacks.
+process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET ??= 'p3d-test-system-secret';
 
 const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 const maintenanceContext = (tenantId) => Object.freeze({ tenantId, userId: NIL_UUID });

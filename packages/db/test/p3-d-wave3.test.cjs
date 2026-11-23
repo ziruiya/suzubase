@@ -13,7 +13,11 @@ const { addField, configureRuntime, createApp, expectRequest, login, provision, 
 // construct due schedule rows (the established P3-C pattern) and to
 // simulate a worker that died after creating a run but before finalizing
 // its plan (plan row reset -- never to fabricate an event or a result).
-process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET = 'p3d-test-system-secret';
+// Use the stack-provided credential when one is exported: the API server
+// encrypts webhook endpoint secrets with it, so the in-process delivery
+// engine must derive the same key (CI provisions a fresh random value
+// per run). The fixed value is only a fallback for local stacks.
+process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET ??= 'p3d-test-system-secret';
 
 const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 const maintenanceContext = (tenantId) => Object.freeze({ tenantId, userId: NIL_UUID });
