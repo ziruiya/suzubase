@@ -41,7 +41,10 @@ test('all Drizzle migrations run from an empty PostgreSQL database and can be re
       ORDER BY c.relname
     `);
     assert.deepEqual(rows.map(({ relname }) => relname), [
-      'api_tokens', 'app_counters', 'app_versions', 'apps', 'auto_number_counters', 'comment_mentions', 'csv_jobs', 'deployment_instance', 'export_jobs', 'fields', 'file_references', 'files', 'group_members', 'import_jobs', 'issued_auto_numbers', 'login_credentials', 'member_groups', 'migration_audit_log', 'migration_tokens', 'notifications', 'organizations', 'outbox', 'permission_audit',
+      'api_tokens', 'app_counters', 'app_versions', 'apps', 'auto_number_counters',
+      'automation_audit_events', 'automation_grants', 'automation_rule_versions', 'automation_rules',
+      'automation_run_actions', 'automation_runs', 'automation_schedules', 'automation_webhook_deliveries',
+      'comment_mentions', 'csv_jobs', 'deployment_instance', 'export_jobs', 'fields', 'file_references', 'files', 'group_members', 'import_jobs', 'issued_auto_numbers', 'login_credentials', 'member_groups', 'migration_audit_log', 'migration_tokens', 'notifications', 'organizations', 'outbox', 'permission_audit',
       'record_comments', 'record_create_keys', 'record_events', 'record_references', 'record_search_values', 'record_table_rows', 'record_unique_values', 'record_workflow_state', 'records', 'runtime_indexes', 'tenant_members', 'tenants', 'users',
       'workflow_actions', 'workflow_assignments', 'workflow_definitions', 'workflow_events', 'workflow_states',
     ]);

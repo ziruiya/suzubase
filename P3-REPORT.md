@@ -39,32 +39,63 @@ Baseline HEAD before P3-A: `82e33d6`
 1. **Top unresolved:** P3-A intentionally does not execute P3-B actions. The implementation must retain `ACTIONS_NOT_IMPLEMENTED` / `NOT_EXECUTED` evidence and must never promote such runs to `SUCCEEDED`. The final P3-B change should replace the deferred state only after real action execution and action-level outcomes are implemented.
 2. Migration 0036 initially duplicated `source_schema_version` already introduced in 0035. It was removed and the migration rerun on an empty database.
 3. P3-A has no formal P3-C scheduling worker, P3-D HTTP transport, or P3-B business action execution. Those are outside this branch's IN scope.
-4. Local integration authentication currently returns `401 Invalid credentials` for API login despite direct database password verification and API health/route startup. It is recorded as an environment/integration blocker pending CI-equivalent rerun; no product success is inferred.
+4. The fourth-round CI-equivalent rerun no longer has a login blocker: direct credential verification and login through the built API both pass. The earlier 401 swarm was traced to a stale API container occupying the local port, not to P3-A code or password hashing.
+
+## Fourth-round diagnosis
+
+### Reproduction and failure inventory
+
+- CI PostgreSQL 16 was recreated as a fresh database on port 5432 with CI-equivalent environment variables.
+- Build and 40-migration empty-database migration passed.
+- The first CI-equivalent attempt produced 89 tests: 12 passed and 77 failed. The failure inventory and first errors are retained in `/tmp/p3a-failures.txt`.
+- Every suite failure named in that run shared the same setup symptom: `401 Invalid credentials` at `/auth/login`, including the P3-A integration test. This was not multiple independent P3-A or product regressions.
+- Investigation found the local `127.0.0.1:3000` port was owned by the existing `suzubase-api-1` container. A fresh API process was also started, but the Docker listener reached stale database/application state. Direct verification of the credential SQL function and the exact built `verifyLogin` function passed, and login through the new API passed after the stale container was stopped.
+
+### Failure classification
+
+| Class | Evidence |
+|---|---|
+| (a) P3-A test wiring/coverage defects | The P3-A test itself passed after the stale API port was removed. The new P3-A routes were also found missing from `/docs-json`; after explicit OpenAPI contracts were added, `GF-11` passed. The migration exact-table test was reconciled to include the eight P3-A tables. |
+| (b) Existing test regression | None was found. The first 77 failures were produced by the stale/wrong API process, and the clean rerun passed all 98 baseline tests plus the P3-A test. |
+
+### Root cause and repair
+
+- Root cause: local port 3000 was polluted by a pre-existing Docker API container, so test requests did not reach the freshly built API/database pair. Password hashing and P3-A migrations did not cause the credential rejection.
+- Product/test repairs: added complete OpenAPI contracts for all P3-A automation routes; extended the migration exact-table assertion with the eight P3-A tables so schema verification remains exact rather than being weakened.
+
+### Final CI-equivalent rerun
+
+- `pnpm -r --workspace-concurrency=1 build`: passed.
+- `pnpm -r --workspace-concurrency=1 typecheck`: passed.
+- Fresh PostgreSQL 16, 40 migrations applied: passed.
+- `pnpm test`: 100 tests, 100 passed, 0 failed.
+- P3-A integration: passed; P3-A diagnostics reported `ACTIONS_NOT_IMPLEMENTED` as the intentional P3-A boundary.
+- `audit-integrity --sample 20`: passed, 0 failures across all six checks.
 
 ## CI-equivalent evidence
 
-- PostgreSQL 16 local container: `docker` test container on port 5433.
+- PostgreSQL 16 fresh local container: CI-equivalent port 5432, PostgreSQL 16 Alpine.
 - `pnpm install --frozen-lockfile`: passed.
 - `pnpm -r --workspace-concurrency=1 build`: passed.
 - `pnpm -r --workspace-concurrency=1 typecheck`: passed.
-- Empty database migration before repair: product failure found: duplicate `source_schema_version` in 0036.
-- Empty database migration after repair: passed, 40 migrations applied.
+- Empty database migration: passed, 40 migrations applied.
 - API health: passed (`{"status":"ok","database":"connected"}`).
-- Full `pnpm test`: attempted. First runner summary: 89 tests seen, 12 passed, 77 failed. Failures were predominantly `401 Invalid credentials` at API login, preventing integration fixture setup. This environment-local suite result is not a product pass.
-- Target P3-A test: attempted, 0/1 passed; blocked at the real API login setup with `401 Invalid credentials`.
-- Browser suite: not run locally; environment is not glibc-compatible for the required Chromium suite. Leave to Hosted CI.
+- Full `pnpm test`: passed, 100 tests / 100 passed.
+- Target P3-A test: passed.
+- `audit-integrity --sample 20`: passed, 0 failures.
+- Browser suite: not run; this round's required gates were build, typecheck, migration, integration and audit integrity.
 
 ## P3-A gate evidence
 
 | Gate | Conclusion | Evidence |
 |---|---|---|
-| Repeated trigger no duplicate logical run | Implemented and tested by code/test shape | Unique `(tenant_id, idempotency_key)`, replay `onConflictDoNothing`, worker marks processed outbox event. Runtime integration pass remains blocked by API auth. |
+| Repeated trigger no duplicate logical run | Implemented and passed in full integration | Unique `(tenant_id, idempotency_key)`, replay `onConflictDoNothing`, worker marks processed outbox event. P3-A integration test passed in 100/100 rerun. |
 | Old-version binding | Completed | Run stores `rule_version`; worker selects `automationRules.currentVersion`; test asserts workflow run bound to version. |
 | Grant revocation | Completed | Revoke sets `revoked_at`; runtime filters active grants and test verifies `SKIPPED_UNAUTHORIZED`. |
 | Deterministic cycle | Completed | Static analysis can emit `BLOCKING_CYCLE`; publish preflight blocks it. |
 | Potential cycle | Completed | Static analysis emits `POTENTIAL_CYCLE` warning and permits publication. |
 | Causation through outbox | Completed | Outbox columns, run columns and exports are linked; chain-depth test records depth 5/6 behavior and admin notification. |
-| Business admin cross-app grant and preflight | API implementation present | Real `/automation/rules/:id/grants`, `/preflight`, `/publish`, `/enable` routes exist and P3-A test uses them. Local API login prevented execution proof in this round. |
+| Business admin cross-app grant and preflight | API implementation present and passed | Real `/automation/rules/:id/grants`, `/preflight`, `/publish`, `/enable` routes exist and P3-A integration test passed them. |
 
 ## Commit and push status
 

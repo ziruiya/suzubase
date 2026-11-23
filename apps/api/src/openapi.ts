@@ -16,6 +16,7 @@ import { tokenHttp } from './api-tokens';
 import { formulaInput } from './formula';
 import { importHttp, importHttp2, importHttp3 } from './import';
 import { identifier } from './validation';
+import { automationHttp } from './automation';
 
 const id = identifier;
 const text = z.string();
@@ -261,6 +262,34 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/workflow/draft']: { put: { body: workflowHttp.graphInput, reply: workflowHttp.definition } },
   [applications + '/workflow/publish']: { post: { reply: workflowHttp.definition, conflict: errorSchema } },
   [applications + '/workflow/enabled']: { patch: { body: workflowHttp.enabledInput, reply: workflowHttp.enabledInput, conflict: errorSchema } },
+  [applications + '/automation/rules']: {
+    get: { reply: z.array(automationHttp.rule) },
+    post: { body: automationHttp.createRuleInput, reply: z.looseObject({ rule: automationHttp.rule, version: automationHttp.version }), conflict: errorSchema },
+  },
+  [applications + '/automation/rules/{ruleId}/draft']: {
+    put: { body: automationHttp.draftInput, reply: automationHttp.version, conflict: errorSchema },
+  },
+  [applications + '/automation/rules/{ruleId}/grants']: {
+    post: { body: automationHttp.grantInput, reply: automationHttp.grant, conflict: errorSchema },
+  },
+  [applications + '/automation/rules/{ruleId}/grants/{grantId}/revoke']: {
+    post: { reply: z.looseObject({ revoked: z.literal(true) }), conflict: errorSchema },
+  },
+  [applications + '/automation/rules/{ruleId}/preflight']: {
+    post: { body: automationHttp.versionInput, reply: z.looseObject({ publishable: z.boolean(), findings: z.array(z.looseObject({})), cycles: z.array(z.looseObject({})) }), conflict: errorSchema },
+  },
+  [applications + '/automation/rules/{ruleId}/dry-run']: {
+    post: { body: automationHttp.versionInput.extend({ recordId: id }), reply: z.looseObject({ dryRun: z.literal(true), sideEffects: z.literal(false) }), conflict: errorSchema },
+  },
+  [applications + '/automation/rules/{ruleId}/publish']: {
+    post: { body: automationHttp.versionInput, reply: z.looseObject({ version: automationHttp.version, warnings: z.array(z.looseObject({})) }), conflict: errorSchema },
+  },
+  [applications + '/automation/rules/{ruleId}/enable']: {
+    post: { body: automationHttp.enableInput, reply: z.looseObject({ enabled: z.boolean() }), conflict: errorSchema },
+  },
+  [applications + '/automation/rules/{ruleId}']: {
+    delete: { reply: z.looseObject({ archived: z.literal(true) }), conflict: errorSchema },
+  },
   [applications + '/publish']: { post: { body: appHttp.publishInput, optionalBody: true,
     reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text), resolvedDependencies: z.array(z.looseObject({ fieldId: text, dependency: text, reason: text })) }), conflict: publishConflict } },
   [records]: { get: { query: recordHttp.pageInput, reply: page(record) }, post: { body: recordHttp.createInput, reply: record, conflict: errorSchema } },

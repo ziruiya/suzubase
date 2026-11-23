@@ -72,6 +72,18 @@ const grantInput = z.strictObject({
 const versionInput = z.strictObject({ version: z.number().int().positive() });
 const enableInput = z.strictObject({ enabled: z.boolean() });
 
+export const automationHttp = {
+  createRuleInput,
+  draftInput,
+  grantInput,
+  versionInput,
+  enableInput,
+  rule: z.looseObject({ id: identifier, name: z.string(), enabled: z.boolean(), archivedAt: z.string().nullable().optional() }),
+  version: z.looseObject({ ruleId: identifier, version: z.number().int(), status: z.string(), trigger: z.unknown(), conditions: z.unknown(), actions: z.unknown() }),
+  grant: z.looseObject({ id: identifier, ruleId: identifier, ruleVersion: z.number().int(), revokedAt: z.string().nullable().optional() }),
+  result: z.looseObject({}),
+};
+
 export function automationActionCausation(run: {
   id: string; rootCausationId: string; causationDepth: number; ruleId: string;
 }, actionId: string) {
