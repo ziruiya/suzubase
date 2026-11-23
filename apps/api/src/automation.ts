@@ -2983,8 +2983,12 @@ export class AutomationService {
     }
     const pinnedIp = resolved.ips[0];
     let secret: string;
-    try { secret = decryptWebhookSecret(endpoint.secretEnc); } catch {
-      return finalize({ outcome: 'BLOCKED', errorType: 'SECRET_UNREADABLE', pinnedIp });
+    try { secret = decryptWebhookSecret(endpoint.secretEnc); } catch (error) {
+      // A missing encryption key (fail-fast, P3 closure C3) is reported
+      // distinctly from a corrupted/unreadable ciphertext: both BLOCK
+      // the delivery, neither ever falls back to a default key.
+      const notConfigured = error instanceof Error && error.message.includes('WEBHOOK_SECRET_KEY_NOT_CONFIGURED');
+      return finalize({ outcome: 'BLOCKED', errorType: notConfigured ? 'WEBHOOK_SECRET_KEY_NOT_CONFIGURED' : 'SECRET_UNREADABLE', pinnedIp });
     }
     const body = JSON.stringify(delivery.payload ?? {});
     if (Buffer.byteLength(body) > WEBHOOK_MAX_REQUEST_BYTES) {

@@ -273,6 +273,15 @@ test('P3-D wave2 roundtrip: export carries automation without secrets; import la
   assert.deepEqual(run.pending.automation.unresolved, []);
   assert.equal(run.pending.automation.credentialsPending.length, 1);
   assert.equal(run.pending.automation.grantRequirements.length, 4);
+  // P3 closure C5: the import-completion UI renders exactly this
+  // pending.automation.manualActions list (data source for the visible
+  // "Manual actions required after import" block in import-export.tsx).
+  assert.ok(Array.isArray(run.pending.automation.manualActions), 'manualActions list present on the job pending payload the UI renders');
+  assert.equal(run.pending.automation.manualActions.length, 5, 'manualActions = 1 webhook credential + 4 grant re-approvals');
+  assert.equal(run.pending.automation.manualActions.filter((entry) => entry.kind === 'webhook-credential').length, 1);
+  assert.equal(run.pending.automation.manualActions.filter((entry) => entry.kind === 'grant-reauthorization').length, 4);
+  const credentialAction = run.pending.automation.manualActions.find((entry) => entry.kind === 'webhook-credential');
+  assert.ok(credentialAction.name && credentialAction.url, 'credential action carries the endpoint name/url the UI lists');
   assert.ok(run.report.automation, 'report carries the automation section');
   assert.equal(run.report.automation.rulesImported, 4);
   assert.equal(run.report.automation.rulesEnabled, 0);

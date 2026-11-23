@@ -7,6 +7,10 @@ import { api, appPath, download, json, message, response, type App, type Session
 // the migration channel with the one-time migration token (decision 7).
 
 type Counts = Record<string, number>;
+type ManualAction = {
+  kind: string; name?: string; url?: string; action?: string; note?: string;
+  sourceRuleId?: string; version?: number | string;
+};
 type MigrationJob = {
   id: string; status: string; stage: string; completion: 'complete' | 'pending' | null;
   sourceAppCode: string | null; sourceExportId: string | null; targetAppId: string | null;
@@ -21,6 +25,12 @@ type MigrationJob = {
     unmappedUsers?: { id: string; name: string | null; email: string | null }[];
     unmappedGroups?: { id: string; name: string | null }[];
     droppedAcl?: { layer: string; action: string; subjectKind: string; sourceSubjectId: string }[];
+    automation?: {
+      manualActions?: ManualAction[];
+      credentialsPending?: unknown[];
+      grantRequirements?: unknown[];
+      unresolved?: unknown[];
+    } | null;
     cleanup?: unknown;
   };
   report: {
@@ -254,6 +264,21 @@ function JobPanel({ job, apps, directory, busy, run, open, token, migrationToken
     {!!pending.droppedAcl?.length && <div className="stack"><h4>Permissions not restored (default-deny)</h4>
       <ul>{pending.droppedAcl.map((entry, index) => <li key={index}>
         {entry.layer} · {entry.action} · {entry.subjectKind} {entry.sourceSubjectId} (unmapped)</li>)}</ul></div>}
+    {!!pending.automation?.manualActions?.length && <div className="stack" role="alert">
+      <h4>Manual actions required after import ({pending.automation.manualActions.length} outstanding)</h4>
+      <p className="error">These manual actions are still outstanding. Imported automation rules stay
+        disabled drafts and webhook endpoints cannot deliver until an administrator completes every
+        item below in the target environment. Nothing on this list is done automatically.</p>
+      <ul>{pending.automation.manualActions.map((entry, index) => <li key={index}>
+        {entry.kind === 'webhook-credential'
+          ? <>Webhook credential to supply: endpoint &quot;{entry.name}&quot; ({entry.url})
+              — supply a signing secret for this endpoint before it can deliver.</>
+          : entry.kind === 'grant-reauthorization'
+            ? <>Automation grant to re-approve: rule {entry.sourceRuleId} v{entry.version}
+                — re-run preflight and re-approve the grant in the target; imported grants never take effect.</>
+            : <>{entry.kind}: {entry.name ?? entry.sourceRuleId ?? ''}{entry.note ? ' — ' + entry.note : ''}</>}
+      </li>)}</ul>
+    </div>}
     {report && <div className="stack"><h4>Restore verification &amp; difference report</h4>
       <table><thead><tr><th>Object</th><th>Source</th><th>Target</th><th>Match</th></tr></thead>
         <tbody>{Object.keys(report.counts.source).map((key) => <tr key={key}>

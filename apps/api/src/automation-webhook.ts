@@ -164,12 +164,23 @@ export async function resolvePublicIps(rawUrl: string, resolver: WebhookResolver
 // SUZUBASE_WEBHOOK_SECRET_KEY, falling back to the already-provisioned
 // SUZUBASE_SYSTEM_NOTIFICATION_SECRET so the test/CI stack needs no new
 // secret. Secrets are never written to logs or API responses.
+//
+// FAIL FAST (P3 closure batch, C3): there is deliberately NO hardcoded
+// fallback key. If neither environment variable provides a non-empty
+// value, encryption and decryption refuse to run with an explicit
+// WEBHOOK_SECRET_KEY_NOT_CONFIGURED error instead of silently using a
+// key that is published in this repository (any ciphertext produced
+// under such a key would be readable by anyone with repo access).
 // ---------------------------------------------------------------------------
 
+export const WEBHOOK_SECRET_KEY_NOT_CONFIGURED = 'WEBHOOK_SECRET_KEY_NOT_CONFIGURED';
+
 function encryptionKey(): Buffer {
-  const material = process.env.SUZUBASE_WEBHOOK_SECRET_KEY
-    ?? process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET
-    ?? 'suzubase-local-development-webhook-secret';
+  const material = [process.env.SUZUBASE_WEBHOOK_SECRET_KEY, process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET]
+    .find((value) => typeof value === 'string' && value.trim().length > 0);
+  if (!material) {
+    throw new Error(WEBHOOK_SECRET_KEY_NOT_CONFIGURED + ': neither SUZUBASE_WEBHOOK_SECRET_KEY nor SUZUBASE_SYSTEM_NOTIFICATION_SECRET is set; refusing to encrypt or decrypt webhook secrets without a configured key');
+  }
   return createHash('sha256').update(material).digest();
 }
 

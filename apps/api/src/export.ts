@@ -375,7 +375,17 @@ export class ExportService {
       .orderBy(automationRuleVersions.version) : [];
     const automationGrantRows = automationVersionRows.length ? await tx.select().from(automationGrants)
       .where(and(eq(automationGrants.tenantId, tenantId), eq(automationGrants.appId, appId))) : [];
-    const automationEndpointRows = await tx.select().from(automationWebhookEndpoints).where(and(
+    // Explicit non-sensitive column selection (P3 closure hardening):
+    // secretEnc / previousSecretEnc are never loaded into memory here at
+    // all, instead of being selected wholesale and dropped at mapping.
+    const automationEndpointRows = await tx.select({
+      id: automationWebhookEndpoints.id, name: automationWebhookEndpoints.name,
+      url: automationWebhookEndpoints.url, policy: automationWebhookEndpoints.policy,
+      keyVersion: automationWebhookEndpoints.keyVersion,
+      credentialPending: automationWebhookEndpoints.credentialPending,
+      validatedUrlHash: automationWebhookEndpoints.validatedUrlHash,
+      createdAt: automationWebhookEndpoints.createdAt,
+    }).from(automationWebhookEndpoints).where(and(
       eq(automationWebhookEndpoints.tenantId, tenantId), eq(automationWebhookEndpoints.appId, appId)))
       .orderBy(automationWebhookEndpoints.createdAt);
     const automationPackage: AutomationPackage = {
