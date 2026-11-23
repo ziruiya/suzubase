@@ -1084,7 +1084,7 @@ as ordered.
 
 1. **托管 CI 未决（wave3-5）**：run 45133671478（HEAD c1e28ea）三次运行（含两次 rerun）均 failure，失败步均为 Integration tests（步时长约 2m28s）；同一 HEAD 在 Mac 本地 CI 等价栈两次全套 169/169 全绿（含 TZ=UTC 子集复跑 52/52）。失败用例名未能取得：CI 日志经签名 URL 下载，本波下载尝试超时且批准未获答复，未读到日志原文。定性待日志——候选为 runner（UMIDORI 自托管）环境特异性失败或负载时序 flake；本波未改任何既有测试逻辑去迁就它。签收前须取得日志定性。
 2. **V-05 口径解释（待 GPT 签收确认）**：简报 §8.2 V-05「旧任务排队时发布新版——旧任务继续绑定原版本，且仍接受当前授权校验」。本波实测并钉死两种「旧任务」形态：(i) 已生成的 run（含待重试的 FAILED run）——重试严格按 run.ruleVersion 的原始动作清单执行、且按**当前**授权状态复检（撤销原版本 grant 后重试被 409 拒绝），本波新测全项通过；(ii) 尚未被 worker 消费的 outbox 事件——按 §5.2「历史 run 永远引用**实际执行时**的规则版本」绑定消费时的 currentVersion（本波新测断言 v2 启用后产生的 run 绑定 v2）。若签收方对 (ii) 持不同解释（要求按事件产生时的版本绑定），需另立变更，本波未擅自改此语义。
-3. **S-(e) 周期汇总的实现边界（口径明示）**：平台无跨记录聚合引擎（简报 §9 明列后置）。每周汇总以「固定周期触发（周一 09:00 租户时区）+ 条件逐条筛选 + 每条命中记录一条汇总通知」实现，同一槽位的全部 run 共享 batch_id 构成可核对的汇总集合；汇总口径 = 命中条件的记录计数/清单（本波实测 3 条中 2 条 open 命中、closed 不命中、重复扫描不新增）。不存在「一条消息内含聚合数字」的汇总动作，此边界如实记录。
+3. **S-(e) 每周汇总的实现边界（口径明示，P3 签收关闭批 C6 定名）**：本功能的正式定名是「逐条通知＋同 batch 集合」——固定周期触发（周一 09:00 租户时区）+ 条件逐条筛选 + 每条命中记录一条通知，同一槽位的全部 run 共享 batch_id 构成可核对的集合；核对口径 = 命中条件的记录计数/清单（本波实测 3 条中 2 条 open 命中、closed 不命中、重复扫描不新增）。平台没有跨记录汇总计算能力（简报 §9 明列后置），不存在「一条消息内含汇总数字」的动作；本报告全文不把本功能表述为任何形式的汇总计算已实现，此边界如实记录。
 4. **非 IT 真人实测未做**：UI 路径与控件接线已逐项核查通过（见下方 UI 验收节）；真人非 IT 用户实测未做，留最终签收环节。本波未虚报真人验收。
 5. **wave1 偏差 0~3 与 wave2 偏差 1 仍待复核**（未配置端点预检 WARNING 口径、Webhook 动作 SUCCEEDED=已入队语义、重试耗尽终态、非 429 4xx 归类；M1 待补全构成口径），汇总于文末索引，本波未裁决。
 
@@ -1103,7 +1103,7 @@ as ordered.
 | (b) 日期提醒：wish_date −3 天 09:00 Asia/Tokyo | S-02 | 既有 p3-c-date-relative S-02/V-02/V-03/24h 边界/B1/C1 共 11+ 项 + 本波 item-4 采纳恢复新测 | 时区精确 due_at、改期旧失效新安排、软删不发、迟到 24h 窗口、MISSED 不发、崩溃恢复采纳不重发且不误标 LATE、重启（worker 重入）不重复 |
 | (c) 审批结果联动：流程推进→通知申请人＋关联应用生成待办 | §8.1 S-01 家族扩展（施工单 (c)；简报三类样例未单列此场景） | S-c 新测 | 人工 workflow 动作（actor_type='USER'，自动化未伪造）触发 workflow.transitioned 规则；NOTIFY＋CREATE_RECORD 两动作顺序 SUCCEEDED；待办记录字段映射正确且仅 1 条；重放不重复 |
 | (d) 自动建单：创建案件→关联应用自动跟进记录 | S-03 | S-d 新测（与 p3-b A-3 互证） | 目标应用授权内建单、字段映射（source＋constant）、record_create_keys 业务幂等键恰 1、后续动作失败后重试不产第二张单（兼 V-01/V-09） |
-| (e) 周期汇总：每周一 cadence→上周汇总通知 | 施工单 (e)（简报 §8.1 未单列；§9 聚合后置） | S-e 新测 | 周一 09:00 JST 槽位精确（2026-12-07T00:00Z）、条件筛选逐条执行、同 batch 共享、计数可核（2/3 命中）、重复扫描 0 新增；实现边界见偏差 3 |
+| (e) 每周汇总（定名「逐条通知＋同 batch 集合」）：每周一 cadence→逐条通知 | 施工单 (e)（简报 §8.1 未单列；§9 跨记录汇总计算后置） | S-e 新测 | 周一 09:00 JST 槽位精确（2026-12-07T00:00Z）、条件筛选逐条执行、同 batch 共享、计数可核（2/3 命中）、重复扫描 0 新增；实现边界见偏差 3 |
 
 ### V-01~V-10 证据矩阵
 
@@ -1183,9 +1183,9 @@ as ordered.
 | P3-A 地基 | 核心表（8 表含审计表）/Schema/不可变版本/事件绑定/两阶段判定/Service Principal 解释（批准者委托重检）/授权预检＋运行时复核/静态环检/因果传播/run-action 状态/幂等/Dry-run/审计——全 IN | 重复触发不产重复 run、旧版本绑定、权限撤销有效、确定性循环阻断、潜在循环警告、因果传播、跨应用授权配置与预检——全过（GPT 附条件 PASS＋Muse 验收，附二裁定已落实） | 分支 p3-a-automation-foundation；测试 99 基线内含 p3-a 套件；报告 P3-A 段 |
 | P3-B 本地动作 | A-1~A-4/T-4/顺序执行/动作级幂等/失败停止与恢复/流程机器授权/运行历史/非原子风险说明——全 IN（A-6 邮件按 §1.3 正式后置） | 重试不重复建单、增减不重复累计、恢复不重放成功动作、权限不足不写入、不伪造审批、无进展不循环——全过；C2~C8 准入条件于 P3-C 批关闭 | 分支 p3-b-automation-actions @0dc4140；108/108；托管 CI success；报告 P3-B 段 |
 | P3-C 定时 | T-3 双形态/持久化计划/改期取消/24h 补发/月末 DST/积压监控/稳定游标/1000 批次/checkpoint/领取恢复——全 IN；C-0 系统 actor、C-1 手动去重、C-2 状态清理、C-3 小项全关；GPT 阻塞缺陷 B1 已修＋C1 宽限边界＋C2 10 万冒烟 | 日期改旧失效、删除不发、24h 边界、错过默认跳过、月末 DST、重启不重复、10 万受控批次续跑——全过 | 分支 p3-c-automation-schedules @7520b0d（含修复批）；134/134；托管 CI success；报告 P3-C 各段 |
-| P3-D Webhook/M1/整体验收 | A-5 Webhook（HMAC/轮换/双策略/状态分类/SSRF）＋M1 导出导入（禁用/重授权/凭据占位）＋S 样例＋V-01~V-10＋空库复跑＋无代码 UI——全 IN | Webhook 分类重试正确、不确定不伪装、旧 M1 包不回归、导入不自动激活——全过；整体验收矩阵见 wave3 段（S/V/§8.3）。**托管 CI 在 P3-D 末端 HEAD 未取得绿（wave3-5 未决），此项如实保留，不宣称门禁全过** | 分支 p3-d-automation-webhooks @c1e28ea（+报告提交）；169/169 本地全绿；托管 CI run 45133671478 failure ×3；报告 P3-D wave1/wave2/wave3 段 |
+| P3-D Webhook/M1/整体验收 | A-5 Webhook（HMAC/轮换/双策略/状态分类/SSRF）＋M1 导出导入（禁用/重授权/凭据占位）＋S 样例＋V-01~V-10＋空库复跑＋无代码 UI——全 IN | Webhook 分类重试正确、不确定不伪装、旧 M1 包不回归、导入不自动激活——全过；整体验收矩阵见 wave3 段（S/V/§8.3）。托管 CI 已取得绿：wave3-5 未决项由 P3-D CI 修复段关闭（run 45139370741 success），签收关闭批代码 HEAD 7ed8719 的托管 CI run 45143847455 亦 success；含本报告关闭小节的最终 HEAD 的 CI 以该 HEAD 在 GitHub 上的 run 为准（见文末关闭批小节注记） | 分支 p3-d-automation-webhooks @7ed8719（签收关闭批代码提交；其后仅报告提交）；172/172 本地全绿（169 基线＋关闭批新增 3）；托管 CI run 45143847455 success；报告 P3-D wave1/wave2/wave3 段＋CI 修复段＋签收关闭批小节 |
 
-四阶段证据索引（分支/HEAD/测试数/CI）：A——p3-a-automation-foundation，99 基线，CI 绿（验收以托管 CI 同 HEAD 全绿替代本地复跑，见验收注）；B——p3-b-automation-actions @0dc4140，108/108，CI success；C——p3-c-automation-schedules @7520b0d，134/134，CI success；D——p3-d-automation-webhooks @c1e28ea，169/169 本地，CI run 45133671478 failure ×3（未决）。P3-C 验收的「独立全新栈复跑」缺位已由 wave3 在 P3 末端 HEAD 以全新空库（50 迁移）＋全套回归补齐（附四验收条件 1 闭环；托管 CI 项除外）。
+四阶段证据索引（分支/HEAD/测试数/CI）：A——p3-a-automation-foundation，99 基线，CI 绿（验收以托管 CI 同 HEAD 全绿替代本地复跑，见验收注）；B——p3-b-automation-actions @0dc4140，108/108，CI success；C——p3-c-automation-schedules @7520b0d，134/134，CI success；D——p3-d-automation-webhooks @7ed8719（签收关闭批代码 HEAD；其后仅报告提交），172/172 本地（169 基线＋关闭批新增 3），托管 CI run 45143847455 success（wave3-5 的 run 45133671478 failure ×3 为历史记录，已由 CI 修复段以 run 45139370741 success 关闭）。P3-C 验收的「独立全新栈复跑」缺位已由 wave3 在 P3 末端 HEAD 以全新空库（50 迁移）＋全套回归补齐（附四验收条件 1 闭环；托管 CI 亦已取得绿）。
 
 ### 遗留与后置清单（批次外，不属 P3 未完成项）
 
@@ -1204,7 +1204,7 @@ as ordered.
 - wave2 偏差 1：「待补全」构成——未解决引用＋BLOCKING 环检阻塞激活；授权重审与凭据补录入 manualActions 不阻塞激活（闸在规则启用侧）。
 - wave2 偏差 2~4：跨应用引用只按既往导入任务解析、未映射接收人剔除不改指、组合规则拆分（既有 grant 模型约束）。
 - wave3 偏差 2：V-05 未消费事件按执行时版本绑定（§5.2 解释）。
-- wave3 偏差 3：S-(e) 周期汇总的实现边界（逐条通知＋同 batch 集合，无聚合引擎）。
+- wave3 偏差 3：S-(e) 每周汇总的实现边界——正式定名「逐条通知＋同 batch 集合」，未实现跨记录汇总计算。
 - wave3 偏差 5（未决置顶）：托管 CI run 45133671478 三次 failure 于 Integration tests 步，本地同 HEAD 两次 169/169；日志未取得，定性待签收环节处理。
 
 
@@ -1215,3 +1215,45 @@ as ordered.
 - **改动清单（提交 9382c59，仅 2 个测试文件、10 增 2 删）**：两文件顶层的无条件赋值改为 `??=`（仅当环境未提供时才落回写死值作本地栈回退），并加注原因。未改任何断言、未 skip 任何用例、未动审计 check 1 抽样、未动 M3 导入路径、未改 ci.yaml、未改产品代码。
 - **双口径验证**：① CI 口径（复现克隆 @9382c59，全新空库＋每轮随机密钥）：pnpm test **169/169 全绿**，typecheck 全包干净。② 本地回退口径（API 以写死值启动、测试进程不带该环境变量，靠 ??= 回退对齐）：两文件 **27/27 全绿**。
 - **托管 CI 结论**：run **45139370741**（HEAD 9382c59）completed **success**——job build-and-test 全部步骤绿，含 step 12 Integration tests 与此前被 skipped 的 step 13 Audit integrity、step 15 Browser tests。wave3-5 未决项就此关闭；P3 全阶段总结表中 P3-D 行的「托管 CI 未取得绿」表述以本节为准更新为已取得绿（run 45139370741）。
+
+## P3 签收关闭批（C2–C6 关闭证据；C1 留档）
+
+分支 `p3-d-automation-webhooks`，代码提交 `7ed8719`（基线 `defa1d6`），本小节随其后的报告提交进入最终 HEAD。未合并 main；未部署。
+
+### C3（安全项）加密密钥回退改 fail fast —— 已关闭
+
+- **改动**：`apps/api/src/automation-webhook.ts:178-184` 的 `encryptionKey()` 删除写死在仓库里的回退值（原 `'suzubase-local-development-webhook-secret'`）；`SUZUBASE_WEBHOOK_SECRET_KEY` 与 `SUZUBASE_SYSTEM_NOTIFICATION_SECRET` 两者都缺失、为空或纯空白时，明确抛 `WEBHOOK_SECRET_KEY_NOT_CONFIGURED`（常量定义 :176）拒绝加密/解密。投递路径 `apps/api/src/automation.ts:2988-2991`：解密失败时区分该错误，delivery 以 outcome=BLOCKED、errorType=`WEBHOOK_SECRET_KEY_NOT_CONFIGURED` 终态关闭（区别于密文损坏的 `SECRET_UNREADABLE`），绝不用任何默认值继续。
+- **同类回退全仓核查**：以密钥/secret/token/password × 硬编码默认值模式 grep `apps/api/src`、`apps/web/src`、`packages/*/src`、`tools`，除本处外无第二处硬编码密钥回退；`main.ts` 的 `SESSION_SECRET` 缺省时用 `randomBytes(32)` 进程内随机生成（非写死值、重启即失效），不属同类，保留并在此明记。构建产物 dist 已复核不含旧回退字符串。
+- **测试**（新文件 `packages/db/test/p3-closure.test.cjs`）：①缺密钥/纯空白时保存路径 `encryptWebhookSecret` 与投递读密钥路径 `decryptWebhookSecret` 均抛 `WEBHOOK_SECRET_KEY_NOT_CONFIGURED`，有密钥时往返正常（对照）；②投递引擎实测：端点在有密钥时正常保存并入队，投递时刻移除密钥后 `processWebhookDeliveries` 产生 1 条 attempt（outcome=BLOCKED、error_type=`WEBHOOK_SECRET_KEY_NOT_CONFIGURED`）、delivery 终态 PERMANENT_FAILED、传输层零调用。
+- **备案（无需轮换）**：P3 从未部署，演示实例运行的是 P1 代码；该回退值从未加密过任何真实数据（仅本地/CI 测试栈中的测试密钥经同一环境变量口径加密），故无存量密文需要重加密、无密钥需要轮换。
+
+### C4 V-05(ii) 直测 —— 已关闭
+
+- 新测 `p3-closure.test.cjs`「P3 closure C4 (V-05(ii) direct)」：规则 v1（NOTIFY）启用后创建记录、**outbox 事件已排队但 worker 不消费**（先断言 run 数为 0），其后发布并启用 v2（UPDATE_FIELDS），再消费该事件——断言生成的 run `rule_version=2`、状态 SUCCEEDED、记录被 v2 动作改为 `v2-executed`、v1 的 NOTIFY 零通知。与既有 wave3 V-05 的差异：wave3 第二条记录是在 v2 已生效**之后**才创建的（事件从未在 v1 下排队），其第一腿是已生成 run 的 v1 重试；本测是唯一直接复现「排队于 v1、消费于 v2 后」的用例，不重复。
+
+### C5 manualActions 显著展示 —— 已关闭
+
+- **UI**：`apps/web/src/import-export.tsx:265-282`（标题 :268）在导入任务详情（完成/激活界面所在的 JobDetail 面板）新增常显区块「Manual actions required after import (N outstanding)」：`role="alert"`、未清零提示文案明示「仍有未办事项；导入的自动化规则保持禁用草稿、Webhook 端点在管理员逐项办完前不能投递；此清单不会被自动完成」，逐项列出凭据补录（端点名＋URL）与授权重审（规则＋版本）。
+- **数据来源真实**：区块直接渲染任务 `pending.automation.manualActions`（`apps/api/src/import.ts` Finalizer 由 credentialsPending＋grantRequirements 组装）。接线实测：`p3-d-automation-m1.test.cjs` 新增断言钉死该 payload（往返包：manualActions 共 5 项 = 凭据 1＋授权重审 4，凭据项带 name/url）；Web 构建产物 bundle 含全部区块文案（标题/提示/两类条目）；vite preview 根页 200 正常伺服该 bundle（其 /api 代理按配置指向 :3000 的 CI 口径，本轮本地 API 在 :3310，故本地未走代理健康检查，不影响 bundle 接线结论）。
+
+### C2 报告纠错 —— 已关闭
+
+- P3 全阶段总结表 P3-D 行与四阶段证据索引已由过时口径（`@c1e28ea`、托管 CI run 45133671478 failure ×3「未决」）改为最终事实：wave3-5 已由 CI 修复段关闭（run 45139370741 success）；签收关闭批代码 HEAD `7ed8719` 全套本地 172/172、托管 CI run **45143847455 success**。wave3 段内的「未决」表述是当时的历史记录，已被 CI 修复段与本小节取代，不再代表当前状态。
+- **最终 HEAD 注记**：本小节所在的报告提交构成最终 HEAD；按关闭批口径，其托管 CI 以该最终 HEAD 在 GitHub 上的 run 结论为准（提交后由施工方核验并在回报中给出 run 号），不以 7ed8719 的 run 冒充最终 HEAD 的 CI。
+
+### C6 每周汇总定名 —— 已关闭
+
+- S-(e) 每周汇总全文统一正式定名「逐条通知＋同 batch 集合」：wave3 偏差 3、S 样例表 (e) 行、偏差汇总索引三处已改；全文 grep「聚合」零命中，不存在任何「已实现汇总计算」类表述（平台无跨记录汇总计算能力，简报 §9 后置，如实保留此边界）。
+
+### 顺手加固：export 端点显式列选择 —— 已完成
+
+- `apps/api/src/export.ts:378-390`：导出加载 `automationWebhookEndpoints` 时改显式只选非敏感列（id/name/url/policy/keyVersion/credentialPending/validatedUrlHash/createdAt），`secretEnc`/`previousSecretEnc` 不再被全列查进内存再映射丢弃；导出包内容与既有断言（包内无密钥材料）不变，wave2 M1 测试全绿复核。
+
+### C1 留档口径（不关闭）
+
+- **真人非 IT 用户走查未做**：无代码 UI 的真人实测仍未完成，简报 §8.4 该门禁项**保持未完成**；本批仅完成 UI 路径与接线核查，**不宣称 P3 门禁全过**。C1 以此口径留档，待真人走查后另行关闭。
+
+### 本批验证证据
+
+- 全新空库验证栈（独立 Postgres 容器 127.0.0.1:55441＋本机 API :3310，50 条迁移从零跑通）：`pnpm test` **172/172 全绿**（169 基线＋新增 3：C3 两项＋C4 一项；另 M1 测试内 C5 payload 断言随套件通过），无重跑；`pnpm -r build` 通过、`pnpm -r typecheck` 全包干净；套件后 `audit-integrity --sample 20` failures=0（本轮未触发 check 1 的 M3 flake；挂账口径不变：若 CI 红于该步，原样重跑转绿可接受，本批未动导入/抽样逻辑）。
+- 托管 CI：代码 HEAD `7ed8719` run 45143847455 **success**；最终 HEAD（本报告提交）的 run 号与结论在施工回报中给出。
