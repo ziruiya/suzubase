@@ -179,7 +179,7 @@ test('P3-B A-3 cross-app create is idempotent across retries; failed actions do 
       [owner.tenantId, runId]);
     assert.equal(actions.rows[0].status, 'SUCCEEDED');
     assert.equal(actions.rows[1].status, 'FAILED');
-    assert.equal(actions.rows[1].error_code, 'WEBHOOK_NOT_IMPLEMENTED_P3D');
+    assert.equal(actions.rows[1].error_code, 'WEBHOOK_ENDPOINT_NOT_CONFIGURED');
     const created = await audit.query(
       `SELECT count(*)::int AS count FROM records WHERE tenant_id=$1 AND app_id=$2`,
       [owner.tenantId, appB.id]);

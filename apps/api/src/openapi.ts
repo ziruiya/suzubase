@@ -314,6 +314,25 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/automation/summary']: {
     get: { reply: automationHttp.summary },
   },
+  [applications + '/automation/webhook-endpoints']: {
+    get: { reply: z.array(automationHttp.webhookEndpoint) },
+    post: { body: automationHttp.webhookEndpointInput, reply: automationHttp.webhookEndpoint, conflict: errorSchema },
+  },
+  [applications + '/automation/webhook-endpoints/{endpointId}']: {
+    put: { body: automationHttp.webhookEndpointUpdateInput, reply: automationHttp.webhookEndpoint, conflict: errorSchema },
+  },
+  [applications + '/automation/webhook-endpoints/{endpointId}/validate']: {
+    post: { reply: automationHttp.webhookEndpoint.extend({ resolvedAddresses: integer }), conflict: errorSchema },
+  },
+  [applications + '/automation/webhook-endpoints/{endpointId}/rotate-secret']: {
+    post: { body: automationHttp.webhookSecretInput, reply: automationHttp.webhookEndpoint, conflict: errorSchema },
+  },
+  [applications + '/automation/webhook-deliveries']: {
+    get: { reply: automationHttp.webhookDeliveryPage },
+  },
+  [applications + '/automation/webhook-deliveries/{deliveryRowId}/resend']: {
+    post: { reply: z.looseObject({ resent: z.literal(true), deliveryId: id, status: z.string() }), conflict: errorSchema },
+  },
   [applications + '/publish']: { post: { body: appHttp.publishInput, optionalBody: true,
     reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text), resolvedDependencies: z.array(z.looseObject({ fieldId: text, dependency: text, reason: text })) }), conflict: publishConflict } },
   [records]: { get: { query: recordHttp.pageInput, reply: page(record) }, post: { body: recordHttp.createInput, reply: record, conflict: errorSchema } },

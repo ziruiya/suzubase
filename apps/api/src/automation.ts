@@ -290,9 +290,6 @@ const config = z.strictObject({
     if (action.type === 'ADVANCE_WORKFLOW' && !action.workflowActionId) {
       ctx.addIssue({ code: 'custom', message: 'ADVANCE_WORKFLOW actions require a workflow action' });
     }
-    if (action.type === 'WEBHOOK' && !action.webhook?.endpointId) {
-      ctx.addIssue({ code: 'custom', message: 'WEBHOOK actions require a webhook endpoint' });
-    }
     if (action.type !== 'WEBHOOK' && action.webhook) {
       ctx.addIssue({ code: 'custom', message: 'Only WEBHOOK actions take a webhook configuration' });
     }
@@ -936,7 +933,7 @@ export class AutomationService {
             endpointUrl: endpoint?.url ?? null, policy: endpoint?.policy ?? null,
             endpointValidated: endpoint ? endpoint.validatedUrlHash === webhookUrlHash(endpoint.url) : false,
             payloadPreview: { recordId: row.id,
-              fields: Object.keys(record.data).filter((id) => readableIds.has(id)) },
+              fields: Object.keys(record.data).filter((id) => (grant?.readableFieldIds ?? []).includes(id)) },
             note: 'Dry run never calls the endpoint. A real run enqueues a durable delivery; ' +
               'the webhook worker performs the HTTP call asynchronously.' });
         } else {
@@ -3323,7 +3320,11 @@ export class AutomationService {
       if (action.type !== 'WEBHOOK') continue;
       const endpointId = action.webhook?.endpointId;
       if (!endpointId) {
-        findings.push({ code: 'WEBHOOK_ENDPOINT_NOT_CONFIGURED', severity: 'BLOCKING' });
+        // A webhook action with no endpoint configured is the P3-B-era
+        // fail-closed placeholder: it may publish (warning) and fails at
+        // execution with WEBHOOK_ENDPOINT_NOT_CONFIGURED. A CONFIGURED
+        // endpoint that is unsafe, unvalidated or missing blocks here.
+        findings.push({ code: 'WEBHOOK_ENDPOINT_NOT_CONFIGURED', severity: 'WARNING' });
         continue;
       }
       const [endpoint] = await tx.select().from(automationWebhookEndpoints).where(and(
