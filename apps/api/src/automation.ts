@@ -72,9 +72,11 @@ export const AUTOMATION_SCHEDULE_BACKLOG_ALERT_THRESHOLD = 100;
 // P3-C date-relative (T-3 lower half): brief 3.2 late window -- a plan
 // executed within 24 ACTUAL hours of its due_at (UTC) is a late
 // execution (marked LATE); past the window the plan is MISSED and never
-// executes. This is unrelated to the fixed-cadence 15-minute on-time
-// grace above: that one classifies cadence slots, this one is the
-// brief's explicit date-relative contract.
+// executes. The 24h window itself is the brief's explicit contract and
+// is NOT the fixed-cadence 15-minute grace; the grace is reused here
+// only to classify the boundary between an on-time execution and a
+// late one (the worker polls every 60s, so without a grace every
+// normal execution would be "late" and SUCCEEDED unreachable).
 export const AUTOMATION_DATE_RELATIVE_LATE_WINDOW_MS = 24 * 3_600_000;
 // Aggregated MISSED alerting: at or above this many plans marked MISSED
 // in one pass, tenant admins get ONE summary SYSTEM notification (daily
@@ -2098,7 +2100,7 @@ export class AutomationService {
         await finalize('CANCELLED', { invalidated: true, reason: 'conditions-not-met' });
         return { plan, cancelled: true };
       }
-      const late = lateMs > 0;
+      const late = lateMs > AUTOMATION_SCHEDULE_ON_TIME_GRACE_MS;
       const identity = `${plan.appId}:date-relative:${plan.ruleId}:${plan.ruleVersion}:${plan.scheduleKey}:${plan.recordId}`;
       const [existingRun] = await tx.select({ id: automationRuns.id, status: automationRuns.status })
         .from(automationRuns).where(and(eq(automationRuns.tenantId, context.tenantId),
