@@ -64,6 +64,10 @@ async function main() {
             new WorkflowRuntimeService(schema, authorization, planner));
           const processed = await automation.processOutbox(context);
           if (processed.events || processed.createdRuns) console.info('Automation outbox', { tenantId: context.tenantId, ...processed });
+          const schedules = await automation.processSchedules(context);
+          if (schedules.claimedPlans || schedules.resumedSlots || schedules.runsCreated || schedules.slotsSkipped) {
+            console.info('Automation schedules', { tenantId: context.tenantId, ...schedules });
+          }
           const pruned = await automation.pruneRunHistory(context);
           if (pruned.pruned) console.info('Automation run history pruned', { tenantId: context.tenantId, ...pruned });
         } catch (error) {

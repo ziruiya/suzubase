@@ -506,13 +506,21 @@ export type AutomationConditionOperator = 'eq' | 'ne' | 'gt' | 'lt' | 'gte' | 'l
 export type AutomationRuleConfig = {
   schemaVersion: number;
   trigger: {
-    eventType: 'record.created' | 'record.updated' | 'record.deleted' | 'workflow.transitioned' | 'workflow.rejected';
+    eventType: 'record.created' | 'record.updated' | 'record.deleted' | 'workflow.transitioned' | 'workflow.rejected' | 'schedule.fixed';
     fieldId?: string;
     oldValue?: unknown;
     newValue?: unknown;
     fromStateId?: string;
     toStateId?: string;
     allowManual?: boolean;
+    schedule?: {
+      cadence: 'daily' | 'weekly' | 'monthly';
+      localTime: string;
+      timezone: string;
+      weekdays?: number[];
+      monthDay?: number;
+      missedRunPolicy?: 'skip' | 'catch_up_latest';
+    };
   };
   conditions: {
     eventSnapshot: { operator: 'and' | 'or'; groups: { conditions: {
@@ -671,6 +679,63 @@ export const automationSchedules = pgTable('automation_schedules', {
   foreignKey({ columns: [t.tenantId, t.appId, t.ruleId, t.ruleVersion], foreignColumns: [automationRuleVersions.tenantId, automationRuleVersions.appId, automationRuleVersions.ruleId, automationRuleVersions.version] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
   check('automation_schedules_status', sql`${t.status} IN ('PENDING','SCHEDULED','SUCCEEDED','FAILED','INVALIDATED','SKIPPED_NONEXISTENT_TIME','MISSED','LATE','CANCELLED')`),
+]);
+
+export const automationCadencePlans = pgTable('automation_cadence_plans', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  ruleId: uuid('rule_id').notNull(),
+  ruleVersion: integer('rule_version').notNull(),
+  timezone: text().notNull(),
+  cadence: text().notNull(),
+  localTime: text('local_time').notNull(),
+  weekdays: jsonb().$type<number[]>(),
+  monthDay: integer('month_day'),
+  missedRunPolicy: text('missed_run_policy').notNull().default('skip'),
+  status: text().notNull().default('ACTIVE'),
+  invalidationReason: text('invalidation_reason'),
+  nextDueAt: time('next_due_at').notNull(),
+  nextSlotKey: text('next_slot_key').notNull(),
+  lastCompletedSlot: text('last_completed_slot'),
+  claimToken: uuid('claim_token'),
+  claimedAt: time('claimed_at'),
+  createdAt: time('created_at').notNull().defaultNow(),
+  updatedAt: time('updated_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  unique().on(t.tenantId, t.ruleId, t.ruleVersion),
+  foreignKey({ columns: [t.tenantId, t.appId, t.ruleId, t.ruleVersion], foreignColumns: [automationRuleVersions.tenantId, automationRuleVersions.appId, automationRuleVersions.ruleId, automationRuleVersions.version] }),
+  check('automation_cadence_plans_cadence', sql`${t.cadence} IN ('daily','weekly','monthly')`),
+  check('automation_cadence_plans_policy', sql`${t.missedRunPolicy} IN ('skip','catch_up_latest')`),
+  check('automation_cadence_plans_status', sql`${t.status} IN ('ACTIVE','INVALIDATED')`),
+]);
+
+export const automationCadenceSlots = pgTable('automation_cadence_slots', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  planId: uuid('plan_id').notNull(),
+  ruleId: uuid('rule_id').notNull(),
+  ruleVersion: integer('rule_version').notNull(),
+  slotKey: text('slot_key').notNull(),
+  localDate: text('local_date').notNull(),
+  scheduledFor: time('scheduled_for').notNull(),
+  isCatchup: boolean('is_catchup').notNull().default(false),
+  status: text().notNull().default('CLAIMED'),
+  batchId: uuid('batch_id'),
+  claimToken: uuid('claim_token'),
+  cursorRecordId: uuid('cursor_record_id'),
+  processedCount: integer('processed_count').notNull().default(0),
+  lastError: text('last_error'),
+  createdAt: time('created_at').notNull().defaultNow(),
+  completedAt: time('completed_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  unique().on(t.tenantId, t.ruleId, t.ruleVersion, t.slotKey),
+  foreignKey({ columns: [t.tenantId, t.appId, t.planId], foreignColumns: [automationCadencePlans.tenantId, automationCadencePlans.appId, automationCadencePlans.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.ruleId, t.ruleVersion], foreignColumns: [automationRuleVersions.tenantId, automationRuleVersions.appId, automationRuleVersions.ruleId, automationRuleVersions.version] }),
+  check('automation_cadence_slots_status', sql`${t.status} IN ('CLAIMED','COMPLETED','SKIPPED_NONEXISTENT_TIME','SKIPPED_MISSED','FAILED')`),
 ]);
 
 export const automationProblemChains = pgTable('automation_problem_chains', {

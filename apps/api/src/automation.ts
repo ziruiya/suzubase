@@ -3,10 +3,14 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
-  and, apps, automationAuditEvents, automationGrants, automationRuleVersions, automationRunActions, automationRuns,
+  and, apps, automationAuditEvents, automationCadencePlans, automationCadenceSlots, automationGrants, automationRuleVersions, automationRunActions, automationRuns,
   automationRules, automationProblemChains, eq, groupMembers, inArray, isNull, notifications, outbox, records, sql, tenantMembers, TenantContext, TenantTransaction, withTenantTransaction, workflowAssignments,
   type AutomationRuleConfig,
 } from '@suzubase/db';
+import {
+  enumerateSlots, isValidLocalTime, isValidTimezone, nextSlotAfter,
+  type FixedScheduleConfig, type ScheduleSlot,
+} from './automation-schedule';
 import { fieldContract, multiOptionFieldTypes, type FieldDefinition, type RecordData, type RecordResponse } from '@suzubase/shared-types';
 import Decimal from 'decimal.js';
 import { z } from 'zod';
@@ -20,7 +24,16 @@ import { WorkflowRuntimeService } from './workflow-runtime';
 import { randomUUID } from 'node:crypto';
 import { identifier, parseInput } from './validation';
 
-const eventTypes = ['record.created', 'record.updated', 'record.deleted', 'workflow.transitioned', 'workflow.rejected'] as const;
+const eventTypes = ['record.created', 'record.updated', 'record.deleted', 'workflow.transitioned', 'workflow.rejected', 'schedule.fixed'] as const;
+
+const fixedSchedule = z.strictObject({
+  cadence: z.enum(['daily', 'weekly', 'monthly']),
+  localTime: z.string(),
+  timezone: z.string().min(1).max(100),
+  weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).optional(),
+  monthDay: z.number().int().min(1).max(31).optional(),
+  missedRunPolicy: z.enum(['skip', 'catch_up_latest']).optional(),
+});
 export const AUTOMATION_TENANT_RUN_RATE_LIMIT = 100;
 export const AUTOMATION_TENANT_RUN_RATE_WINDOW_MS = 60_000;
 export const AUTOMATION_TENANT_PENDING_LIMIT = 1_000;
@@ -32,6 +45,22 @@ export const AUTOMATION_PROBLEM_CHAIN_FAILURE_LIMIT = 3;
 // not lost -- the triggering event stays unprocessed and a later pass
 // outside the window writes a fresh row.
 export const AUTOMATION_GUARDRAIL_AUDIT_WINDOW_MS = 60_000;
+
+// P3-C fixed cadence (T-3): one pass claims at most this many candidate
+// records per slot; the remainder continues from the slot checkpoint on
+// the next pass and is never discarded.
+export const AUTOMATION_SCHEDULE_BATCH_LIMIT = 1_000;
+// A claimed plan/slot whose worker died becomes resumable after this
+// lease; run idempotency keys make resumption duplicate-safe.
+export const AUTOMATION_SCHEDULE_CLAIM_LEASE_MS = 5 * 60_000;
+// A due slot processed within this window of its scheduled instant is
+// on time (the worker polls every 60s, so normal lateness is ~1 minute).
+// A slot first seen later than this is "missed": the missed-run policy
+// decides between skipping it and one controlled catch-up.
+export const AUTOMATION_SCHEDULE_ON_TIME_GRACE_MS = 15 * 60_000;
+// Due-plan backlog above this count alerts tenant admins (SYSTEM
+// notification + audit row, throttled to one alert per day per tenant).
+export const AUTOMATION_SCHEDULE_BACKLOG_ALERT_THRESHOLD = 100;
 
 // P3-C C-0 (option a): maintenanceTenants() contexts carry the nil UUID as
 // userId; that identity is not a tenant member, so audit rows written from
@@ -72,6 +101,7 @@ const config = z.strictObject({
     fromStateId: identifier.optional(),
     toStateId: identifier.optional(),
     allowManual: z.boolean().optional(),
+    schedule: fixedSchedule.optional(),
   }),
   conditions: z.strictObject({
     eventSnapshot: conditionGroup,
@@ -114,6 +144,41 @@ const config = z.strictObject({
   }
   if (trigger.eventType.startsWith('workflow.') && !trigger.toStateId) {
     ctx.addIssue({ code: 'custom', message: 'Workflow triggers require a target state' });
+  }
+  if (trigger.eventType === 'schedule.fixed') {
+    if (!trigger.schedule) {
+      ctx.addIssue({ code: 'custom', message: 'Fixed-schedule triggers require a schedule configuration' });
+    } else {
+      const schedule = trigger.schedule;
+      if (trigger.fieldId || trigger.fromStateId || trigger.toStateId ||
+        'oldValue' in trigger && trigger.oldValue !== undefined || 'newValue' in trigger && trigger.newValue !== undefined) {
+        ctx.addIssue({ code: 'custom', message: 'Fixed-schedule triggers do not take event selectors' });
+      }
+      if (!isValidLocalTime(schedule.localTime)) {
+        ctx.addIssue({ code: 'custom', message: 'Schedule localTime must be HH:MM (24-hour)' });
+      }
+      if (!isValidTimezone(schedule.timezone)) {
+        ctx.addIssue({ code: 'custom', message: 'Schedule timezone must be an IANA timezone identifier' });
+      }
+      if (schedule.cadence === 'weekly' && !schedule.weekdays?.length) {
+        ctx.addIssue({ code: 'custom', message: 'Weekly schedules require at least one weekday' });
+      }
+      if (schedule.cadence === 'weekly' && schedule.weekdays &&
+        new Set(schedule.weekdays).size !== schedule.weekdays.length) {
+        ctx.addIssue({ code: 'custom', message: 'Weekly schedule weekdays must be unique' });
+      }
+      if (schedule.cadence !== 'weekly' && schedule.weekdays) {
+        ctx.addIssue({ code: 'custom', message: 'Only weekly schedules take weekdays' });
+      }
+      if (schedule.cadence === 'monthly' && schedule.monthDay === undefined) {
+        ctx.addIssue({ code: 'custom', message: 'Monthly schedules require a month day' });
+      }
+      if (schedule.cadence !== 'monthly' && schedule.monthDay !== undefined) {
+        ctx.addIssue({ code: 'custom', message: 'Only monthly schedules take a month day' });
+      }
+    }
+  } else if (trigger.schedule) {
+    ctx.addIssue({ code: 'custom', message: 'Only fixed-schedule triggers take a schedule configuration' });
   }
   const sameIds = (left: string[], right: string[]) =>
     left.length === right.length && left.every((id) => right.includes(id));
@@ -517,6 +582,15 @@ export class AutomationService {
           readableFieldIds: input.readableFieldIds, writableFieldIds: input.writableFieldIds,
           allowedOperations: input.allowedOperations },
       });
+      // P3-C cadence: re-approving a grant for the enabled rule's current
+      // version revives its plan (it was invalidated on revoke).
+      const [ruleForPlan] = await tx.select({ enabled: automationRules.enabled, currentVersion: automationRules.currentVersion })
+        .from(automationRules).where(and(eq(automationRules.tenantId, context.tenantId),
+          eq(automationRules.appId, appId), eq(automationRules.id, ruleId)));
+      if (ruleForPlan?.enabled && ruleForPlan.currentVersion === input.version) {
+        const version = await this.readVersion(tx, context, appId, ruleId, input.version);
+        await this.refreshCadencePlan(tx, context.tenantId, appId, ruleId, version);
+      }
       return grant;
     });
   }
@@ -529,6 +603,8 @@ export class AutomationService {
           eq(automationGrants.ruleId, ruleId), eq(automationGrants.id, grantId), isNull(automationGrants.revokedAt)))
         .returning();
       if (!grant) throw new NotFoundException('Active automation grant not found');
+      // P3-C cadence: revoking the grant kills that version's plan.
+      await this.invalidateCadencePlans(tx, context.tenantId, ruleId, 'grant-revoked', { onlyVersion: grant.ruleVersion });
       await tx.insert(automationAuditEvents).values({
         tenantId: context.tenantId, appId, ruleId, ruleVersion: grant.ruleVersion,
         actorId: context.userId, action: 'GRANT_REVOKED',
@@ -609,6 +685,12 @@ export class AutomationService {
         eq(automationRuleVersions.status, 'draft'))).returning();
       await tx.update(automationRules).set({ currentVersion: input.version, enabled: false, updatedAt: sql`clock_timestamp()` })
         .where(and(eq(automationRules.tenantId, context.tenantId), eq(automationRules.appId, appId), eq(automationRules.id, ruleId)));
+      // P3-C cadence: a version change supersedes the old version's plan;
+      // the newly published version gets its own plan row (consumption is
+      // additionally gated on the rule being enabled, which publish just
+      // cleared, so nothing can fire until enable).
+      await this.invalidateCadencePlans(tx, context.tenantId, ruleId, 'version-superseded', { exceptVersion: input.version });
+      await this.refreshCadencePlan(tx, context.tenantId, appId, ruleId, published);
       await tx.insert(automationAuditEvents).values({
         tenantId: context.tenantId, appId, ruleId, ruleVersion: input.version,
         actorId: context.userId, action: 'PUBLISHED', details: { warnings: findings },
@@ -638,6 +720,14 @@ export class AutomationService {
       }
       await tx.update(automationRules).set({ enabled: input.enabled, updatedAt: sql`clock_timestamp()` })
         .where(and(eq(automationRules.tenantId, context.tenantId), eq(automationRules.appId, appId), eq(automationRules.id, ruleId)));
+      // P3-C cadence: enabling (re)creates the current version's plan;
+      // disabling invalidates it so a disabled rule can never fire.
+      if (input.enabled) {
+        const version = await this.readVersion(tx, context, appId, ruleId, rule.currentVersion);
+        await this.refreshCadencePlan(tx, context.tenantId, appId, ruleId, version);
+      } else {
+        await this.invalidateCadencePlans(tx, context.tenantId, ruleId, 'rule-disabled');
+      }
       await tx.insert(automationAuditEvents).values({
         tenantId: context.tenantId, appId, ruleId, ruleVersion: rule.currentVersion,
         actorId: context.userId, action: input.enabled ? 'ENABLED' : 'DISABLED',
@@ -654,6 +744,7 @@ export class AutomationService {
       }).where(and(eq(automationRules.tenantId, context.tenantId), eq(automationRules.appId, appId),
         eq(automationRules.id, ruleId), isNull(automationRules.archivedAt))).returning();
       if (!rule) throw new NotFoundException('Active automation rule not found');
+      await this.invalidateCadencePlans(tx, context.tenantId, ruleId, 'rule-archived');
       await tx.insert(automationAuditEvents).values({
         tenantId: context.tenantId, appId, ruleId, ruleVersion: rule.currentVersion,
         actorId: context.userId, action: 'RULE_ARCHIVED',
@@ -694,6 +785,7 @@ export class AutomationService {
         evaluateGroup(row.data, cfg.conditions.eventSnapshot, []);
       const currentMatches = evaluateGroup(row.data, cfg.conditions.currentState, []);
       const triggerMatches = cfg.trigger.eventType === 'record.created' ? true
+        : cfg.trigger.eventType === 'schedule.fixed' ? true
         : cfg.trigger.eventType === 'record.updated' && cfg.trigger.fieldId && 'newValue' in cfg.trigger
           ? !compare(valueAt(row.data, cfg.trigger.fieldId), cfg.trigger.newValue) ? false
             : 'oldValue' in cfg.trigger ? null : true
@@ -1095,6 +1187,440 @@ export class AutomationService {
     });
   }
 
+
+  // ---------------------------------------------------------------------
+  // P3-C fixed cadence (T-3): persistent plans, atomic claiming, missed
+  // policy, per-slot batched execution over the SAME action engine, run
+  // idempotency keys and guardrails as event runs. No second execution
+  // path is introduced: a schedule run differs from an event run only in
+  // its trigger identity (schedule:<slot key>[:catchup]) and batch_id.
+  // ---------------------------------------------------------------------
+
+  private scheduleConfigOf(cfg: AutomationRuleConfig): FixedScheduleConfig | null {
+    if (cfg.trigger.eventType !== 'schedule.fixed' || !cfg.trigger.schedule) return null;
+    const schedule = cfg.trigger.schedule;
+    return {
+      cadence: schedule.cadence, localTime: schedule.localTime, timezone: schedule.timezone,
+      weekdays: schedule.weekdays, monthDay: schedule.monthDay,
+      missedRunPolicy: schedule.missedRunPolicy ?? 'skip',
+    };
+  }
+
+  private async refreshCadencePlan(tx: TenantTransaction, tenantId: string, appId: string,
+    ruleId: string, version: typeof automationRuleVersions.$inferSelect, now = new Date()) {
+    const schedule = this.scheduleConfigOf(this.configOf(version));
+    if (!schedule) return null;
+    const [existing] = await tx.select().from(automationCadencePlans).where(and(
+      eq(automationCadencePlans.tenantId, tenantId), eq(automationCadencePlans.ruleId, ruleId),
+      eq(automationCadencePlans.ruleVersion, version.version)));
+    const sameConfig = existing && existing.timezone === schedule.timezone &&
+      existing.cadence === schedule.cadence && existing.localTime === schedule.localTime &&
+      JSON.stringify(existing.weekdays ?? null) === JSON.stringify(schedule.weekdays ?? null) &&
+      existing.monthDay === (schedule.monthDay ?? null) &&
+      existing.missedRunPolicy === (schedule.missedRunPolicy ?? 'skip');
+    // An active plan with the same configuration is left untouched, even
+    // when already due: recomputing next-due here would silently drop the
+    // pending slot. Refresh only creates, revives (INVALIDATED) or
+    // re-bases a plan whose configuration changed.
+    if (existing?.status === 'ACTIVE' && sameConfig) return existing;
+    const next = nextSlotAfter(schedule, now);
+    const [plan] = await tx.insert(automationCadencePlans).values({
+      tenantId, appId, ruleId, ruleVersion: version.version,
+      timezone: schedule.timezone, cadence: schedule.cadence, localTime: schedule.localTime,
+      weekdays: schedule.weekdays ?? null, monthDay: schedule.monthDay ?? null,
+      missedRunPolicy: schedule.missedRunPolicy ?? 'skip',
+      status: 'ACTIVE', invalidationReason: null,
+      nextDueAt: next.utc.toISOString(), nextSlotKey: next.slotKey, claimToken: null, claimedAt: null,
+    }).onConflictDoUpdate({
+      target: [automationCadencePlans.tenantId, automationCadencePlans.ruleId, automationCadencePlans.ruleVersion],
+      set: {
+        timezone: schedule.timezone, cadence: schedule.cadence, localTime: schedule.localTime,
+        weekdays: schedule.weekdays ?? null, monthDay: schedule.monthDay ?? null,
+        missedRunPolicy: schedule.missedRunPolicy ?? 'skip',
+        status: 'ACTIVE', invalidationReason: null,
+        nextDueAt: next.utc.toISOString(), nextSlotKey: next.slotKey, claimToken: null, claimedAt: null,
+        updatedAt: sql`clock_timestamp()`,
+      },
+    }).returning();
+    return plan;
+  }
+
+  private async invalidateCadencePlans(tx: TenantTransaction, tenantId: string, ruleId: string,
+    reason: string, scope: { exceptVersion?: number; onlyVersion?: number } = {}) {
+    await tx.update(automationCadencePlans).set({
+      status: 'INVALIDATED', invalidationReason: reason, claimToken: null, claimedAt: null,
+      updatedAt: sql`clock_timestamp()`,
+    }).where(and(
+      eq(automationCadencePlans.tenantId, tenantId), eq(automationCadencePlans.ruleId, ruleId),
+      eq(automationCadencePlans.status, 'ACTIVE'),
+      scope.onlyVersion !== undefined ? eq(automationCadencePlans.ruleVersion, scope.onlyVersion) : undefined,
+      scope.exceptVersion !== undefined ? sql`${automationCadencePlans.ruleVersion} <> ${scope.exceptVersion}` : undefined,
+    ));
+  }
+
+  // Lazily (re)create plans for enabled schedule rules whose plan is
+  // missing or invalidated while an active grant exists (defensive: the
+  // publish/enable/grant hooks normally maintain plans eagerly).
+  private async ensureCadencePlans(tx: TenantTransaction, context: TenantContext, now: Date) {
+    const candidates = await tx.select({ rule: automationRules, version: automationRuleVersions })
+      .from(automationRules).innerJoin(automationRuleVersions, and(
+        eq(automationRuleVersions.tenantId, automationRules.tenantId),
+        eq(automationRuleVersions.appId, automationRules.appId),
+        eq(automationRuleVersions.ruleId, automationRules.id),
+        eq(automationRuleVersions.version, automationRules.currentVersion),
+      )).innerJoin(automationGrants, and(
+        eq(automationGrants.tenantId, automationRules.tenantId),
+        eq(automationGrants.ruleId, automationRules.id),
+        eq(automationGrants.ruleVersion, automationRuleVersions.version),
+        isNull(automationGrants.revokedAt),
+      )).where(and(eq(automationRules.tenantId, context.tenantId),
+        eq(automationRules.enabled, true), isNull(automationRules.archivedAt),
+        eq(automationRuleVersions.status, 'published'),
+        sql`${automationRuleVersions.trigger}->>'eventType' = 'schedule.fixed'`));
+    for (const { rule, version } of candidates) {
+      const [plan] = await tx.select({ id: automationCadencePlans.id, status: automationCadencePlans.status })
+        .from(automationCadencePlans).where(and(
+          eq(automationCadencePlans.tenantId, context.tenantId),
+          eq(automationCadencePlans.ruleId, rule.id), eq(automationCadencePlans.ruleVersion, version.version)));
+      if (!plan || plan.status !== 'ACTIVE') {
+        await this.refreshCadencePlan(tx, context.tenantId, rule.appId, rule.id, version, now);
+      }
+    }
+  }
+
+  async processSchedules(context: TenantContext, options: {
+    now?: Date; batchLimit?: number; claimLeaseMs?: number;
+    onTimeGraceMs?: number; backlogAlertThreshold?: number;
+  } = {}) {
+    const now = options.now ?? new Date();
+    const batchLimit = options.batchLimit ?? AUTOMATION_SCHEDULE_BATCH_LIMIT;
+    const leaseMs = options.claimLeaseMs ?? AUTOMATION_SCHEDULE_CLAIM_LEASE_MS;
+    const graceMs = options.onTimeGraceMs ?? AUTOMATION_SCHEDULE_ON_TIME_GRACE_MS;
+    const alertThreshold = options.backlogAlertThreshold ?? AUTOMATION_SCHEDULE_BACKLOG_ALERT_THRESHOLD;
+    const totals = { backlog: 0, claimedPlans: 0, resumedSlots: 0, slotsCompleted: 0, slotsSkipped: 0, runsCreated: 0 };
+
+    // Pass 0: plan maintenance, backlog accounting and admin alerting.
+    const duePlanIds = await withTenantTransaction(context, async (tx) => {
+      await this.ensureCadencePlans(tx, context, now);
+      const due = await tx.execute(sql`
+        SELECT p.id AS id FROM automation_cadence_plans p
+        JOIN automation_rules r ON r.tenant_id = p.tenant_id AND r.id = p.rule_id
+        WHERE p.tenant_id = ${context.tenantId} AND p.status = 'ACTIVE'
+          AND p.next_due_at <= ${now.toISOString()} AND r.enabled = true AND r.archived_at IS NULL
+          AND r.current_version = p.rule_version
+        ORDER BY p.next_due_at, p.id
+      `);
+      totals.backlog = due.rows.length;
+      if (totals.backlog > alertThreshold) {
+        const recent = await tx.execute(sql`
+          SELECT 1 AS hit FROM automation_audit_events
+          WHERE tenant_id = ${context.tenantId} AND action = 'SCHEDULE_BACKLOG_ALERT'
+            AND occurred_at >= clock_timestamp() - interval '24 hours' LIMIT 1
+        `);
+        if (!recent.rows.length) {
+          const first = due.rows[0] as { id: string };
+          const [plan] = await tx.select().from(automationCadencePlans).where(and(
+            eq(automationCadencePlans.tenantId, context.tenantId), eq(automationCadencePlans.id, first.id)));
+          if (plan) {
+            await tx.insert(automationAuditEvents).values({
+              tenantId: context.tenantId, appId: plan.appId, ruleId: plan.ruleId, ruleVersion: plan.ruleVersion,
+              ...auditActor(context), action: 'SCHEDULE_BACKLOG_ALERT',
+              details: { backlog: totals.backlog, threshold: alertThreshold },
+            });
+            const admins = await tx.select({ userId: tenantMembers.userId }).from(tenantMembers).where(and(
+              eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.isAdmin, true),
+              isNull(tenantMembers.disabledAt)));
+            for (const { userId } of admins) await tx.insert(notifications).values({
+              tenantId: context.tenantId, userId, sourceType: 'SYSTEM',
+              ruleKey: 'AUTOMATION_SCHEDULE_BACKLOG',
+              title: 'Automation schedule backlog is growing',
+              body: `${totals.backlog} fixed-schedule plans are due and unprocessed (alert threshold ${alertThreshold}).`,
+              sourceEventId: plan.id, dedupKey: `automation-schedule-backlog:${context.tenantId}:${now.toISOString().slice(0, 10)}`,
+              eventType: 'AUTOMATION_SCHEDULE_BACKLOG', targetRole: 'TENANT_ADMIN',
+              payload: { backlog: totals.backlog, threshold: alertThreshold }, emailState: 'skipped',
+            }).onConflictDoNothing();
+          }
+        }
+      }
+      return (due.rows as { id: string }[]).map(({ id }) => id);
+    });
+
+    // Pass 1: resume slots left CLAIMED by a dead worker (lease expired).
+    const resumable = await withTenantTransaction(context, async (tx) => tx.execute(sql`
+      SELECT s.id AS "slotId", s.plan_id AS "planId" FROM automation_cadence_slots s
+      JOIN automation_cadence_plans p ON p.tenant_id = s.tenant_id AND p.id = s.plan_id
+      WHERE s.tenant_id = ${context.tenantId} AND s.status = 'CLAIMED' AND p.status = 'ACTIVE'
+        AND (p.claim_token IS NULL OR p.claimed_at <= ${new Date(now.getTime() - leaseMs).toISOString()})
+      ORDER BY s.created_at, s.id
+    `));
+    for (const row of resumable.rows as { slotId: string; planId: string }[]) {
+      const outcome = await this.resumeCadenceSlot(context, row.planId, row.slotId, { now, batchLimit, leaseMs });
+      if (outcome) {
+        totals.resumedSlots++;
+        totals.runsCreated += outcome.runsCreated;
+        if (outcome.done) totals.slotsCompleted++;
+      }
+    }
+
+    // Pass 2: claim and process due plans, one plan at a time.
+    for (const planId of duePlanIds) {
+      const outcome = await this.processCadencePlan(context, planId, { now, batchLimit, leaseMs, graceMs });
+      if (!outcome) continue;
+      totals.claimedPlans++;
+      totals.runsCreated += outcome.runsCreated;
+      totals.slotsCompleted += outcome.slotsCompleted;
+      totals.slotsSkipped += outcome.slotsSkipped;
+    }
+    return totals;
+  }
+
+  // Atomically claim one due plan (single conditional UPDATE: concurrent
+  // workers race on the row and exactly one wins), classify its due slots
+  // under the missed-run policy, and execute the surviving slot(s).
+  private async processCadencePlan(context: TenantContext, planId: string, options: {
+    now: Date; batchLimit: number; leaseMs: number; graceMs: number;
+  }) {
+    const { now, batchLimit, leaseMs, graceMs } = options;
+    const claimToken = randomUUID();
+    const claimed = await withTenantTransaction(context, async (tx) => {
+      const result = await tx.execute(sql`
+        UPDATE automation_cadence_plans
+        SET claim_token = ${claimToken}, claimed_at = ${now.toISOString()}, updated_at = clock_timestamp()
+        WHERE tenant_id = ${context.tenantId} AND id = ${planId} AND status = 'ACTIVE'
+          AND next_due_at <= ${now.toISOString()}
+          AND (claim_token IS NULL OR claimed_at <= ${new Date(now.getTime() - leaseMs).toISOString()})
+        RETURNING id
+      `);
+      return result.rows.length > 0;
+    });
+    if (!claimed) return null;
+
+    const prepared = await withTenantTransaction(context, async (tx) => {
+      const [plan] = await tx.select().from(automationCadencePlans).where(and(
+        eq(automationCadencePlans.tenantId, context.tenantId), eq(automationCadencePlans.id, planId)));
+      if (!plan || plan.status !== 'ACTIVE' || plan.claimToken !== claimToken) return null;
+      const [rule] = await tx.select().from(automationRules).where(and(
+        eq(automationRules.tenantId, context.tenantId), eq(automationRules.id, plan.ruleId)));
+      const version = rule?.currentVersion === plan.ruleVersion
+        ? await this.readVersion(tx, context, plan.appId, plan.ruleId, plan.ruleVersion).catch(() => null) : null;
+      const [grant] = version ? await tx.select().from(automationGrants).where(and(
+        eq(automationGrants.tenantId, context.tenantId), eq(automationGrants.ruleId, plan.ruleId),
+        eq(automationGrants.ruleVersion, plan.ruleVersion), isNull(automationGrants.revokedAt))) : [];
+      const cfg = version ? this.configOf(version) : null;
+      const schedule = cfg ? this.scheduleConfigOf(cfg) : null;
+      if (!rule?.enabled || rule.archivedAt || !version || version.status !== 'published' || !grant || !cfg || !schedule ||
+        !await this.grantCoversExecution(tx, context.tenantId, plan.appId, cfg, grant)) {
+        await this.invalidateCadencePlans(tx, context.tenantId, plan.ruleId,
+          !rule?.enabled || rule.archivedAt ? 'rule-disabled' : !grant ? 'grant-revoked' : 'version-superseded',
+          { onlyVersion: plan.ruleVersion });
+        return null;
+      }
+      const dueSlots = enumerateSlots(schedule, new Date(new Date(plan.nextDueAt).getTime() - 1000), now)
+        .filter((slot) => slot.utc >= new Date(plan.nextDueAt) || slot.slotKey === plan.nextSlotKey);
+      const fromKey = dueSlots.findIndex((slot) => slot.slotKey === plan.nextSlotKey);
+      const pending = fromKey >= 0 ? dueSlots.slice(fromKey) : dueSlots;
+      let slotsSkipped = 0;
+      const existent: ScheduleSlot[] = [];
+      for (const slot of pending) {
+        if (!slot.exists) {
+          await tx.insert(automationCadenceSlots).values({
+            tenantId: context.tenantId, appId: plan.appId, planId: plan.id, ruleId: plan.ruleId,
+            ruleVersion: plan.ruleVersion, slotKey: slot.slotKey, localDate: slot.localDate,
+            scheduledFor: slot.utc.toISOString(), status: 'SKIPPED_NONEXISTENT_TIME', completedAt: sql`clock_timestamp()`,
+          }).onConflictDoNothing();
+          slotsSkipped++;
+        } else existent.push(slot);
+      }
+      const missed = existent.filter((slot) => now.getTime() - slot.utc.getTime() > graceMs);
+      const onTime = existent.filter((slot) => now.getTime() - slot.utc.getTime() <= graceMs);
+      const policy = schedule.missedRunPolicy ?? 'skip';
+      const executions: { slot: ScheduleSlot; isCatchup: boolean }[] = [];
+      const catchupSlot = policy === 'catch_up_latest' && missed.length ? missed[missed.length - 1] : null;
+      for (const slot of missed) {
+        if (catchupSlot && slot.slotKey === catchupSlot.slotKey) {
+          executions.push({ slot, isCatchup: true });
+          continue;
+        }
+        await tx.insert(automationCadenceSlots).values({
+          tenantId: context.tenantId, appId: plan.appId, planId: plan.id, ruleId: plan.ruleId,
+          ruleVersion: plan.ruleVersion, slotKey: slot.slotKey, localDate: slot.localDate,
+          scheduledFor: slot.utc.toISOString(), status: 'SKIPPED_MISSED', completedAt: sql`clock_timestamp()`,
+        }).onConflictDoNothing();
+        slotsSkipped++;
+      }
+      for (const slot of onTime) executions.push({ slot, isCatchup: false });
+      const slotRows: (typeof automationCadenceSlots.$inferSelect)[] = [];
+      let inFlight = false;
+      for (const { slot, isCatchup } of executions) {
+        const [row] = await tx.insert(automationCadenceSlots).values({
+          tenantId: context.tenantId, appId: plan.appId, planId: plan.id, ruleId: plan.ruleId,
+          ruleVersion: plan.ruleVersion, slotKey: slot.slotKey, localDate: slot.localDate,
+          scheduledFor: slot.utc.toISOString(), isCatchup, status: 'CLAIMED', batchId: randomUUID(), claimToken,
+        }).onConflictDoNothing().returning();
+        if (row) slotRows.push(row);
+        else {
+          // A slot row already exists for this period: if it is still
+          // CLAIMED, a previous batch is in flight (batch limit or a
+          // crashed worker) -- the resume path owns it, and this pass
+          // must not advance the plan past it.
+          const [existing] = await tx.select({ status: automationCadenceSlots.status }).from(automationCadenceSlots)
+            .where(and(eq(automationCadenceSlots.tenantId, context.tenantId),
+              eq(automationCadenceSlots.ruleId, plan.ruleId),
+              eq(automationCadenceSlots.ruleVersion, plan.ruleVersion),
+              eq(automationCadenceSlots.slotKey, slot.slotKey)));
+          if (existing?.status === 'CLAIMED') inFlight = true;
+        }
+      }
+      if (!slotRows.length && inFlight) {
+        await tx.update(automationCadencePlans).set({
+          claimToken: null, claimedAt: null, updatedAt: sql`clock_timestamp()`,
+        }).where(and(eq(automationCadencePlans.tenantId, context.tenantId),
+          eq(automationCadencePlans.id, plan.id), eq(automationCadencePlans.claimToken, claimToken)));
+      }
+      if (!slotRows.length && !inFlight) {
+        const next = nextSlotAfter(schedule, now);
+        await tx.update(automationCadencePlans).set({
+          lastCompletedSlot: pending.length ? pending[pending.length - 1].slotKey : plan.lastCompletedSlot,
+          nextDueAt: next.utc.toISOString(), nextSlotKey: next.slotKey, claimToken: null, claimedAt: null,
+          updatedAt: sql`clock_timestamp()`,
+        }).where(and(eq(automationCadencePlans.tenantId, context.tenantId),
+          eq(automationCadencePlans.id, plan.id), eq(automationCadencePlans.claimToken, claimToken)));
+      }
+      return { plan, cfg, grant, schedule, slotRows, slotsSkipped };
+    });
+    if (!prepared) return { runsCreated: 0, slotsCompleted: 0, slotsSkipped: 0 };
+    let runsCreated = 0, slotsCompleted = 0;
+    for (const slotRow of prepared.slotRows) {
+      const outcome = await this.executeCadenceSlot(context, prepared.plan, slotRow, prepared.cfg, prepared.grant, batchLimit);
+      runsCreated += outcome.runsCreated;
+      if (outcome.done) slotsCompleted++;
+    }
+    return { runsCreated, slotsCompleted, slotsSkipped: prepared.slotsSkipped };
+  }
+
+  // Re-acquire a CLAIMED slot whose worker died and continue it from its
+  // checkpoint. Already-created runs are protected by their idempotency
+  // keys, so resumption never duplicates a logical run.
+  private async resumeCadenceSlot(context: TenantContext, planId: string, slotId: string, options: {
+    now: Date; batchLimit: number; leaseMs: number;
+  }) {
+    const claimToken = randomUUID();
+    const prepared = await withTenantTransaction(context, async (tx) => {
+      const result = await tx.execute(sql`
+        UPDATE automation_cadence_plans
+        SET claim_token = ${claimToken}, claimed_at = ${options.now.toISOString()}, updated_at = clock_timestamp()
+        WHERE tenant_id = ${context.tenantId} AND id = ${planId} AND status = 'ACTIVE'
+          AND (claim_token IS NULL OR claimed_at <= ${new Date(options.now.getTime() - options.leaseMs).toISOString()})
+        RETURNING id
+      `);
+      if (!result.rows.length) return null;
+      const [plan] = await tx.select().from(automationCadencePlans).where(and(
+        eq(automationCadencePlans.tenantId, context.tenantId), eq(automationCadencePlans.id, planId)));
+      const [slotRow] = await tx.select().from(automationCadenceSlots).where(and(
+        eq(automationCadenceSlots.tenantId, context.tenantId), eq(automationCadenceSlots.id, slotId),
+        eq(automationCadenceSlots.status, 'CLAIMED')));
+      if (!plan || !slotRow) return null;
+      await tx.update(automationCadenceSlots).set({ claimToken }).where(and(
+        eq(automationCadenceSlots.tenantId, context.tenantId), eq(automationCadenceSlots.id, slotId)));
+      const version = await this.readVersion(tx, context, plan.appId, plan.ruleId, plan.ruleVersion).catch(() => null);
+      const [grant] = version ? await tx.select().from(automationGrants).where(and(
+        eq(automationGrants.tenantId, context.tenantId), eq(automationGrants.ruleId, plan.ruleId),
+        eq(automationGrants.ruleVersion, plan.ruleVersion), isNull(automationGrants.revokedAt))) : [];
+      if (!version || !grant) return null;
+      const cfg = this.configOf(version);
+      if (!await this.grantCoversExecution(tx, context.tenantId, plan.appId, cfg, grant)) return null;
+      return { plan, slotRow: { ...slotRow, claimToken }, cfg, grant };
+    });
+    if (!prepared) return null;
+    return this.executeCadenceSlot(context, prepared.plan, prepared.slotRow, prepared.cfg, prepared.grant, options.batchLimit);
+  }
+
+  // Execute one claimed slot: scan candidate records in stable id order,
+  // filter by the rule conditions, and create + execute one run per
+  // matching record through the shared action engine. At most batchLimit
+  // candidates are examined per call; the slot checkpoint (cursor +
+  // processed count) is persisted per record, in the same transaction as
+  // that record's run, so a crash loses at most the in-flight record and
+  // resumption continues exactly where the checkpoint stopped.
+  private async executeCadenceSlot(context: TenantContext, plan: typeof automationCadencePlans.$inferSelect,
+    slotRow: typeof automationCadenceSlots.$inferSelect, cfg: AutomationRuleConfig,
+    grant: typeof automationGrants.$inferSelect, batchLimit: number) {
+    let cursor = slotRow.cursorRecordId;
+    let processed = slotRow.processedCount;
+    let runsCreated = 0;
+    const candidates = await withTenantTransaction(context, async (tx) => tx.select().from(records).where(and(
+      eq(records.tenantId, context.tenantId), eq(records.appId, plan.appId), isNull(records.deletedAt),
+      cursor ? sql`${records.id} > ${cursor}` : undefined,
+    )).orderBy(records.id).limit(batchLimit));
+    for (const candidate of candidates) {
+      const matches = evaluateGroup(candidate.data, cfg.conditions.eventSnapshot, []) &&
+        evaluateGroup(candidate.data, cfg.conditions.currentState, []);
+      await withTenantTransaction(context, async (tx) => {
+        if (matches) {
+          const identity = `${plan.appId}:schedule:${plan.ruleId}:${plan.ruleVersion}:${slotRow.slotKey}:${candidate.id}`;
+          const runId = randomUUID();
+          const [run] = await tx.insert(automationRuns).values({
+            id: runId, tenantId: context.tenantId, appId: plan.appId, ruleId: plan.ruleId,
+            ruleVersion: plan.ruleVersion, eventId: null,
+            triggerIdentity: `schedule:${slotRow.slotKey}${slotRow.isCatchup ? ':catchup' : ''}`,
+            idempotencyKey: identity, recordId: candidate.id, batchId: slotRow.batchId,
+            rootCausationId: slotRow.batchId ?? runId, parentRunId: null, causationDepth: 1,
+            originRuleId: plan.ruleId, originActionId: null, status: 'RUNNING',
+          }).onConflictDoNothing().returning();
+          if (run) {
+            runsCreated++;
+            const actionRows: { action: AutomationRuleConfig['actions'][number];
+              row: { actionId: string; idempotencyKey: string } }[] = [];
+            for (const [position, action] of cfg.actions.entries()) {
+              const [row] = await tx.insert(automationRunActions).values({
+                tenantId: context.tenantId, appId: plan.appId, runId: run.id, actionId: action.actionId,
+                position, status: 'PENDING', idempotencyKey: `${identity}:${action.actionId}`,
+              }).onConflictDoNothing().returning();
+              if (row) actionRows.push({ action, row: { actionId: row.actionId, idempotencyKey: row.idempotencyKey } });
+            }
+            await this.executeActions(tx, { tenantId: context.tenantId, userId: grant.approvedBy }, {
+              runId: run.id, appId: plan.appId, ruleId: plan.ruleId,
+              rootCausationId: run.rootCausationId, causationDepth: run.causationDepth,
+              cfg, record: serializeRecord(candidate), eventId: null, actionRows,
+              readableFieldIds: grant.readableFieldIds,
+            });
+          }
+        }
+        processed++;
+        cursor = candidate.id;
+        await tx.update(automationCadenceSlots).set({
+          cursorRecordId: candidate.id, processedCount: processed,
+        }).where(and(eq(automationCadenceSlots.tenantId, context.tenantId),
+          eq(automationCadenceSlots.id, slotRow.id), eq(automationCadenceSlots.status, 'CLAIMED')));
+      });
+    }
+    let done = candidates.length < batchLimit;
+    if (!done) {
+      const remaining = await withTenantTransaction(context, async (tx) => tx.select({ id: records.id }).from(records)
+        .where(and(eq(records.tenantId, context.tenantId), eq(records.appId, plan.appId),
+          isNull(records.deletedAt), sql`${records.id} > ${cursor}`)).limit(1));
+      done = remaining.length === 0;
+    }
+    if (done) {
+      const schedule = this.scheduleConfigOf(cfg);
+      await withTenantTransaction(context, async (tx) => {
+        await tx.update(automationCadenceSlots).set({
+          status: 'COMPLETED', completedAt: sql`clock_timestamp()`,
+        }).where(and(eq(automationCadenceSlots.tenantId, context.tenantId),
+          eq(automationCadenceSlots.id, slotRow.id), eq(automationCadenceSlots.status, 'CLAIMED')));
+        if (schedule) {
+          const next = nextSlotAfter(schedule, new Date(slotRow.scheduledFor));
+          await tx.update(automationCadencePlans).set({
+            lastCompletedSlot: slotRow.slotKey, nextDueAt: next.utc.toISOString(), nextSlotKey: next.slotKey,
+            claimToken: null, claimedAt: null, updatedAt: sql`clock_timestamp()`,
+          }).where(and(eq(automationCadencePlans.tenantId, context.tenantId),
+            eq(automationCadencePlans.id, plan.id), eq(automationCadencePlans.status, 'ACTIVE'),
+            sql`(${automationCadencePlans.claimToken} = ${slotRow.claimToken} OR ${automationCadencePlans.claimToken} IS NULL OR ${automationCadencePlans.nextSlotKey} = ${slotRow.slotKey})`));
+        }
+      });
+    }
+    return { runsCreated, done };
+  }
 
   // ---------------------------------------------------------------------
   // P3-B action execution engine. Actions run sequentially inside the
@@ -1564,7 +2090,18 @@ export class AutomationService {
       const [{ unprocessedEvents }] = await tx.select({ unprocessedEvents: sql<number>`count(*)::int` })
         .from(outbox).where(and(eq(outbox.tenantId, context.tenantId), eq(outbox.appId, appId),
           isNull(outbox.automationProcessedAt)));
-      return { rules: summaries, backlog, unprocessedEvents };
+      // P3-C cadence: schedule backlog is part of the same E-6 summary --
+      // active plans whose next due instant has passed, plus slots still
+      // claimed (in flight or awaiting crash recovery).
+      const [{ scheduleBacklog }] = await tx.select({ scheduleBacklog: sql<number>`count(*)::int` })
+        .from(automationCadencePlans).where(and(
+          eq(automationCadencePlans.tenantId, context.tenantId), eq(automationCadencePlans.appId, appId),
+          eq(automationCadencePlans.status, 'ACTIVE'), sql`${automationCadencePlans.nextDueAt} <= clock_timestamp()`));
+      const [{ scheduleInFlight }] = await tx.select({ scheduleInFlight: sql<number>`count(*)::int` })
+        .from(automationCadenceSlots).where(and(
+          eq(automationCadenceSlots.tenantId, context.tenantId), eq(automationCadenceSlots.appId, appId),
+          eq(automationCadenceSlots.status, 'CLAIMED')));
+      return { rules: summaries, backlog, unprocessedEvents, scheduleBacklog, scheduleInFlight };
     });
   }
 
@@ -1742,6 +2279,39 @@ export class AutomationService {
       } catch {
         findings.push({ code: 'TARGET_APP_UNAVAILABLE', severity: 'BLOCKING', targetAppId: action.targetAppId });
       }
+    }
+    // P3-C cadence: schedule configuration is re-validated at preflight
+    // time (not only by the write-path schema), so a version stored
+    // through any path cannot publish an illegal cadence, local time or
+    // timezone.
+    if (cfg.trigger.eventType === 'schedule.fixed') {
+      const schedule = cfg.trigger.schedule;
+      if (!schedule) findings.push({ code: 'SCHEDULE_CONFIG_MISSING', severity: 'BLOCKING' });
+      else {
+        if (!['daily', 'weekly', 'monthly'].includes(schedule.cadence)) {
+          findings.push({ code: 'SCHEDULE_CADENCE_INVALID', severity: 'BLOCKING' });
+        }
+        if (!isValidLocalTime(schedule.localTime ?? '')) {
+          findings.push({ code: 'SCHEDULE_LOCAL_TIME_INVALID', severity: 'BLOCKING' });
+        }
+        if (!isValidTimezone(schedule.timezone ?? '')) {
+          findings.push({ code: 'SCHEDULE_TIMEZONE_INVALID', severity: 'BLOCKING' });
+        }
+        if (schedule.cadence === 'weekly' &&
+          (!schedule.weekdays?.length || schedule.weekdays.some((day) => !Number.isInteger(day) || day < 0 || day > 6) ||
+            new Set(schedule.weekdays).size !== schedule.weekdays.length)) {
+          findings.push({ code: 'SCHEDULE_WEEKDAYS_INVALID', severity: 'BLOCKING' });
+        }
+        if (schedule.cadence === 'monthly' &&
+          (schedule.monthDay === undefined || !Number.isInteger(schedule.monthDay) || schedule.monthDay < 1 || schedule.monthDay > 31)) {
+          findings.push({ code: 'SCHEDULE_MONTH_DAY_INVALID', severity: 'BLOCKING' });
+        }
+        if (schedule.missedRunPolicy !== undefined && !['skip', 'catch_up_latest'].includes(schedule.missedRunPolicy)) {
+          findings.push({ code: 'SCHEDULE_MISSED_POLICY_INVALID', severity: 'BLOCKING' });
+        }
+      }
+    } else if (cfg.trigger.schedule) {
+      findings.push({ code: 'SCHEDULE_CONFIG_UNEXPECTED', severity: 'BLOCKING' });
     }
     const [grant] = await tx.select().from(automationGrants).where(and(
       eq(automationGrants.tenantId, context.tenantId), eq(automationGrants.ruleId, version.ruleId),
