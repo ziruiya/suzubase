@@ -89,7 +89,12 @@ const data = z.record(text, text).describe('Values keyed by field UUID. Numeric 
 const record = z.object({
   id, appId: id, recordNo, data, schemaVersion: integer, revision: integer, status: text,
   createdBy: id, createdAt: timestamp, updatedBy: id, updatedAt: timestamp,
-  categoryIds: z.array(id).optional(),
+  categoryIds: z.array(id).optional().describe(
+    'Category node ids assigned to this record. Optional compatibility property: ' +
+    'ABSENCE means this response did not provide the property (legacy shape for apps ' +
+    'that never used categories) and is NOT proof that the record has no category ' +
+    'assignments; an empty array is an explicit empty assignment set. Never use the ' +
+    'presence or absence of this property as an authorization signal.'),
 });
 const revisionConflict = z.looseObject({ code: z.literal('REVISION_CONFLICT'), message: text, current: record });
 const recordForm = z.object({

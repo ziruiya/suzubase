@@ -35,6 +35,17 @@ export interface FieldCompatibility {
   resolvedOptions?: { value: string; label: string; disabled: boolean }[];
   /** P4-T3a: source choice value -> target option identifier. */
   optionValueMap?: Record<string, string>;
+  /** P4 fix batch (task 5): set to 'IDENTIFIER_TRANSLATED' when the
+   * field's option identifiers were re-issued (optionValueMap present).
+   * Marks, in the compatibility report, that the field is EQUIVALENT
+   * under an identifier translation: labels and selection meaning are
+   * preserved, but external API raw values are not byte-faithful. */
+  translation?: 'IDENTIFIER_TRANSLATED';
+  /** P4 fix batch (task 5): the source field default translated through
+   * the same option map (identity when no translation was needed). The
+   * target field model has no default-value mechanism, so the translated
+   * default is carried as package/report evidence, never dropped. */
+  resolvedDefaultValue?: string | string[];
   /** P4-T3a: verified lookup structure (six-item check) for packaging. */
   lookupResolution?: KintoneLookupResolution;
   /** P4-T3a: category disposition decided at extraction time. */
@@ -240,40 +251,140 @@ export const KINTONE_IDENTITY_TYPES = [
  * (frequently Japanese) that the target cannot use as option identifiers.
  * When every value is already a safe identifier the field needs no
  * translation; otherwise ALL values are deterministically re-issued as
- * `opt_<kintone index>` (indices are unique per field, so this cannot
- * collide) while labels keep the original text and index order. Record
- * values are translated through the same map at package build time, so the
- * migration is lossless: identifier changes are internal, labels and the
- * selected values' meaning are preserved verbatim.
+ * `opt_<kintone index>` while labels keep the original text and index
+ * order. Record values are translated through the same map at package
+ * build time, and the source field default is translated through the
+ * same map at resolution time, so every supported reference point
+ * (record values, subtable row values, field default) follows the one
+ * map recorded on the compatibility item.
+ *
+ * P4 fix batch (GPT T3a review, task 5) — identifier uniqueness
+ * hardening. The pre-hardening code defaulted a missing object-form
+ * index to 0 and never validated the issued identifiers, so two options
+ * could silently receive the same `opt_<index>` (and a duplicate source
+ * value silently overwrote its map entry). Resolution now FAILS CLOSED
+ * (a `{ problem }` result: the caller keeps the field UNRESOLVED and
+ * records a gate problem, which blocks packaging) when:
+ * - an object-form option is missing its index, or any explicit index
+ *   is not a non-negative integer (kintone serializes indices as
+ *   numeric strings; an empty string is missing, not zero);
+ * - two options resolve to the same index (array-form options without
+ *   an explicit index take their array position, which the uniqueness
+ *   check then covers like any other index);
+ * - a source option value appears twice, or the issued target
+ *   identifiers are not unique within the field;
+ * - the field default references a value outside the option set.
+ * The full source -> target map is returned for every translated field
+ * and lands in the package compatibility report via the item's
+ * `optionValueMap`; the item is additionally marked
+ * `translation: 'IDENTIFIER_TRANSLATED'` because external API raw
+ * values are NOT byte-faithful after translation (labels are).
  */
-export function resolveChoiceOptions(source: any): {
+export type ChoiceOptionsResolution = {
   resolvedOptions: { value: string; label: string; disabled: boolean }[];
   optionValueMap?: Record<string, string>;
-} | null {
+  resolvedDefaultValue?: string | string[];
+} | { problem: string };
+
+function parseOptionIndex(raw: unknown): number | null {
+  if (typeof raw === 'number') {
+    return Number.isInteger(raw) && raw >= 0 ? raw : null;
+  }
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const parsed = Number(raw);
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+  }
+  return null;
+}
+
+export function resolveChoiceOptions(source: any): ChoiceOptionsResolution | null {
   const raw = source?.options;
   if (!raw || typeof raw !== 'object') return null;
-  const entries = (Array.isArray(raw)
-    ? raw.map((option: any, index: number) => ({
-      value: String(option.value), label: String(option.label ?? option.value),
-      index: Number.isFinite(Number(option.index)) ? Number(option.index) : index,
-    }))
-    : Object.entries(raw).map(([value, option]: [string, any]) => ({
-      value, label: String(option?.label ?? value),
-      index: Number.isFinite(Number(option?.index)) ? Number(option.index) : 0,
-    }))).sort((a, b) => a.index - b.index);
-  if (!entries.length) return null;
-  if (entries.every(({ value }) => SAFE_OPTION_VALUE.test(value))) {
-    return {
-      resolvedOptions: entries.map(({ value, label }) => ({ value, label, disabled: false })),
-    };
+  const fail = (problem: string): ChoiceOptionsResolution => ({ problem });
+  const entries: { value: string; label: string; index: number }[] = [];
+  if (Array.isArray(raw)) {
+    for (const [position, option] of raw.entries()) {
+      const value = String((option as any)?.value);
+      if ((option as any)?.index === undefined || (option as any)?.index === null) {
+        entries.push({ value, label: String((option as any)?.label ?? value), index: position });
+        continue;
+      }
+      const index = parseOptionIndex((option as any).index);
+      if (index === null) {
+        return fail(`option "${value}" carries an invalid index ${JSON.stringify((option as any).index)}; ` +
+          'option indices must be non-negative integers');
+      }
+      entries.push({ value, label: String((option as any)?.label ?? value), index });
+    }
+  } else {
+    for (const [value, option] of Object.entries(raw) as [string, any][]) {
+      if (option?.index === undefined || option?.index === null) {
+        return fail(`option "${value}" is missing its kintone index; ` +
+          'an index is required to issue a unique target option identifier');
+      }
+      const index = parseOptionIndex(option.index);
+      if (index === null) {
+        return fail(`option "${value}" carries an invalid index ${JSON.stringify(option.index)}; ` +
+          'option indices must be non-negative integers');
+      }
+      entries.push({ value, label: String(option?.label ?? value), index });
+    }
   }
+  if (!entries.length) return null;
+  const seenValues = new Set<string>();
+  for (const { value } of entries) {
+    if (seenValues.has(value)) {
+      return fail(`source option value "${value}" appears more than once; ` +
+        'option values must be unique within a field to map losslessly');
+    }
+    seenValues.add(value);
+  }
+  const seenIndices = new Set<number>();
+  for (const { index } of entries) {
+    if (seenIndices.has(index)) {
+      return fail(`kintone option index ${index} is assigned to more than one option; ` +
+        'indices must be unique within a field to issue unique target identifiers');
+    }
+    seenIndices.add(index);
+  }
+  entries.sort((a, b) => a.index - b.index);
+  const needsTranslation = !entries.every(({ value }) => SAFE_OPTION_VALUE.test(value));
   const optionValueMap: Record<string, string> = {};
   const resolvedOptions = entries.map(({ value, label, index }) => {
-    const mapped = `opt_${index}`;
-    optionValueMap[value] = mapped;
+    const mapped = needsTranslation ? `opt_${index}` : value;
+    if (needsTranslation) optionValueMap[value] = mapped;
     return { value: mapped, label, disabled: false };
   });
-  return { resolvedOptions, optionValueMap };
+  const targetValues = resolvedOptions.map(({ value }) => value);
+  if (new Set(targetValues).size !== targetValues.length) {
+    return fail('issued target option identifiers are not unique within the field');
+  }
+  if (needsTranslation && Object.keys(optionValueMap).length !== entries.length) {
+    return fail('source -> target option map does not cover every option');
+  }
+  // The field default is a reference point of the same identifiers: it
+  // must name a member of the option set and is translated through the
+  // same map. The target field model has no default-value mechanism, so
+  // the translated default is carried on the compatibility item (and
+  // into the package report) as evidence instead of being dropped.
+  const rawDefault = source?.defaultValue;
+  let resolvedDefaultValue: string | string[] | undefined;
+  if (rawDefault !== undefined && rawDefault !== null && rawDefault !== '') {
+    const defaults = (Array.isArray(rawDefault) ? rawDefault : [rawDefault]).map(String);
+    for (const value of defaults) {
+      if (!seenValues.has(value)) {
+        return fail(`field default "${value}" is not a member of the option set; ` +
+          'a default outside the option set cannot be translated faithfully');
+      }
+    }
+    const translated = defaults.map((value) => (needsTranslation ? optionValueMap[value] : value));
+    resolvedDefaultValue = Array.isArray(rawDefault) ? translated : translated[0];
+  }
+  return {
+    resolvedOptions,
+    ...(needsTranslation ? { optionValueMap } : {}),
+    ...(resolvedDefaultValue !== undefined ? { resolvedDefaultValue } : {}),
+  };
 }
 
 function identityEntriesOf(value: unknown): { code: string; name: string | null }[] | null {
@@ -323,11 +434,32 @@ export function resolveExtractionCompatibility(
     if (item.status !== 'UNRESOLVED') return item.status === 'EQUIVALENT';
     const resolved = resolveChoiceOptions(item.sourceConfig);
     if (!resolved) return false;
+    if ('problem' in resolved) {
+      // Fail closed: the field stays UNRESOLVED (which alone blocks
+      // packaging) and the specific defect is recorded as a gate
+      // problem so the block is explicit in the extraction report.
+      item.reason = `Choice option identifiers cannot be issued safely: ${resolved.problem}`;
+      context.gateProblems.push(
+        `CHOICE_OPTION_IDENTITY: field ${item.sourceFieldCode}: ${resolved.problem}`);
+      return false;
+    }
     item.status = 'EQUIVALENT';
     item.resolvedOptions = resolved.resolvedOptions;
-    if (resolved.optionValueMap) item.optionValueMap = resolved.optionValueMap;
-    item.reason = 'Choice values are carried with deterministic target option identifiers; ' +
-      'original labels and index order are preserved and record values are translated through the same map';
+    if (resolved.optionValueMap) {
+      item.optionValueMap = resolved.optionValueMap;
+      item.translation = 'IDENTIFIER_TRANSLATED';
+    }
+    if (resolved.resolvedDefaultValue !== undefined) {
+      item.resolvedDefaultValue = resolved.resolvedDefaultValue;
+    }
+    item.reason = resolved.optionValueMap
+      ? 'Choice values are carried with deterministic target option identifiers ' +
+        '(IDENTIFIER_TRANSLATED); original labels and index order are preserved, the full ' +
+        'source -> target map is recorded on this item, and record values plus the field ' +
+        'default are translated through the same map. External API raw values are not ' +
+        'byte-faithful after translation; labels are preserved verbatim'
+      : 'Choice values are already safe target option identifiers and are carried verbatim; ' +
+        'the field default was verified against the option set';
     void values;
     return true;
   };

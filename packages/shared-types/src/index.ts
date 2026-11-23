@@ -14,7 +14,15 @@ export interface RecordResponse {
   createdAt: string;
   updatedBy: string;
   updatedAt: string;
-  /** P4-T1: category node ids assigned to this record (empty when none). */
+  /** P4-T1: category node ids assigned to this record.
+   * P4 fix batch (C2) semantic lock: this is an OPTIONAL compatibility
+   * property. It is present when the app's categories are enabled or the
+   * record carries assignments; it is omitted for apps that never used
+   * categories. Absence therefore means "this response did not provide
+   * the property" — it is NOT proof that the record has no category
+   * assignments. An empty array is the explicit empty assignment set.
+   * Never use the presence or absence of this property for
+   * authorization decisions. */
   categoryIds?: string[];
   /** Present only for migration-restored records (contracts 4 SS4.5.3). */
   migration?: {

@@ -332,6 +332,10 @@ export class RecordService {
     // P4-T1: categoryIds is an additive response key — present when the
     // app's categories are enabled or the record carries assignments, so
     // applications that never use categories keep the legacy shape.
+    // P4 fix batch (C2) semantic lock: absence means "not provided by
+    // this compatibility response", never proof of an empty assignment
+    // set ([] is the explicit empty set), and the property must never
+    // be used as an authorization signal.
     const assignedIds = (await recordCategoryIds(tx, context, appId, [record.id])).get(record.id);
     const categoriesEnabled = (await this.appSchema.getVersion(tx, context, appId, app.publishedSchemaVersion))
       .categoryConfiguration.enabled;

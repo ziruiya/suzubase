@@ -262,11 +262,26 @@ export class CsvService {
           if (csv.length > 10001) throw new BadRequestException('Flattened export exceeds 10,000 rows');
         }
       }
+      // P4 fix batch (C3): the bundle collects attachment ids from BOTH
+      // record-level attachment fields and subtable-row attachment cells,
+      // matching the M1 package caliber (record-level + subtable-level in
+      // full). Subtable cells are addressed through the table fields in
+      // scope (already field-view filtered by query.scope); every file is
+      // then read through FileService.readAuthorized, which applies the
+      // same three-layer authorization to subtable files via their table
+      // field, so an unauthorized file id can never leak into the zip.
+      const topLevelAttachmentIds = rows.flatMap(({ data }) => selected
+        .filter(({ type }) => type === 'attachment').flatMap(({ fieldId }) => JSON.parse(data[fieldId] || '[]') as string[]));
+      const tableAttachmentIds = tableRows.flatMap((tableRow) => {
+        const table = tableById.get(tableRow.fieldId);
+        if (!table) return [];
+        return table.table.fields.filter(({ type }) => type === 'attachment')
+          .flatMap(({ fieldId: childId }) => JSON.parse(tableRow.data[childId] || '[]') as string[]);
+      });
       return {
         csv, snapshots, hasTables,
         richText: selected.some(({ type }) => type === 'richText'),
-        attachmentIds: bundle ? [...new Set(rows.flatMap(({ data }) => selected
-          .filter(({ type }) => type === 'attachment').flatMap(({ fieldId }) => JSON.parse(data[fieldId] || '[]') as string[])))] : [],
+        attachmentIds: bundle ? [...new Set([...topLevelAttachmentIds, ...tableAttachmentIds])] : [],
       };
     }).catch((error) => {
       if (postgresErrorCode(error) === '57014') throw new ServiceUnavailableException('Export timed out. Narrow the filters and retry.');

@@ -43,6 +43,27 @@
 // event-less RECORD notifications (manual runs) can be reconciled back to
 // exactly one automation_run_actions row; check 3c enforces that linkage
 // and per-run duplicate-freedom for the automation population.
+// Population note (P4-T3b, frozen wording in p4-t0-closeout.md #7):
+// check 1 samples are STRATIFIED by population. A record belongs to the
+// staged population when its application is the target of an import job
+// that has not reached ACTIVATED; staged records carry zero
+// record_events BY DESIGN (no events are ever forged for them), so
+// sampling them into check 1 produced false failures. 定版原因口径：
+// 历次失败全因命中 staged、从未观测正式人口失败 (every historical
+// check-1 failure was traced to sampled staged-population records; no
+// formal-population record has ever been observed failing check 1 —
+// the scope of that sentence is exactly this observation history).
+// Check 1 therefore samples ONLY the formal population (activated /
+// everyday records), n = --sample (CI caliber 20), with a FIXED seed
+// (setseed, constant below) and the actually-sampled record ids written
+// into the JSON report, because a seed alone does not guarantee the
+// same sample across database environments. The staged population is
+// covered instead by check 2 (provenance of import_job_id events),
+// check 3a (zero import-period outbox rows) and job-level count
+// reconciliation in the import report. The zero-false-positive
+// guarantee of the stratified check 1 is scoped strictly to
+// (formal population x fixed-seed n=20 sample); it is not a census of
+// the formal population and says nothing about the staged population.
 // Exit code is non-zero when any check fails. Output is JSON.
 import { createRequire } from 'node:module';
 
@@ -62,16 +83,35 @@ const where = scope.length ? `WHERE ${scope.join(' AND ')}` : '';
 
 const client = new Client({ connectionString: process.env.ADMIN_DATABASE_URL });
 await client.connect();
-const report = { sampleSize, checks: [], failures: 0 };
-const record = (name, ok, detail) => {
-  report.checks.push({ name, ok, detail });
+// P4-T3b: fixed sampling seed (frozen constant; changing it is a T3b
+// decision that must be recorded in the audit report). Applied before
+// any random() sampling so every run over the same database state
+// draws the same samples; the sampled record ids are still recorded
+// verbatim in the report (see check 1), since a seed alone cannot
+// guarantee the identical sample across database environments.
+const SAMPLE_SEED = 0.20261123;
+await client.query('SELECT setseed($1)', [SAMPLE_SEED]);
+const report = { sampleSize, sampleSeed: SAMPLE_SEED, checks: [], failures: 0 };
+const record = (name, ok, detail, extra = {}) => {
+  report.checks.push({ name, ok, detail, ...extra });
   if (!ok) report.failures++;
   console.log(`${ok ? 'PASS' : 'FAIL'} ${name}: ${detail}`);
 };
 try {
-  // 1. Random records: history events vs revision.
+  // 1. Formal-population records: history events vs revision.
+  // P4-T3b stratification: records whose application is the target of
+  // an import job that has not reached ACTIVATED form the staged
+  // population and are EXCLUDED here (zero events by design; covered
+  // by checks 2/3a and job-level reconciliation). The exclusion count
+  // is reported so the stratification is auditable, and the sampled
+  // record ids are written into the report for reproducibility.
+  const stagedScope = `EXISTS (SELECT 1 FROM import_jobs j
+    WHERE j.tenant_id = records.tenant_id AND j.target_app_id = records.app_id
+      AND j.status <> 'activated')`;
+  const stagedExcluded = (await client.query(
+    `SELECT count(*)::int AS n FROM records ${where} ${where ? 'AND' : 'WHERE'} ${stagedScope}`, params)).rows[0].n;
   const records = (await client.query(
-    `SELECT tenant_id, app_id, id, revision FROM records ${where} ORDER BY random() LIMIT ${sampleSize}`, params)).rows;
+    `SELECT tenant_id, app_id, id, revision FROM records ${where} ${where ? 'AND' : 'WHERE'} NOT ${stagedScope} ORDER BY random() LIMIT ${sampleSize}`, params)).rows;
   let historyProblems = 0;
   for (const row of records) {
     const events = (await client.query(
@@ -91,7 +131,10 @@ try {
     if (distinct.size < 1) historyProblems++;
   }
   record('history-vs-revision sample', historyProblems === 0,
-    `${records.length} records sampled, ${historyProblems} problem records`);
+    `${records.length} formal-population records sampled (seed ${SAMPLE_SEED}), ${historyProblems} problem records; ` +
+    `${stagedExcluded} staged-population records excluded from check 1 by stratification ` +
+    '(历次失败全因命中 staged、从未观测正式人口失败; zero-false-positive scope: formal population x fixed-seed sample only)',
+    { population: 'formal', stagedExcluded, sampledRecordIds: records.map(({ id }) => id) });
 
   // 2. Migrated provenance: four elements on package-import events
   // (import_job_id IS NOT NULL selects the import population; see header).
