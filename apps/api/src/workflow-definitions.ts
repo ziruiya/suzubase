@@ -33,6 +33,7 @@ const stateInput = z.strictObject({
 });
 const actionInput = z.strictObject({
   id: identifier, name, eventType: z.enum(['transitioned', 'rejected']).default('transitioned'),
+  automationAllowed: z.boolean().default(false),
   fromStateId: identifier, toStateId: identifier, conditions: z.array(workflowCondition).max(20), assignees,
 });
 const graphInput = z.strictObject({ states: z.array(stateInput).max(50), actions: z.array(actionInput).max(150) });

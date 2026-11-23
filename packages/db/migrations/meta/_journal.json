@@ -288,6 +288,13 @@
       "when": 1795396505000,
       "tag": "0040_p3b_runtime_guardrails",
       "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1795396506000,
+      "tag": "0041_p3b_action_execution",
+      "breakpoints": true
     }
   ]
 }

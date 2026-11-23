@@ -242,6 +242,7 @@ export const workflowActions = pgTable('workflow_actions', {
   eventType: text('event_type').$type<'transitioned' | 'rejected'>().notNull().default('transitioned'),
   fromStateId: uuid('from_state_id').notNull(),
   toStateId: uuid('to_state_id').notNull(),
+  automationAllowed: boolean('automation_allowed').notNull().default(false),
   conditions: jsonb('condition_expr').$type<WorkflowCondition[]>().notNull(),
   assignees: jsonb('assignee_rule').$type<AssigneeSource[]>().notNull(),
 }, (t) => [
@@ -450,6 +451,9 @@ export const workflowEvents = pgTable('workflow_events', {
   fromStateId: uuid('from_state_id'),
   toStateId: uuid('to_state_id').notNull(),
   reason: text(),
+  actorType: text('actor_type').$type<'USER' | 'AUTOMATION'>().notNull().default('USER'),
+  ruleId: uuid('rule_id'),
+  runId: uuid('run_id'),
   assigneeIds: jsonb('assignee_ids').$type<string[]>().notNull(),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.eventId] }),
@@ -508,6 +512,7 @@ export type AutomationRuleConfig = {
     newValue?: unknown;
     fromStateId?: string;
     toStateId?: string;
+    allowManual?: boolean;
   };
   conditions: {
     eventSnapshot: { operator: 'and' | 'or'; groups: { conditions: {
@@ -517,7 +522,16 @@ export type AutomationRuleConfig = {
       fieldId: string; operator: AutomationConditionOperator; value?: unknown;
     }[] }[] };
   };
-  actions: { actionId: string; type: string; targetAppId?: string; targetFieldIds?: string[] }[];
+  actions: {
+    actionId: string; type: string; targetAppId?: string; targetFieldIds?: string[];
+    notify?: {
+      recipientUserIds?: string[]; recipientGroupIds?: string[]; recipientFieldId?: string;
+      recipientAssignee?: boolean; title?: string; body?: string;
+    };
+    updates?: { fieldId: string; mode: 'set' | 'increment' | 'decrement' | 'clear' | 'copy'; value?: unknown; sourceFieldId?: string }[];
+    mappings?: { targetFieldId: string; mode: 'constant' | 'source'; value?: unknown; sourceFieldId?: string }[];
+    workflowActionId?: string;
+  }[];
 };
 
 export const automationRules = pgTable('automation_rules', {
@@ -593,7 +607,7 @@ export const automationRuns = pgTable('automation_runs', {
   id: uuid().notNull().defaultRandom(),
   ruleId: uuid('rule_id').notNull(),
   ruleVersion: integer('rule_version').notNull(),
-  eventId: uuid('event_id').notNull(),
+  eventId: uuid('event_id'),
   triggerIdentity: text('trigger_identity').notNull(),
   idempotencyKey: text('idempotency_key').notNull(),
   recordId: uuid('record_id').notNull(),

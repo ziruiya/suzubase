@@ -24,6 +24,7 @@ export interface WorkflowAction {
   id: string;
   name: string;
   eventType?: 'transitioned' | 'rejected';
+  automationAllowed?: boolean;
   fromStateId: string;
   toStateId: string;
   conditions: WorkflowCondition[];

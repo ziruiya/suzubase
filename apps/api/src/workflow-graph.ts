@@ -9,6 +9,7 @@ const selectState = {
 };
 const selectAction = {
   id: workflowActions.id, name: workflowActions.name, eventType: workflowActions.eventType,
+  automationAllowed: workflowActions.automationAllowed,
   fromStateId: workflowActions.fromStateId,
   toStateId: workflowActions.toStateId, conditions: workflowActions.conditions, assignees: workflowActions.assignees,
 };
