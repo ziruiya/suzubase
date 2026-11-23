@@ -980,3 +980,57 @@ verification stack, workspace build and typecheck clean, hosted CI
 green on the pushed branch. Not merged to main; not deployed. P3-D
 (Webhook / M1 compatibility / overall acceptance) remains untouched,
 as ordered.
+
+
+## P3-D wave1（Webhook）
+
+状态：施工完成，待独立验收 + GPT diff 评审。分支 `p3-d-automation-webhooks`（基线 `p3-c-automation-schedules` @7520b0d）。本波只做 A-5 Webhook 投递引擎；M1 自动化导出/导入（§7）与 S/V 全量矩阵为后续波次，未动 `import.ts` / `export-package.ts` 的自动化部分。
+
+### 偏差置顶（先看这里）
+
+0. **未配置端点动作的预检口径（待复核）**：见下方「测试证据」内兼容性说明——未配置 = WARNING＋执行失败关闭；已配置不安全 = BLOCKING。
+1. **动作成功语义（口径选择，待复核）**：WEBHOOK 动作在 run 事务内只做「持久化入队」——run action 的 SUCCEEDED 表示 delivery 已可靠入队（resultRef = `webhook-delivery:<deliveryId>`），HTTP 结果以 delivery 行为唯一事实源（投递历史 UI 可查）。理由：HTTP 绝不能在业务事务内执行；重试时间跨度（最长 31 分钟退避）也决定了投递必然异步。若验收要求 run 随投递终态回写，需另行设计回写通道。
+2. **重试预算耗尽的终态（待复核）**：AUTO 策略下确定性失败（5xx/429/3xx/连接类）耗尽 6 次尝试 → `PERMANENT_FAILED`，errorType 前缀 `RETRY_BUDGET_EXHAUSTED:` 保留原始分类；不确定结果耗尽 → `MANUAL_REVIEW_REQUIRED`（绝不宣称失败）。简报未明文规定耗尽终态，按此最保守口径实现。
+3. **非 429 的 4xx 归类（待复核）**：判 `PERMANENT_FAILURE`（端点确定性拒绝同一载荷，重试无意义）。简报只明文 429/5xx 按策略重试、永久配置错误 0 重试；4xx 归类留待复核。
+4. **P3-D 准入备注处置（附四遗留三项纵深备注）**：①固定节律执行时按记录重读复检——属 P3-C 既有路径，本波未改其代码，维持现状并在此明记为已接受偏差（deletedAt 复检在 cadence slot 的 CURRENT_STATE 两阶段判定中已覆盖条件求值，记录删除后条件不命中即跳过）；②`automation_schedules.status` 中无代码写入的 SCHEDULED/SKIPPED_NONEXISTENT_TIME 死值——该列无 CHECK 约束（0046 未加），不存在约束层死值可清理，代码侧状态集合已在 P3-C 收敛，本波不动；③回填 COMPLETED 复活路径、5 分钟租期败者 finalize 窄窗口、节律槽恢复未重检规则状态——三项均为 P3-C 调度纵深项，本波未触碰调度代码，建议随 P3-D 后续波次或 P3 收尾批统一处置，不在本波范围内擅自扩围。
+
+### 实现口径
+
+**数据模型（迁移 0047）**：新表 `automation_webhook_endpoints`（URL、策略、当前/上一把签名密钥的 AES-256-GCM 密文、key 版本、轮换时间、validated_url_hash/validated_at、RLS）；新表 `automation_webhook_attempts`（每次尝试独立行：attempt_number、key_version、outcome、http_status、error_type、响应截断摘要/字节数/SHA-256、pinned_ip、起止时间）；P3-A 骨架表 `automation_webhook_deliveries` 扩展 endpoint_url/policy/key_version/payload（冻结载荷）/payload_hash/claim 租约列，并加 `(tenant_id, run_id, action_id)` 唯一约束——同一逻辑动作只生成一条 delivery，重试复用同一 delivery、attempt 独立。审计 CHECK 增 `WEBHOOK_DELIVERY_RESEND`。
+
+**端点配置**：挂在规则动作配置上最小扩展——`actions_json` 的 WEBHOOK 动作新增 `webhook: { endpointId }`（服务端 zod Schema 校验，缺失/错位均拒绝）；端点本体经 API CRUD 管理。URL 仅 HTTPS、无内嵌凭据、无 fragment；IP 字面量在保存时即分类拦截。管理员改 URL 后 `validated_url_hash` 清空，投递与发布预检均阻断，直到重新 validate。超时 10s、请求体上限 64KB、响应摘要上限 512 字符（仅状态码＋截断摘要/字节数/哈希落库，响应体不落库），均为模块常量。
+
+**签名与轮换口径**：HMAC-SHA256 覆盖 `timestamp.eventId.body`（原始冻结载荷字节），请求头带 `X-Suzubase-Signature: v1=<hex>`、`X-Suzubase-Timestamp`、`X-Suzubase-Delivery-Id`、`X-Suzubase-Event-Id`、`X-Suzubase-Key-Version`。轮换口径：**每次 attempt 用端点当前密钥签名**，attempt 行记录所用 key 版本；端点保留上一把密钥供接收方在轮换窗口内验旧签。理由：在途 delivery 的重试若继续用旧钥，接收方完成轮换后反而验不过；用当前钥 + attempt 级版本记录，历史验签口径可精确复原（测试断言轮换后 attempt 序列 key 版本 [1,2]、新签仅新钥可验）。密钥以 AES-256-GCM 加密落库（密钥材料来自 `SUZUBASE_WEBHOOK_SECRET_KEY`，缺省回退既有 `SUZUBASE_SYSTEM_NOTIFICATION_SECRET`），API 响应与日志永不出现密钥/密文。
+
+**投递引擎与分类**：既有 worker 周期调用 `AutomationService.processWebhookDeliveries`（claim 租约 5 分钟防重复领取，run/action 幂等键防重复首投）。分类表：
+
+| 结果 | 分类 | AUTO_RETRY_AT_LEAST_ONCE | MANUAL_ON_UNCERTAIN |
+|---|---|---|---|
+| 2xx | SUCCEEDED | 终态 SUCCEEDED | 终态 SUCCEEDED |
+| 5xx / 429 / 3xx（不跟随）/ 连接类确定失败 | RETRYABLE_FAILURE（429 优先合法 Retry-After，上限 60 分钟） | RETRY_SCHEDULED，退避 1/2/4/8/16 分钟＋0–30s 抖动，合计 ≤6 次 | MANUAL_REVIEW_REQUIRED |
+| 超时 / 连接中途断开 | UNCERTAIN（errorType 前缀 DELIVERY_UNCERTAIN_） | DELIVERY_UNCERTAIN 并排下一次尝试；耗尽转 MANUAL_REVIEW_REQUIRED | MANUAL_REVIEW_REQUIRED |
+| 非 429 的 4xx | PERMANENT_FAILURE | PERMANENT_FAILED，0 重试 | PERMANENT_FAILED |
+| URL 非法 / SSRF 拒绝 / 端点未校验 / 端点不存在 / 密钥不可读 | BLOCKED | PERMANENT_FAILED，0 重试 | PERMANENT_FAILED |
+
+手动重发：仅 `MANUAL_REVIEW_REQUIRED` 可经 API/UI 重发——同一 delivery 身份、新 attempt、写审计行。验收用可控时钟（`processWebhookDeliveries(context, { now })` 注入；抖动随机源可注入，测试注入 0 得精确退避序列），无真实等待。
+
+**SSRF 纵深与钉 IP 机制**：仅 HTTPS；每次 attempt 前重新解析 DNS 并复核**全部**解析结果（任一非公网即整名拒绝，防重绑定轮换）；拒绝私网/保留/loopback/link-local/CGNAT/文档段/组播（含 169.254.169.254 云元数据）；默认传输层（node:https）以 `lookup` 回调把连接钉在已校验 IP 上、同时以原主机名做 TLS SNI/证书校验与 Host 头，连接阶段不再查 DNS；不跟随重定向（3xx 按失败分类、目标永不拨号）；请求/响应大小上限如上；日志不落密钥与签名头。
+
+**dry-run 与预检**：dry-run 对 WEBHOOK 给出端点/策略/已校验状态/载荷预览（记录字段名集）且零外呼；发布预检（validateVersion）对每个 WEBHOOK 动作做端点存在性、URL 结构、校验哈希、DNS/SSRF 复核，不安全或未校验端点以 BLOCKING finding 阻断发布（publish 同路径 409 实测）。
+
+**UI**（automation-settings.tsx）：端点创建表单（URL/策略/密钥）、Validate 与 Rotate 操作、两种策略风险文案明示（AUTO 含「可能重复投递、接收方应按投递 ID 去重」；MANUAL 原文展示「外部系统可能已经处理本次请求，重新发送可能造成重复业务操作。」）、投递历史表（状态/尝试数/HTTP/最后错误/下次尝试）＋attempt 明细表、MANUAL_REVIEW_REQUIRED 行的手动重发按钮（confirm 对话框含上述原文风险句）。
+
+### 提交清单
+
+- `3ef7720` 数据模型（迁移 0047）＋投递引擎＋worker 驱动
+- `c7a0451` Webhook UI（端点配置/轮换/风险文案/投递历史/手动重发）
+- `a591c1e` UI rotate-secret 载荷修复
+- `a44c165` webhook 依赖改为可赋值字段（Nest DI 不变）
+- `4847768` 测试（17 项）＋兼容修复（未配置端点保留 P3-B 失败关闭语义、OpenAPI 新路由契约、迁移期望表清单）＋ dry-run 预览字段口径修复
+
+### 测试证据
+
+- 新增 `packages/db/test/p3-d-webhooks.test.cjs`：17 项全绿——成功投递与验签、5xx 重试后成功、429 Retry-After、恰 6 次尝试与 1/2/4/8/16 退避序列断言、超时/断连不确定分类、MANUAL 停重试、手动重发身份不变、3xx 不跟随、SSRF 四项（保存时私网 IP 字面量拒绝、DNS 解析到私网拨号前阻断、重定向到私网不跟随、改 URL 后未校验阻断＋重校验恢复）、幂等（单 delivery、重复领取/租约）、密钥轮换、dry-run 零外呼、预检阻断、密钥密文落库且 API 不暴露。
+- 测试栈：独立 Postgres 容器（127.0.0.1:55437）＋本机 API 进程（:3300），TEST_API_URL 与 SUZUBASE_SYSTEM_NOTIFICATION_SECRET 按 CI 口径注入；全新空库迁移 48 条从零跑通。
+- 全套回归：**155/155 全绿**（基线 138 + 新增 17，零回归）；`pnpm -r typecheck` 全包干净。
+- 兼容性说明（蓄意、最小）：P3-B 两处旧测试以「无端点 WEBHOOK 动作」作为必然失败动作，其一断言占位错误码 `WEBHOOK_NOT_IMPLEMENTED_P3D`。P3-D 落地后口径迁移为：未配置端点的 WEBHOOK 动作可保存/发布（预检 WARNING 而非 BLOCKING）、执行期以 `WEBHOOK_ENDPOINT_NOT_CONFIGURED` 失败关闭（该断言已同步改码）；**已配置**但不安全/未校验/不存在的端点仍是预检 BLOCKING。
