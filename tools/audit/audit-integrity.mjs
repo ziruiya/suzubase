@@ -27,6 +27,17 @@
 // 3a therefore scope to import_job_id IS NOT NULL. No assertion is weakened:
 // every package-import event is still required to carry all four provenance
 // elements and zero outbox rows.
+//
+// Population note (P3-B diagnosis): check 3b's duplicate grouping must use
+// each notification population's real uniqueness key. RECORD notifications
+// are unique on (tenant, app, event, user, rule_key) -- that key only exists
+// when event_id is present; manual automation runs (P3-B T-4) legitimately
+// create event-less RECORD notifications whose deduplication is guaranteed
+// by run/action idempotency, not by a notification key. SYSTEM notifications
+// are unique on (tenant, dedup_key, user) via a partial index and share
+// rule_key categories across distinct events, so grouping them by rule_key
+// counts distinct deliveries as duplicates. No assertion is weakened: every
+// key the schema actually enforces is still required to be duplicate-free.
 // Exit code is non-zero when any check fails. Output is JSON.
 import { createRequire } from 'node:module';
 
@@ -111,10 +122,19 @@ try {
 
   // 3b. Daily outbox <-> notifications: processed outbox rows carry a
   // notifications delivery list; generated notifications must not duplicate.
-  const duplicates = (await client.query(
+  const recordDuplicates = (await client.query(
     `SELECT count(*)::int AS n FROM (
        SELECT tenant_id, app_id, event_id, user_id, rule_key, count(*) AS c
-       FROM notifications GROUP BY 1, 2, 3, 4, 5 HAVING count(*) > 1) d`)).rows[0].n;
+       FROM notifications
+       WHERE source_type = 'RECORD' AND event_id IS NOT NULL
+       GROUP BY 1, 2, 3, 4, 5 HAVING count(*) > 1) d`)).rows[0].n;
+  const systemDuplicates = (await client.query(
+    `SELECT count(*)::int AS n FROM (
+       SELECT tenant_id, dedup_key, user_id, count(*) AS c
+       FROM notifications
+       WHERE source_type = 'SYSTEM'
+       GROUP BY 1, 2, 3 HAVING count(*) > 1) d`)).rows[0].n;
+  const duplicates = recordDuplicates + systemDuplicates;
   record('notification duplicates', duplicates === 0, `${duplicates} duplicated notification keys`);
   const processed = (await client.query(
     `SELECT count(*)::int AS total,
