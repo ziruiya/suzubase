@@ -562,8 +562,13 @@ function cycleFindings(rules: { appId: string; config: AutomationRuleConfig }[])
 @Injectable()
 export class AutomationService {
   constructor(private readonly schema: AppSchemaService, private readonly authorization: AuthorizationService,
-    private readonly recordWrites: RecordService, private readonly workflowRuntime: WorkflowRuntimeService,
-    private readonly webhookDeps: AutomationWebhookDeps = {}) {}
+    private readonly recordWrites: RecordService, private readonly workflowRuntime: WorkflowRuntimeService) {}
+
+  // P3-D wave 1: webhook dependencies (DNS resolver, HTTP transport,
+  // jitter source) are injectable for tests; production uses the
+  // defaults from automation-webhook.ts. A plain field, not a
+  // constructor parameter, so Nest DI wiring is unchanged.
+  webhookDeps: AutomationWebhookDeps = {};
 
   list(context: TenantContext, appId: string) {
     return withTenantTransaction(context, async (tx) => {
