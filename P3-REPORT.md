@@ -617,3 +617,199 @@ safety net, exercised only by the migration text itself.
   execution / resume / backlog alert), worker wiring, summary backlog
   fields, 10 gate tests
 - (migration table-list fix + this report commit)
+
+## C-5 Date-relative scheduling (T-3 lower half): per-record plans, backfill, 24h late window, MISSED aggregation
+
+### Deviations and decisions (read first)
+
+1. **On-time vs LATE boundary (builder-chosen operational definition,
+   flagged for review):** the brief fixes the 24-hour late window but
+   does not define when an execution stops being "on time". The worker
+   polls every 60 seconds, so without a grace every normal execution
+   would be marked LATE and the SUCCEEDED plan state would be
+   unreachable. This block reuses the fixed-cadence on-time grace
+   (`AUTOMATION_SCHEDULE_ON_TIME_GRACE_MS`, 15 minutes) purely as the
+   on-time/LATE classifier: execution within the grace of due_at ends
+   SUCCEEDED, later but within 24 actual hours ends LATE, past 24 hours
+   ends MISSED. The 24-hour window itself is the brief's §3.2 contract
+   (measured from the plan's due_at in UTC) and is a different constant
+   from the grace -- the two are not interchangeable.
+2. **Backfill treatment of already-past-due stock (explicit, as
+   required):** backfill only writes plans; it never executes. A stock
+   record whose computed due_at is already past is still planned as
+   PENDING with that past due_at, and the normal due-consumption pass
+   then applies the §3.2 rules to it: within 24h it executes once as
+   LATE, beyond 24h it is marked MISSED with no execution and no
+   per-plan reminder (only the aggregated admin alert can fire). There
+   is no backfill-time execution burst: consumption stays bounded by
+   the same per-pass batch limit (1,000) and claim discipline as live
+   plans.
+3. **Plan identity lives in the P3-A table:** `automation_schedules`
+   already carried the exact unique identity
+   `(tenant, rule, rule_version, record, schedule_key)`; migration 0046
+   only adds `source_date` (the date value the plan was computed from,
+   for the execution-time staleness check), the claim lease columns
+   (`claim_token` / `claimed_at`, same pattern as cadence plans) and
+   `executed_at`. The status CHECK from C-2 already contained PENDING /
+   SUCCEEDED / LATE / MISSED / INVALIDATED / CANCELLED, so no status
+   change was needed. Backfill checkpoints get one new table,
+   `automation_date_backfills` (one row per rule version).
+4. **Terminal-plan reopening:** when a record's date changes after its
+   plan already executed (SUCCEEDED / LATE / MISSED), the same logical
+   row is reset to PENDING for the new source date -- the unique
+   identity forbids a second row, and the earlier execution remains
+   proven by its run / action rows and notifications. A date change
+   before execution simply moves due_at on the PENDING row (V-02 gate
+   asserts the old due_at never fires).
+5. **DST-gap wall times** for date-relative plans resolve to the
+   pseudo-instant (pre-transition offset), reusing the cadence
+   conversion helpers in `automation-schedule.ts`; the reminder still
+   fires at approximately the configured local time instead of being
+   skipped (the brief's SKIPPED_NONEXISTENT_TIME rule is stated for
+   fixed cadence slots, §3.1, not for date-relative plans, §3.2).
+6. **Fixture honesty fix during this block:** the backfill gate test
+   originally bulk-inserted its 2,000 stock records without
+   `record_events` rows, which polluted the audit tool's check-1
+   sample population on the shared verification database (the same
+   failure class as the known M3 staged-import flake, but introduced
+   by this block's fixture). The fixture now writes each record's
+   `created` history event in the same statement, and the polluted
+   populations from the earlier runs were removed from the
+   verification database. Check 1 passes first try on both databases
+   with the fixed fixture; the sampling logic was not touched.
+
+### Implementation
+
+- **Trigger configuration:** `trigger.eventType =
+  'schedule.dateRelative'` with `trigger.dateRelative { source:
+  'field' | 'createdAt', fieldId?, offsetDays (signed, -3650..3650),
+  localTime, timezone }`. The write-path Zod schema rejects illegal
+  shapes (field source without fieldId, createdAt with fieldId,
+  out-of-range offset, bad local time / timezone, event selectors);
+  `validateVersion` re-checks at preflight/publish, including that a
+  field source names an existing field of type `date`
+  (`SCHEDULE_DATE_FIELD_TYPE_INVALID`). The date field joins
+  `fieldsFor`, so grants must cover reading it.
+- **Schedule key:** `daterel:<field:<fieldId>|createdAt>:<signed
+  offset>d:<localTime>` -- stable encoding of the trigger elements
+  (source field, offset magnitude and direction, execution wall time).
+  due_at = (source local date + offset days) at localTime in the
+  rule's IANA timezone, converted via the same Intl helpers as fixed
+  cadence (`dateRelativeDueAt`). For `createdAt`, the source local
+  date is the record's creation instant rendered in that timezone.
+- **Generation & invalidation:** `processOutbox` maintains plans for
+  every enabled date-relative rule of an app on record.created /
+  record.updated / record.deleted events (create -> generate, date
+  change -> move due_at / invalidate + regenerate, date cleared ->
+  `date-cleared`, soft delete -> `record-deleted`). The sync sits
+  before the guardrail deferrals so a rate/backlog pause cannot lose
+  a plan update, and it is idempotent under event replay. Lifecycle
+  hooks mirror the cadence ones: disable -> `rule-disabled`, grant
+  revoke -> `grant-revoked` (that version), publish -> old versions
+  `version-superseded`, archive -> `rule-archived`; execution-time
+  revalidation repeats every check (rule still enabled and current,
+  grant present and covering, record present and undeleted, current
+  source date still equal to the plan's `source_date`, rule conditions
+  still met -- otherwise the plan ends INVALIDATED with the reason, or
+  CANCELLED with `conditions-not-met`).
+- **Backfill:** publish / enable / grant-approval ensure one
+  `automation_date_backfills` job per version (invalidation resets a
+  job to a null cursor so a re-enabled rule rescans fully). The worker
+  processes jobs in stable record-id order, at most
+  `AUTOMATION_SCHEDULE_BATCH_LIMIT` (1,000) records per pass, with the
+  checkpoint (cursor + processed count) persisted in the same
+  transaction as each record's plan sync; an interrupted pass resumes
+  from the checkpoint with no duplicates and no gaps.
+- **Consumption:** `processDateRelativeSchedules` (worker loop, after
+  `processSchedules`) claims due PENDING plans with the same atomic
+  conditional-UPDATE discipline as cadence plans (5-minute lease).
+  Surviving plans execute through the shared `executeActions` engine
+  under the grant approver's delegated context, one run per plan with
+  idempotency key
+  `<app>:date-relative:<rule>:<version>:<schedule key>:<record>` and
+  trigger identity `date-relative:<schedule key>`. A worker that dies
+  after creating the run but before finalizing the plan leaves a
+  claimed plan whose resumption adopts the existing run's outcome
+  instead of executing twice.
+- **Late / MISSED:** see decision 1 for the classifier. MISSED plans
+  never execute and send nothing. At or above
+  `AUTOMATION_DATE_RELATIVE_MISSED_ALERT_THRESHOLD` (100) MISSED in one
+  pass, tenant admins receive ONE aggregated SYSTEM notification
+  (`AUTOMATION_SCHEDULE_MISSED`, daily dedup key) plus one
+  `SCHEDULE_MISSED_ALERT` audit row (C-0 SYSTEM actor口径), throttled
+  to one alert per 24 hours.
+
+### Gate evidence (all in `packages/db/test/p3-c-date-relative.test.cjs`, 11 tests)
+
+- Config validation: 7 illegal date-relative shapes rejected with 400;
+  preflight blocks a non-date source field with
+  `SCHEDULE_DATE_FIELD_TYPE_INVALID`.
+- S-02 form: wish_date 2026-12-13, minus 3 days, 09:00 Asia/Tokyo ->
+  plan `source_date 2026-12-13`, due_at exactly
+  `2026-12-10T00:00:00Z`; not-yet-due pass executes nothing; due pass
+  executes once (run SUCCEEDED, plan SUCCEEDED with `executed_at`,
+  exactly one notification linked to the run); replay passes create
+  nothing.
+- V-02: date 12/10 -> 12/20 moves the single logical plan to the new
+  due_at (2026-12-17T00:00Z); a pass at the old due_at creates zero
+  runs; the new due_at executes.
+- V-03: soft delete invalidates the plan (`record-deleted`); the due
+  pass produces zero runs and zero notifications.
+- 24h boundary (constructed plan rows against an injected now):
+  due 23:59 ago -> executed, plan LATE; due 24:01 ago -> plan MISSED,
+  `executed_at` null, zero runs, zero notifications.
+- Backfill: 2,000 stock records predating the rule; injected batch
+  limit 700 completes in 3 passes (700 / 700 / 600) with the job's
+  checkpoint persisted between passes and a fresh engine instance
+  resuming; exactly 2,000 PENDING plans, no duplicates, zero runs.
+- Lifecycle: disable -> plan INVALIDATED (`rule-disabled`), revoke ->
+  INVALIDATED (`grant-revoked`), publish of v2 -> v1 plan INVALIDATED
+  (`version-superseded`) and silent at the v1 due instant, while the
+  v2 backfilled plan fires at its own due_at bound to v2.
+- Concurrency & recovery: two engines racing one due plan produce
+  exactly one run; a planted claim (dead worker) blocks execution
+  inside the lease and is reclaimed after it, executing once with no
+  duplicate run.
+- Aggregated MISSED alert: 3 plans past the window with an injected
+  threshold of 2 -> exactly 1 SYSTEM admin notification and 1
+  `SCHEDULE_MISSED_ALERT` audit row (SYSTEM actor, missedCount 3); a
+  second missed wave inside 24h stays silent.
+- createdAt source: plan's source_date equals the record's creation
+  date in Asia/Tokyo and due_at matches `dateRelativeDueAt` (+7 days,
+  09:00).
+
+### Evidence (this block)
+
+- Verification stack: Postgres 16 on 127.0.0.1:55436, API on
+  127.0.0.1:3101, `TEST_API_URL` +
+  `SUZUBASE_SYSTEM_NOTIFICATION_SECRET` injected (same口径 as
+  C-0..C-4).
+- Build clean; `pnpm -r typecheck` clean.
+- Migrations: 0046 applied incrementally on the verification stack
+  (47 total) and from zero on a fresh database (47 applied; automation
+  subset -- migration + p3-a + p3-b actions + p3-b guardrails + p3-c
+  system actor + p3-c admission + p3-c schedules + p3-c date-relative
+  = 36/36 pass there).
+- Full suite: **134/134 pass** (123 C-4 baseline + 11 new
+  `p3-c-date-relative` tests), no reruns needed.
+- Audit tool: fresh database -- all checks PASS. Long-lived
+  verification database -- check 1 passed first try; check 3c still
+  flags exactly the same 2 pre-change legacy notifications disclosed
+  under C-1.2 (unchanged by this block; date-relative notifications
+  carry the C-1 payload linkage and reconcile on the fresh database).
+
+### Commits (this block)
+
+- `f4723ea` P3-C date-relative code: migration 0046, schema,
+  date-relative trigger config + preflight validation, plan sync on
+  record events, lifecycle invalidation hooks, backfill jobs,
+  `processDateRelativeSchedules` (claim / revalidation / LATE /
+  MISSED / aggregated alert), worker wiring, migration table list
+- `51f5e27` P3-C date-relative tests (11 gates) + on-time grace
+  classification for LATE marking
+- (fixture history-event fix + this report commit)
+
+With C-5, the P3-C stage is complete: T-3 fixed cadence (C-4) and
+date-relative (C-5) both run on the shared worker loop and the shared
+action engine. P3-D (Webhook / M1 compatibility / overall acceptance)
+is untouched, as ordered.

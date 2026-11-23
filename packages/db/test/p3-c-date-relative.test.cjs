@@ -403,10 +403,19 @@ test('P3-C date-relative: backfill over 2000 stock records in injected small bat
     // 2,000 stock records exist BEFORE the rule: bulk-inserted directly
     // (the API path would take minutes; the backfill contract is about
     // the stored population, not about how it arrived).
+    // Each stock record also gets its 'created' history event, exactly
+    // as if it had arrived through the API: the fixture must stay a
+    // history-consistent population (the audit tool samples records
+    // against their events).
     await db.query(
-      `INSERT INTO records (tenant_id, app_id, id, record_no, data, schema_version, revision, status, created_by, updated_by)
-       SELECT $1, $2, gen_random_uuid(), n, jsonb_build_object($3::text, '2027-03-15'), $4, 1, 'active', $5, $5
-       FROM generate_series(1, 2000) AS n`,
+      `WITH inserted AS (
+         INSERT INTO records (tenant_id, app_id, id, record_no, data, schema_version, revision, status, created_by, updated_by)
+         SELECT $1, $2, gen_random_uuid(), n, jsonb_build_object($3::text, '2027-03-15'), $4, 1, 'active', $5, $5
+         FROM generate_series(1, 2000) AS n
+         RETURNING id, data
+       )
+       INSERT INTO record_events (tenant_id, app_id, event_id, record_id, record_revision, schema_version, actor_id, source, kind, changes, snapshot_data)
+       SELECT $1, $2, gen_random_uuid(), id, 1, $4, $5, 'api', 'created', '[]'::jsonb, data FROM inserted`,
       [owner.tenantId, app.id, wish.fieldId, appRow.published_schema_version, owner.userId]);
     const config = {
       schemaVersion: 1,
