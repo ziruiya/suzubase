@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, appPath, json, message, type App } from './api';
+import { AutomationRuleBuilder } from './automation-rule-builder';
 
 type SummaryRule = {
   ruleId: string; name: string; enabled: boolean;
@@ -243,6 +244,8 @@ export function AutomationSettings({ app, token }: { app: App; token: string }) 
       </table></div>
       {!summary.rules.length && <p className="muted">No automation rules yet.</p>}
     </>}
+
+    <AutomationRuleBuilder app={app} token={token} />
 
     <h3>Run history</h3>
     <div className="inline">

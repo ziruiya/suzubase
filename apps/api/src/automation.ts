@@ -2031,15 +2031,21 @@ export class AutomationService {
       if (!rule?.enabled || rule.archivedAt || !version || version.status !== 'published' || !grant || !cfg ||
         !this.dateRelativeConfigOf(cfg) ||
         !await this.grantCoversExecution(tx, context.tenantId, job.appId, cfg, grant)) {
-        await tx.update(automationDateBackfills).set({
-          status: 'COMPLETED', updatedAt: sql`clock_timestamp()`,
-        }).where(and(eq(automationDateBackfills.tenantId, context.tenantId),
-          eq(automationDateBackfills.id, job.id), eq(automationDateBackfills.status, 'RUNNING')));
+        // P3-D wave3 (appendix-4 item 3a): a job whose rule is currently
+        // ineligible must WAIT in RUNNING, not be marked COMPLETED.
+        // COMPLETED is terminal for the worker (only RUNNING jobs are
+        // picked up), so marking it here silently stranded the stock
+        // records after the rule became eligible again: the invalidate
+        // hooks reset the job to RUNNING, but a worker pass in the
+        // ineligible window flipped it back to COMPLETED and no path
+        // revived it. Leaving it RUNNING matches the invalidate hooks'
+        // documented intent (a reset job for a disabled rule simply
+        // waits).
         return null;
       }
       return { cfg };
     });
-    if (!prepared) return { processed: 0, completed: true };
+    if (!prepared) return { processed: 0, completed: false };
     let cursor = job.cursorRecordId;
     let processed = job.processedCount;
     let batchProcessed = 0;
@@ -2166,15 +2172,20 @@ export class AutomationService {
       // so crash recovery still adopts the existing run and
       // never executes or notifies twice.
       const identity = `${plan.appId}:date-relative:${plan.ruleId}:${plan.ruleVersion}:${plan.scheduleKey}:${plan.recordId}:${plan.sourceDate}`;
-      const [existingRun] = await tx.select({ id: automationRuns.id, status: automationRuns.status })
+      const [existingRun] = await tx.select({ id: automationRuns.id, status: automationRuns.status, startedAt: automationRuns.startedAt })
         .from(automationRuns).where(and(eq(automationRuns.tenantId, context.tenantId),
           eq(automationRuns.idempotencyKey, identity)));
       if (existingRun) {
         // A previous worker created the run but died before finalizing
         // the plan: adopt the run's outcome, never execute twice.
+        // P3-D wave3 (appendix-4 item 4): lateness is judged from the
+        // adopted run's own start time, not from the recovery moment --
+        // a run that executed on time must not be re-labelled LATE just
+        // because the plan row was finalized late.
         const succeeded = existingRun.status === 'SUCCEEDED';
-        await finalize(succeeded ? (late ? 'LATE' : 'SUCCEEDED') : 'FAILED', { executed: succeeded });
-        return { plan, executed: succeeded, late: succeeded && late, failed: !succeeded };
+        const runLate = new Date(existingRun.startedAt).getTime() - new Date(plan.dueAt).getTime() > graceMs;
+        await finalize(succeeded ? (runLate ? 'LATE' : 'SUCCEEDED') : 'FAILED', { executed: succeeded });
+        return { plan, executed: succeeded, late: succeeded && runLate, failed: !succeeded };
       }
       const runId = randomUUID();
       const batchId = randomUUID();
@@ -2187,6 +2198,21 @@ export class AutomationService {
         originRuleId: plan.ruleId, originActionId: null, status: 'RUNNING',
       }).onConflictDoNothing().returning();
       if (!run) {
+        // P3-D wave3 (appendix-4 item 3b): the insert lost a race -- a
+        // concurrent worker created the run for this exact identity
+        // between our existence check and the insert. Adopt that run's
+        // outcome (same rule as the existingRun path above) instead of
+        // stamping the plan FAILED while the real run may have
+        // succeeded; lateness again follows the run's own start time.
+        const [raced] = await tx.select({ status: automationRuns.status, startedAt: automationRuns.startedAt })
+          .from(automationRuns).where(and(eq(automationRuns.tenantId, context.tenantId),
+            eq(automationRuns.idempotencyKey, identity)));
+        if (raced) {
+          const succeeded = raced.status === 'SUCCEEDED';
+          const runLate = new Date(raced.startedAt).getTime() - new Date(plan.dueAt).getTime() > graceMs;
+          await finalize(succeeded ? (runLate ? 'LATE' : 'SUCCEEDED') : 'FAILED', { executed: succeeded });
+          return { plan, executed: succeeded, late: succeeded && runLate, failed: !succeeded };
+        }
         await finalize('FAILED', {});
         return { plan, failed: true };
       }

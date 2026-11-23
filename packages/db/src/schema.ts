@@ -690,7 +690,7 @@ export const automationSchedules = pgTable('automation_schedules', {
   unique().on(t.tenantId, t.ruleId, t.ruleVersion, t.recordId, t.scheduleKey),
   foreignKey({ columns: [t.tenantId, t.appId, t.ruleId, t.ruleVersion], foreignColumns: [automationRuleVersions.tenantId, automationRuleVersions.appId, automationRuleVersions.ruleId, automationRuleVersions.version] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
-  check('automation_schedules_status', sql`${t.status} IN ('PENDING','SCHEDULED','SUCCEEDED','FAILED','INVALIDATED','SKIPPED_NONEXISTENT_TIME','MISSED','LATE','CANCELLED')`),
+  check('automation_schedules_status', sql`${t.status} IN ('PENDING','SUCCEEDED','FAILED','INVALIDATED','MISSED','LATE','CANCELLED')`),
 ]);
 
 export const automationCadencePlans = pgTable('automation_cadence_plans', {
