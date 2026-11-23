@@ -1034,3 +1034,43 @@ as ordered.
 - 测试栈：独立 Postgres 容器（127.0.0.1:55437）＋本机 API 进程（:3300），TEST_API_URL 与 SUZUBASE_SYSTEM_NOTIFICATION_SECRET 按 CI 口径注入；全新空库迁移 48 条从零跑通。
 - 全套回归：**155/155 全绿**（基线 138 + 新增 17，零回归）；`pnpm -r typecheck` 全包干净。
 - 兼容性说明（蓄意、最小）：P3-B 两处旧测试以「无端点 WEBHOOK 动作」作为必然失败动作，其一断言占位错误码 `WEBHOOK_NOT_IMPLEMENTED_P3D`。P3-D 落地后口径迁移为：未配置端点的 WEBHOOK 动作可保存/发布（预检 WARNING 而非 BLOCKING）、执行期以 `WEBHOOK_ENDPOINT_NOT_CONFIGURED` 失败关闭（该断言已同步改码）；**已配置**但不安全/未校验/不存在的端点仍是预检 BLOCKING。
+
+
+## P3-D wave2（M1 自动化导出/导入）
+
+状态：施工完成，待独立验收 + GPT diff 评审。分支 `p3-d-automation-webhooks`（接 wave1 `d9d7cdd`）。本波只做简报 §7 M1 自动化段、§5/§10 中 M1 部分、§8.2 的 V-08、§8.3 导入后重新授权；`kintone-import.ts` 未动；M1 包格式版本保持 `1.0`，两种正式恢复结果（完整恢复成功 / 恢复待补全）口径不变。
+
+### 偏差置顶（先看这里）
+
+1. **「待补全」构成口径（待复核）**：导入后 completion 判 `pending` 的自动化侧阻塞项 = 未解决引用 + BLOCKING 环检结论。**授权重新审批与 Webhook 凭据补录不阻塞应用激活**——它们进 pending/report 的显式 `manualActions` 清单，但导入规则恒为禁用草稿、无生效版本，不重新授权就无法发布/启用（§8.3 的闸在规则启用侧，不在应用激活侧）；若把这两项也算激活阻塞，任何含 Webhook/授权需求的包都永远无法「完整恢复」，与 §7.2 两种正式结果并存的口径冲突。此为本波最需复核的语义选择。
+2. **跨应用引用的解析范围（口径）**：跨应用目标只按「同租户内更早的导入任务（状态 ready/activated）且 `sourceAppId` 相同」解析，绝不猜测、绝不按名字匹配；找不到即未解决引用。同一包内多应用打包（bundle）不在 M1 既有契约内，未扩围。
+3. **未映射的通知接收人（口径）**：从接收人列表中剔除并显式列入未解决清单，绝不改指到其他用户；列表因此变空时规则仍是禁用草稿，重新授权时由目标环境管理员补齐（NOTIFY 运行时对空接收人失败关闭）。
+4. **组合规则拆分（既有授权模型约束，非本波引入）**：P3 既有 grant 校验把 `writableFieldIds` 按每个目标应用校验，单条规则无法同时含「写本应用字段」与「跨应用建单」——往返测试因此用两条规则覆盖 A-1~A-5（本地组合 + 跨应用建单）。这是 P3-A/B 既有口径，本波未改 grant 模型；如需放宽应另行立项。
+5. **迁移 0048 顺带修复**：`purge_imported_app`（0033）此前未删除自动化表，含自动化段的导入任务取消/失败会被外键挡住无法清零；0048 重建该函数，先删自动化七表（endpoints/grants/versions/rules/deliveries/attempts/schedules/cadence/backfills）再走原顺序。wave2 未解决引用测试实测取消后自动化规则清零。
+
+### 包格式扩展点
+
+- 包格式版本仍为 `1.0`（加法扩展）；manifest counts 新增 `automationRules` / `automationRuleVersions` / `automationWebhookEndpoints` 三键，`reconcileCounts`/`countPayload` 对旧包缺键按 0 处理——**旧包（无自动化段、无新 counts 键）校验与导入语义完全不变**（测试实证）。
+- 新增载荷文件 `data/automation.json`，`schemaVersion: 1`：规则（全部版本，含草稿/已归档；trigger/conditions/actions 原样，稳定 `actionId` 保留）、每版本的**授权需求**（sourceAppId/readable/targetAppIds/writable/allowedOperations——只导需求，approver、时间戳等已生效授权状态一律不导）、Webhook 端点非敏感部分（name/url/policy/keyVersion + `credentialRequired: true` + 源端 validated/pending 标记）。**密钥明文与密文一律不读入包**（导出代码根本不 SELECT secret 列；测试断言包全文不含明文、不含源库密文、不含 `secretEnc` 字样）。run 历史、投递历史不进包（不导成可重放状态，符合 V-08）。
+
+### 导入与重映射口径
+
+- 导入规则恒为 `enabled=false`、`currentVersion=null`、**全部版本落为 draft**（源端 published/archived 状态不带入生效语义）；导入过程**不写任何 `automation_grants` 行**，零 run、零通知、零投递、零 outbox（测试逐项断言为 0）。
+- ID 重映射：本应用字段/工作流状态与动作走任务 IdMap；用户/用户组走任务映射表；跨应用目标走上条口径的既往导入解析；Webhook 端点映射到本任务新建的占位端点。映射不上的引用：**保留源 ID 写在禁用草稿上**（不静默丢弃、不猜），并逐项列入 dry-run 与正式结果的 `unresolved` 清单（kind: field/user/group/app/target-field/workflow-state/workflow-action/webhook-endpoint）。
+- Webhook 凭据占位（迁移 0048 新增 `credential_pending` 列）：占位端点 `secretEnc=''`、校验状态清空、keyVersion=1；三道失败关闭闸——发布预检 BLOCKING `WEBHOOK_CREDENTIAL_REQUIRED`、执行期同码拒绝、已入队投递 attempt 记 BLOCKED 同码。补录走既有 rotate-secret 路由（占位端点轮换即首把密钥 v1、无上一把，标志清除），之后 validate → 预检 → 发布 → 启用全程实测走通。
+- 定时计划**不复制源行**：导入后目标端 cadence plan 与 date-relative plan 均为 0；规则在目标端重新发布/启用后由目标机制按目标数据重算——测试断言重算出的 date-relative plan 绑定目标 record id、due = 目标记录日期 −3 天 09:00 Asia/Tokyo，cadence plan 为目标端新建 ACTIVE 行。
+- 环检在导入后以目标环境实况重跑（导入配置 + 目标租户全部已启用规则的生效版本）：BLOCKING 进 completion 阻塞，POTENTIAL 以警告进报告。测试构造两条无条件自建单草稿规则（源端无法发布）→ dry-run 与正式导入都给出 `BLOCKING_CYCLE` 且 completion=pending。
+- dry-run：`POST /imports/:jobId/automation-dry-run`（会话通道、租户管理员）在导入前返回 `willCreate`（规则/版本/端点数）、`unresolved`、`manualActions`（凭据补录 + 每规则授权重新审批）、`cycleFindings`（包内自洽检查），与正式导入的 pending/report 自动化段同字段口径（测试对同一包两边断言一致）。
+- pending/report 集成：`pending.automation = { rules, unresolved, credentialsPending, grantRequirements, cycleFindings }` 随 Finalizer 重写保留；`report.automation` 汇总导入数/启用数（恒 0）/生效授权数（恒 0）；`report.difference.notInherited` 新增「webhook credential」「automation grant」两条明示未继承项。
+
+### 提交清单
+
+- `02777de` M1 自动化段核心：迁移 0048（credential_pending + purge 修复）、导出段、导入批 + 重映射 + dry-run + pending/report 集成、凭据三道闸
+- `69a45b4` wave2 测试（4 项）
+
+### 测试证据
+
+- 新增 `packages/db/test/p3-d-automation-m1.test.cjs`：4 项全绿——①往返：源环境 4 条已发布启用规则覆盖 A-1~A-5（含 Webhook 端点+密钥、date-relative 与 fixed cadence 触发、跨应用 A-3、工作流 A-4）→ 导出断言包结构与无密钥材料 → 先导目标应用包再导主包到全新租户，断言禁用草稿/版本全 draft/grants 0 行/占位端点/逐引用重映射（字段、模板、用户、端点、工作流动作、跨应用与目标字段、日期触发字段）/零副作用五表为 0/计划未拷贝 → 激活后补授权仍被凭据闸预检阻断 → rotate-secret 补录 + validate → 预检通过 → 发布 → 启用 → 两类计划在目标端重算且绑定目标 ID；②未解决引用：不导目标应用 + 不映射接收人，dry-run 与正式结果都显式列出 app/user/target-field 落空，completion=pending、激活被拒、接收人剔除不改指，取消后自动化行清零；③环检：BLOCKING 结论在 dry-run 与正式结果一致、completion=pending；④旧包兼容：剥除 automation.json 与新 counts 键的老式包校验通过、导入 completion=complete、pending/report 无自动化段、激活成功。
+- 测试栈：独立 Postgres 容器（127.0.0.1:55438）＋本机 API 进程（:3301），全新空库迁移 **49 条从零跑通**（含 0048）。
+- 全套回归：**159/159 全绿**（基线 155 + 新增 4，零回归）；`pnpm -r typecheck` 全包干净；`pnpm -r build` 通过。
+- 环境备注：首轮全套曾出现 wave1 Webhook 11 项失败，根因为本轮测试栈 API 进程的 `SUZUBASE_SYSTEM_NOTIFICATION_SECRET` 与 wave1 测试文件内注入值不一致（密文不可读 → 投递 PERMANENT_FAILED），对齐后复跑 159/159；与代码无关，未改任何 wave1 代码/测试。
