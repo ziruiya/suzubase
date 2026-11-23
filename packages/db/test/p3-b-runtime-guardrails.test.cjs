@@ -28,19 +28,17 @@ test('P3-B C6 source binding and C2 runtime guardrails use real API and worker p
   await publish(token, app.id);
 
   const saved = await expectRequest(201, `${base}/automation/rules`, {
-    token, body: { name: 'Guardrail rule', config: ruleConfig({ eventType: 'workflow.transitioned', toStateId: randomUUID() }) },
+    token, method: 'POST', body: { name: 'Guardrail rule', config: ruleConfig({ eventType: 'workflow.transitioned', toStateId: randomUUID() }) },
   });
-  await assert.rejects(
-    expectRequest(400, `${base}/automation/rules/${saved.rule.id}/grants`, {
-      token, body: {
-        version: saved.version.version, sourceAppId: otherApp.id, readableFieldIds: [],
-        targetAppIds: [], writableFieldIds: [], allowedOperations: ['NOTIFY'],
-      },
-    }),
-  );
+  await expectRequest(400, `${base}/automation/rules/${saved.rule.id}/grants`, {
+    token, method: 'POST', body: {
+      version: saved.version.version, sourceAppId: otherApp.id, readableFieldIds: [],
+      targetAppIds: [], writableFieldIds: [], allowedOperations: ['NOTIFY'],
+    },
+  });
 
   const recordRule = await expectRequest(201, `${base}/automation/rules`, {
-    token, body: { name: 'Record snapshot rule', config: {
+    token, method: 'POST', body: { name: 'Record snapshot rule', config: {
       schemaVersion: 1,
       trigger: { eventType: 'record.updated', fieldId: status.fieldId, newValue: 'active' },
       conditions: {
@@ -51,23 +49,23 @@ test('P3-B C6 source binding and C2 runtime guardrails use real API and worker p
     } },
   });
   await expectRequest(201, `${base}/automation/rules/${recordRule.rule.id}/grants`, {
-    token, body: {
+    token, method: 'POST', body: {
       version: recordRule.version.version, sourceAppId: app.id, readableFieldIds: [status.fieldId],
       targetAppIds: [], writableFieldIds: [], allowedOperations: ['NOTIFY'],
     },
   });
-  await expectRequest(200, `${base}/automation/rules/${recordRule.rule.id}/preflight`, {
-    token, body: { version: recordRule.version.version },
+  await expectRequest(201, `${base}/automation/rules/${recordRule.rule.id}/preflight`, {
+    token, method: 'POST', body: { version: recordRule.version.version },
   });
-  await expectRequest(200, `${base}/automation/rules/${recordRule.rule.id}/publish`, {
-    token, body: { version: recordRule.version.version },
+  await expectRequest(201, `${base}/automation/rules/${recordRule.rule.id}/publish`, {
+    token, method: 'POST', body: { version: recordRule.version.version },
   });
-  await expectRequest(200, `${base}/automation/rules/${recordRule.rule.id}/enable`, {
-    token, body: { enabled: true },
+  await expectRequest(201, `${base}/automation/rules/${recordRule.rule.id}/enable`, {
+    token, method: 'POST', body: { enabled: true },
   });
 
   const record = await expectRequest(201, `${base}/records`, {
-    token, body: { data: { [status.fieldId]: 'draft' } },
+    token, method: 'POST', body: { data: { [status.fieldId]: 'draft' } },
   });
   const updated = await expectRequest(200, `${base}/records/${record.id}`, {
     token, method: 'PUT', body: { revision: record.revision, data: { [status.fieldId]: 'active' } },
@@ -93,24 +91,29 @@ test('P3-B C6 source binding and C2 runtime guardrails use real API and worker p
        WHERE tenant_id=$1 AND app_id=$2`,
       [owner.tenantId, app.id],
     );
-    await expectRequest(200, `${base}/records/${record.id}`, {
-      token, method: 'PUT', body: { revision: updated.revision, data: { [status.fieldId]: 'active-2' } },
+    const away = await expectRequest(200, `${base}/records/${record.id}`, {
+      token, method: 'PUT', body: { revision: updated.revision, data: { [status.fieldId]: 'draft' } },
     });
-    const causalEvents = await db.query(
-      `SELECT o.event_id,o.root_causation_id FROM outbox o
-       JOIN record_events e ON e.tenant_id=o.tenant_id AND e.app_id=o.app_id AND e.event_id=o.event_id
-       WHERE o.tenant_id=$1 AND o.app_id=$2 AND e.record_id=$3
-       ORDER BY o.created_at`,
+    const back = await expectRequest(200, `${base}/records/${record.id}`, {
+      token, method: 'PUT', body: { revision: away.revision, data: { [status.fieldId]: 'active' } },
+    });
+    // Harness chain linkage: a production chain link is written by the causing
+    // automation action; at this foundation stage the returning event is linked
+    // explicitly to the first run's root. Real action-chain linkage is proven
+    // separately by the P3-B actions suite (C3).
+    const firstRun = await db.query(
+      `SELECT root_causation_id FROM automation_runs WHERE tenant_id=$1 AND app_id=$2 AND rule_id=$3`,
+      [owner.tenantId, app.id, recordRule.rule.id],
+    );
+    const latestEvent = await db.query(
+      `SELECT event_id FROM record_events WHERE tenant_id=$1 AND app_id=$2 AND record_id=$3 ORDER BY occurred_at DESC LIMIT 1`,
       [owner.tenantId, app.id, record.id],
     );
-    if (causalEvents.rows.length >= 2) {
-      const root = causalEvents.rows[0].event_id;
-      await db.query(
-        `UPDATE outbox SET root_causation_id=$3,parent_run_id=NULL
-         WHERE tenant_id=$1 AND app_id=$2 AND event_id=$4`,
-        [owner.tenantId, app.id, root, causalEvents.rows[1].event_id],
-      );
-    }
+    await db.query(
+      `UPDATE outbox SET root_causation_id=$3, parent_run_id=NULL
+       WHERE tenant_id=$1 AND app_id=$2 AND event_id=$4`,
+      [owner.tenantId, app.id, firstRun.rows[0].root_causation_id, latestEvent.rows[0].event_id],
+    );
     await engine.processOutbox(context);
     const blocked = await db.query(
       `SELECT status FROM automation_runs
@@ -151,8 +154,9 @@ test('P3-B C6 source binding and C2 runtime guardrails use real API and worker p
     await db.query(
       `INSERT INTO automation_runs
         (tenant_id,app_id,id,rule_id,rule_version,event_id,trigger_identity,idempotency_key,record_id,
-         root_causation_id,causation_depth,status)
-       SELECT $1,$2,gen_random_uuid(),$3,$4,$5,'backlog:'||n::text,'backlog:'||n::text,$6,$7,1,'QUEUED'
+         root_causation_id,causation_depth,status,started_at)
+       SELECT $1,$2,gen_random_uuid(),$3,$4,$5,'backlog:'||n::text,'backlog:'||n::text,$6,$7,1,'QUEUED',
+         clock_timestamp() - interval '10 minutes'
        FROM generate_series(1,$8::int) n`,
       [owner.tenantId, app.id, recordRule.rule.id, recordRule.version.version, eventId, record.id, eventId, AUTOMATION_TENANT_PENDING_LIMIT + 1],
     );
@@ -165,46 +169,73 @@ test('P3-B C6 source binding and C2 runtime guardrails use real API and worker p
     assert.ok(backlogAudit.rowCount >= 1);
 
     await db.query(`DELETE FROM automation_runs WHERE tenant_id=$1 AND app_id=$2 AND idempotency_key LIKE 'backlog:%'`, [owner.tenantId, app.id]);
-    const repeatedRoot = randomUUID();
+    // Repeated failures in one chain pause the chain (C2 circuit breaker):
+    // a fresh matching event whose chain already holds 3 FAILED runs for the
+    // same record+rule must end CHAIN_PAUSED and register a problem chain.
+    const away2 = await expectRequest(200, `${base}/records/${record.id}`, {
+      token, method: 'PUT', body: { revision: back.revision, data: { [status.fieldId]: 'draft' } },
+    });
+    const back2 = await expectRequest(200, `${base}/records/${record.id}`, {
+      token, method: 'PUT', body: { revision: away2.revision, data: { [status.fieldId]: 'active' } },
+    });
+    const chainRoot = randomUUID();
     await db.query(
       `INSERT INTO automation_runs
         (tenant_id,app_id,id,rule_id,rule_version,event_id,trigger_identity,idempotency_key,record_id,
          root_causation_id,causation_depth,status)
        SELECT $1,$2,gen_random_uuid(),$3,$4,$5,'failed:'||n::text,'failed:'||n::text,$6,$7,1,'FAILED'
        FROM generate_series(1,3) n`,
-      [owner.tenantId, app.id, recordRule.rule.id, recordRule.version.version, eventId, record.id, repeatedRoot],
+      [owner.tenantId, app.id, recordRule.rule.id, recordRule.version.version, eventId, record.id, chainRoot],
+    );
+    const back2Event = await db.query(
+      `SELECT event_id FROM record_events WHERE tenant_id=$1 AND app_id=$2 AND record_id=$3 ORDER BY occurred_at DESC LIMIT 1`,
+      [owner.tenantId, app.id, record.id],
     );
     await db.query(
-      `UPDATE outbox SET automation_processed_at=NULL, root_causation_id=$3, causation_depth=1
+      `UPDATE outbox SET automation_processed_at=NULL, root_causation_id=$3
        WHERE tenant_id=$1 AND app_id=$2 AND event_id=$4`,
-      [owner.tenantId, app.id, repeatedRoot, eventId],
+      [owner.tenantId, app.id, chainRoot, back2Event.rows[0].event_id],
     );
     await engine.processOutbox(context);
     const repeatedPause = await db.query(
       `SELECT reason FROM automation_problem_chains
        WHERE tenant_id=$1 AND root_causation_id=$2 AND resumed_at IS NULL`,
-      [owner.tenantId, repeatedRoot],
+      [owner.tenantId, chainRoot],
     );
     assert.equal(repeatedPause.rowCount, 1);
     assert.match(repeatedPause.rows[0].reason, /REPEATED_FAILURES/);
-    const depthEvent = await db.query(
+
+    // Depth guard: a matching event arriving at causation depth 5 ends
+    // CHAIN_DEPTH_EXCEEDED and pauses its own chain.
+    const away3 = await expectRequest(200, `${base}/records/${record.id}`, {
+      token, method: 'PUT', body: { revision: back2.revision, data: { [status.fieldId]: 'draft' } },
+    });
+    await expectRequest(200, `${base}/records/${record.id}`, {
+      token, method: 'PUT', body: { revision: away3.revision, data: { [status.fieldId]: 'active' } },
+    });
+    const deepEvent = await db.query(
       `SELECT event_id FROM record_events WHERE tenant_id=$1 AND app_id=$2 AND record_id=$3 ORDER BY occurred_at DESC LIMIT 1`,
       [owner.tenantId, app.id, record.id],
     );
     await db.query(
-      `UPDATE outbox SET causation_depth=5, root_causation_id=$3 WHERE tenant_id=$1 AND app_id=$2 AND event_id=$4`,
-      [owner.tenantId, app.id, depthEvent.rows[0].event_id, depthEvent.rows[0].event_id],
-    );
-    await db.query(
-      `UPDATE outbox SET automation_processed_at=NULL WHERE tenant_id=$1 AND app_id=$2 AND event_id=$3`,
-      [owner.tenantId, app.id, depthEvent.rows[0].event_id],
+      `UPDATE outbox SET causation_depth=5, root_causation_id=$3, automation_processed_at=NULL
+       WHERE tenant_id=$1 AND app_id=$2 AND event_id=$4`,
+      [owner.tenantId, app.id, deepEvent.rows[0].event_id, deepEvent.rows[0].event_id],
     );
     await engine.processOutbox(context);
-    const paused = await db.query(
-      `SELECT reason FROM automation_problem_chains WHERE tenant_id=$1 AND resumed_at IS NULL`,
-      [owner.tenantId],
+    const depthRun = await db.query(
+      `SELECT status FROM automation_runs
+       WHERE tenant_id=$1 AND app_id=$2 AND rule_id=$3 AND status='CHAIN_DEPTH_EXCEEDED'`,
+      [owner.tenantId, app.id, recordRule.rule.id],
     );
-    assert.ok(paused.rowCount >= 1);
+    assert.equal(depthRun.rowCount, 1);
+    const paused = await db.query(
+      `SELECT reason FROM automation_problem_chains
+       WHERE tenant_id=$1 AND root_causation_id=$2 AND resumed_at IS NULL`,
+      [owner.tenantId, deepEvent.rows[0].event_id],
+    );
+    assert.equal(paused.rowCount, 1);
+    assert.equal(paused.rows[0].reason, 'CAUSATION_DEPTH_EXCEEDED');
   } finally {
     await db.end();
   }
@@ -212,6 +243,6 @@ test('P3-B C6 source binding and C2 runtime guardrails use real API and worker p
   const pausedApi = await expectRequest(200, `/apps/${app.id}/automation/problem-chains`, { token });
   assert.ok(pausedApi.length >= 1);
   const root = pausedApi[0].rootCausationId;
-  const resumed = await expectRequest(200, `/apps/${app.id}/automation/problem-chains/${root}/resume`, { token, method: 'POST' });
+  const resumed = await expectRequest(201, `/apps/${app.id}/automation/problem-chains/${root}/resume`, { token, method: 'POST' });
   assert.equal(resumed.resumed, true);
 });

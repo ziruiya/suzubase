@@ -558,15 +558,24 @@ export class AutomationService {
     });
   }
 
-  listPausedChains(context: TenantContext) {
-    return withTenantTransaction(context, async (tx) =>
-      tx.select().from(automationProblemChains).where(and(
-        eq(automationProblemChains.tenantId, context.tenantId),
-        isNull(automationProblemChains.resumedAt),
-      )));
+  listPausedChains(context: TenantContext, appId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      const rows = await tx.select({ chain: automationProblemChains })
+        .from(automationProblemChains)
+        .innerJoin(automationRuns, and(
+          eq(automationRuns.tenantId, automationProblemChains.tenantId),
+          eq(automationRuns.id, automationProblemChains.lastRunId),
+        ))
+        .where(and(
+          eq(automationProblemChains.tenantId, context.tenantId),
+          eq(automationRuns.appId, appId),
+          isNull(automationProblemChains.resumedAt),
+        ));
+      return rows.map(({ chain }) => chain);
+    });
   }
 
-  resumePausedChain(context: TenantContext, rootCausationId: string) {
+  resumePausedChain(context: TenantContext, appId: string, rootCausationId: string) {
     return withTenantTransaction(context, async (tx) => {
       const [chain] = await tx.select().from(automationProblemChains).where(and(
         eq(automationProblemChains.tenantId, context.tenantId),
@@ -574,6 +583,14 @@ export class AutomationService {
         isNull(automationProblemChains.resumedAt),
       )).for('update');
       if (!chain) throw new NotFoundException('Active paused automation problem chain not found');
+      if (chain.lastRunId) {
+        const [lastRun] = await tx.select({ appId: automationRuns.appId }).from(automationRuns).where(and(
+          eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.id, chain.lastRunId),
+        ));
+        if (!lastRun || lastRun.appId !== appId) {
+          throw new NotFoundException('Active paused automation problem chain not found');
+        }
+      }
       await tx.update(automationProblemChains).set({
         resumedAt: sql`clock_timestamp()`, resumedBy: context.userId,
       }).where(and(
@@ -947,14 +964,15 @@ export class AutomationController {
   constructor(private readonly automation: AutomationService) {}
 
   @Get('problem-chains')
-  listPausedChains(@AuthenticatedTenant() context: TenantContext) {
-    return this.automation.listPausedChains(context);
+  listPausedChains(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string) {
+    return this.automation.listPausedChains(context, parseInput(identifier, appId));
   }
 
   @Post('problem-chains/:rootCausationId/resume')
   resumePausedChain(@AuthenticatedTenant() context: TenantContext,
-    @Param('rootCausationId') rootCausationId: string) {
-    return this.automation.resumePausedChain(context, parseInput(identifier, rootCausationId));
+    @Param('appId') appId: string, @Param('rootCausationId') rootCausationId: string) {
+    return this.automation.resumePausedChain(context, parseInput(identifier, appId),
+      parseInput(identifier, rootCausationId));
   }
 
   @Get('rules')
