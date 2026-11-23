@@ -719,3 +719,136 @@ test('P3-C date-relative: createdAt source plans from the record creation date i
     assert.equal(new Date(plans[0].due_at).toISOString(), expected.dueAt.toISOString());
   } finally { await db.end(); }
 });
+
+test('P3-C date-relative: B1 regression -- a terminal plan reopened by a date change executes a NEW run and notifies again', async () => {
+  configureRuntime();
+  const owner = await provision({ isAdmin: true });
+  const token = await login(owner);
+  const app = await createApp(token, 'p3c-dr-b1-reopen');
+  const base = `/apps/${app.id}`;
+  const wish = await addField(token, app.id, 'wish_date', 'date');
+  await publish(token, app.id);
+  const config = {
+    schemaVersion: 1,
+    trigger: { eventType: 'schedule.dateRelative', dateRelative: minus3At9Tokyo(wish.fieldId) },
+    conditions: emptyConditions,
+    actions: [{ actionId: randomUUID(), type: 'NOTIFY', notify: { recipientUserIds: [owner.userId], title: 'Reminder', body: 'due soon' } }],
+  };
+  const saved = await expectRequest(201, `${base}/automation/rules`, { token, method: 'POST', body: { name: 'B1 reopen', config } });
+  await expectRequest(201, `${base}/automation/rules/${saved.rule.id}/grants`, {
+    token, method: 'POST', body: {
+      version: saved.version.version, sourceAppId: app.id, readableFieldIds: [wish.fieldId],
+      targetAppIds: [], writableFieldIds: [], allowedOperations: ['NOTIFY'],
+    },
+  });
+  await expectRequest(201, `${base}/automation/rules/${saved.rule.id}/publish`, { token, method: 'POST', body: { version: saved.version.version } });
+  await expectRequest(201, `${base}/automation/rules/${saved.rule.id}/enable`, { token, method: 'POST', body: { enabled: true } });
+  const record = await addRecord(token, base, { [wish.fieldId]: '2026-12-13' });
+  const engine = buildEngine();
+  const context = maintenanceContext(owner.tenantId);
+  await engine.processOutbox(context);
+  const db = await adminClient();
+  try {
+    const notesFor = async (runId) => {
+      const { rows } = await db.query(
+        `SELECT count(*)::int AS count FROM notifications WHERE tenant_id=$1 AND payload->>'runId'=$2`,
+        [owner.tenantId, runId]);
+      return rows[0].count;
+    };
+    // First source date executes once: plan SUCCEEDED, one run, one notification.
+    const first = await engine.processDateRelativeSchedules(context, { now: new Date('2026-12-10T00:05:00Z') });
+    assert.equal(first.executed, 1);
+    let runs = await runRows(db, owner.tenantId, saved.rule.id);
+    assert.equal(runs.length, 1);
+    const firstRun = runs[0];
+    assert.equal(await notesFor(firstRun.id), 1);
+    let plans = await planRows(db, owner.tenantId, saved.rule.id);
+    assert.equal(plans[0].status, 'SUCCEEDED');
+    // Move the source date: the terminal plan reopens for the new date.
+    const current = await expectRequest(200, `${base}/records/${record.id}`, { token });
+    await expectRequest(200, `${base}/records/${record.id}`, {
+      token, method: 'PUT', body: { revision: current.revision, data: { [wish.fieldId]: '2026-12-20' } },
+    });
+    await engine.processOutbox(context);
+    plans = await planRows(db, owner.tenantId, saved.rule.id);
+    assert.equal(plans.length, 1, 'still one logical plan row');
+    assert.equal(plans[0].status, 'PENDING', 'terminal plan reopens when the source date moves');
+    assert.equal(plans[0].source_date, '2026-12-20');
+    assert.equal(new Date(plans[0].due_at).toISOString(), '2026-12-17T00:00:00.000Z');
+    // New due date: a genuinely new run must execute and notify. Before
+    // the B1 fix the run idempotency key did not contain the source
+    // date, so the consumer adopted the OLD run and silently swallowed
+    // the new reminder (runs stayed 1, no second notification).
+    const second = await engine.processDateRelativeSchedules(context, { now: new Date('2026-12-17T00:05:00Z') });
+    assert.equal(second.executed, 1);
+    runs = await runRows(db, owner.tenantId, saved.rule.id);
+    assert.equal(runs.length, 2, 'B1: the new source date must produce a second run, not adopt the old one');
+    const secondRun = runs.find((run) => run.id !== firstRun.id);
+    assert.ok(secondRun, 'second run is a distinct row');
+    assert.notEqual(secondRun.idempotency_key, firstRun.idempotency_key);
+    assert.ok(secondRun.idempotency_key.includes('2026-12-20'), 'run identity carries the source date');
+    assert.equal(await notesFor(secondRun.id), 1, 'B1: the reminder for the new date is actually sent');
+    assert.equal(await notesFor(firstRun.id), 1, 'the first notification is not duplicated');
+    plans = await planRows(db, owner.tenantId, saved.rule.id);
+    assert.equal(plans[0].status, 'SUCCEEDED');
+  } finally { await db.end(); }
+});
+
+test('P3-C date-relative: B1 regression -- replay with the SAME source date adopts the existing run (crash recovery, no duplicate execution or notification)', async () => {
+  configureRuntime();
+  const owner = await provision({ isAdmin: true });
+  const token = await login(owner);
+  const app = await createApp(token, 'p3c-dr-b1-replay');
+  const base = `/apps/${app.id}`;
+  const wish = await addField(token, app.id, 'wish_date', 'date');
+  await publish(token, app.id);
+  const config = {
+    schemaVersion: 1,
+    trigger: { eventType: 'schedule.dateRelative', dateRelative: minus3At9Tokyo(wish.fieldId) },
+    conditions: emptyConditions,
+    actions: [{ actionId: randomUUID(), type: 'NOTIFY', notify: { recipientUserIds: [owner.userId], title: 'Reminder', body: 'due soon' } }],
+  };
+  const saved = await expectRequest(201, `${base}/automation/rules`, { token, method: 'POST', body: { name: 'B1 replay', config } });
+  await expectRequest(201, `${base}/automation/rules/${saved.rule.id}/grants`, {
+    token, method: 'POST', body: {
+      version: saved.version.version, sourceAppId: app.id, readableFieldIds: [wish.fieldId],
+      targetAppIds: [], writableFieldIds: [], allowedOperations: ['NOTIFY'],
+    },
+  });
+  await expectRequest(201, `${base}/automation/rules/${saved.rule.id}/publish`, { token, method: 'POST', body: { version: saved.version.version } });
+  await expectRequest(201, `${base}/automation/rules/${saved.rule.id}/enable`, { token, method: 'POST', body: { enabled: true } });
+  const record = await addRecord(token, base, { [wish.fieldId]: '2026-12-13' });
+  void record;
+  const engine = buildEngine();
+  const context = maintenanceContext(owner.tenantId);
+  await engine.processOutbox(context);
+  const db = await adminClient();
+  try {
+    const notesFor = async (runId) => {
+      const { rows } = await db.query(
+        `SELECT count(*)::int AS count FROM notifications WHERE tenant_id=$1 AND payload->>'runId'=$2`,
+        [owner.tenantId, runId]);
+      return rows[0].count;
+    };
+    const first = await engine.processDateRelativeSchedules(context, { now: new Date('2026-12-10T00:05:00Z') });
+    assert.equal(first.executed, 1);
+    const runs = await runRows(db, owner.tenantId, saved.rule.id);
+    assert.equal(runs.length, 1);
+    assert.equal(await notesFor(runs[0].id), 1);
+    // Simulate a worker that created the run (and its notification) but
+    // died before finalizing the plan: rewind the plan row to its
+    // pre-finalize state. The source date is unchanged, so the replay
+    // must adopt the existing run -- never execute or notify twice.
+    await db.query(
+      `UPDATE automation_schedules SET status='PENDING', claim_token=NULL, claimed_at=NULL, executed_at=NULL
+       WHERE tenant_id=$1 AND rule_id=$2`,
+      [owner.tenantId, saved.rule.id]);
+    await engine.processDateRelativeSchedules(context, { now: new Date('2026-12-10T00:06:00Z') });
+    const afterRuns = await runRows(db, owner.tenantId, saved.rule.id);
+    assert.equal(afterRuns.length, 1, 'same source date replay adopts the old run: no new run');
+    assert.equal(afterRuns[0].id, runs[0].id);
+    assert.equal(await notesFor(runs[0].id), 1, 'notification is not duplicated on replay');
+    const plans = await planRows(db, owner.tenantId, saved.rule.id);
+    assert.equal(plans[0].status, 'SUCCEEDED', 'adoption finalizes the plan from the old run outcome');
+  } finally { await db.end(); }
+});
