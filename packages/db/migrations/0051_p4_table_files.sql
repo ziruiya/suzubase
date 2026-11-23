@@ -2,10 +2,10 @@
 -- files live in table_file_references (the child field id is not a row in
 -- "fields", so file_references cannot address a cell). One attachment
 -- subsystem: same files table, state machine, retention and counting.
--- NOTE for the P4 merge step: this branch and p4-t1-categories both use
--- migration index 50 and both recreate purge_imported_app from the 0048
--- definition; the merge must renumber one of them and combine the two
--- added DELETE lines (record_categories + table_file_references).
+-- P4 merge (p4-merge-t1t2): this migration was renumbered from index 50
+-- to 51 (0050 is p4-t1-categories), and its purge_imported_app below is
+-- the combined final definition: the 0048 body plus BOTH added DELETE
+-- lines (table_file_references and record_categories).
 CREATE TABLE "table_file_references" (
 	"tenant_id" uuid NOT NULL,
 	"app_id" uuid NOT NULL,
@@ -35,8 +35,10 @@ CREATE POLICY tenant_scope ON table_file_references TO suzubase_runtime
 GRANT SELECT, INSERT, DELETE ON table_file_references TO suzubase_runtime;
 --> statement-breakpoint
 -- Import cleanup completeness: purge_imported_app (0048 definition)
--- recreated with table_file_references deleted before its parent records.
--- Everything else is byte-identical to the 0048 definition.
+-- recreated with table_file_references deleted before its parent records
+-- and record_categories deleted before its parent records (the 0050
+-- categories migration added that line; this final definition carries
+-- both). Everything else is byte-identical to the 0048 definition.
 CREATE OR REPLACE FUNCTION public.purge_imported_app(p_tenant_id uuid, p_app_id uuid)
 RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
@@ -82,6 +84,7 @@ BEGIN
   DELETE FROM workflow_assignments WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
   DELETE FROM record_workflow_state WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
   DELETE FROM record_references WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
+  DELETE FROM record_categories WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
   DELETE FROM record_table_rows WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
   DELETE FROM records WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
   DELETE FROM files WHERE tenant_id = p_tenant_id AND app_id = p_app_id;
