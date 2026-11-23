@@ -22,10 +22,12 @@ type ProblemChain = {
   rootCausationId: string; reason: string; lastRunId: string | null; pausedAt: string | null;
 };
 
+// P3-C C-2: only statuses a run can actually carry. RATE_LIMITED and
+// BACKLOG_LIMITED are audit signals, never run statuses; the legacy P3-A
+// ACTIONS_NOT_IMPLEMENTED state was removed by migration 0044.
 const runStatuses = [
   'QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'SKIPPED_CONDITION', 'SKIPPED_STALE',
-  'SKIPPED_UNAUTHORIZED', 'BLOCKED_CYCLE', 'CHAIN_DEPTH_EXCEEDED', 'ACTIONS_NOT_IMPLEMENTED',
-  'RATE_LIMITED', 'BACKLOG_LIMITED', 'CHAIN_PAUSED',
+  'SKIPPED_UNAUTHORIZED', 'BLOCKED_CYCLE', 'CHAIN_DEPTH_EXCEEDED', 'CHAIN_PAUSED',
 ] as const;
 
 const formatTime = (value: string | null) => value ?? '—';
@@ -118,9 +120,11 @@ export function AutomationSettings({ app, token }: { app: App; token: string }) 
       setDetail({ run: result.run, actions: result.actions });
       await loadRuns();
       await loadSummary();
-      setNotice(result.deduplicated
-        ? 'An existing run was returned for this idempotency key; no new run was started.'
-        : 'Manual run finished with status ' + result.run.status + '.');
+      setNotice(result.deduplicated && result.run.status === 'FAILED'
+        ? 'An existing run was returned for this idempotency key, and that run FAILED. It was not executed again — use “Retry failed actions” on the run to retry it.'
+        : result.deduplicated
+          ? 'An existing run was returned for this idempotency key; no new run was started.'
+          : 'Manual run finished with status ' + result.run.status + '.');
     });
   }
 
@@ -213,8 +217,14 @@ export function AutomationSettings({ app, token }: { app: App; token: string }) 
     </form>
     {manualResult && <p role="status">Run status · {manualResult.run.status}
       {manualResult.deduplicated ? ' · Deduplicated: an existing run was returned.' : ' · New run.'}</p>}
+    {manualResult?.deduplicated && manualResult.run.status === 'FAILED' && <div className="stack">
+      <p role="alert">This existing run failed and was not executed again. Retry it instead of triggering a new manual run.</p>
+      <div className="inline"><button type="button" disabled={busy}
+        onClick={() => retry(manualResult.run.id)}>Retry failed actions</button></div>
+    </div>}
 
     <h3>Problem chains</h3>
+    <p className="muted">Resuming a chain does not replay anything: events that arrived while the chain was paused were discarded and will not be re-run.</p>
     {!chains.length && <p className="muted">No paused problem chains.</p>}
     <ul className="plain">{chains.map((chain) => <li className="inline" key={chain.rootCausationId}>
       <span>{chain.reason} <span className="muted">· root {chain.rootCausationId}

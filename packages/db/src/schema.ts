@@ -629,7 +629,7 @@ export const automationRuns = pgTable('automation_runs', {
   foreignKey({ columns: [t.tenantId, t.appId, t.ruleId, t.ruleVersion], foreignColumns: [automationRuleVersions.tenantId, automationRuleVersions.appId, automationRuleVersions.ruleId, automationRuleVersions.version] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.eventId], foreignColumns: [outbox.tenantId, outbox.appId, outbox.eventId] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
-  check('automation_run_status', sql`${t.status} IN ('QUEUED','RUNNING','SUCCEEDED','FAILED','SKIPPED_CONDITION','SKIPPED_STALE','SKIPPED_UNAUTHORIZED','BLOCKED_CYCLE','CHAIN_DEPTH_EXCEEDED','ACTIONS_NOT_IMPLEMENTED','RATE_LIMITED','BACKLOG_LIMITED','CHAIN_PAUSED')`),
+  check('automation_run_status', sql`${t.status} IN ('QUEUED','RUNNING','SUCCEEDED','FAILED','SKIPPED_CONDITION','SKIPPED_STALE','SKIPPED_UNAUTHORIZED','BLOCKED_CYCLE','CHAIN_DEPTH_EXCEEDED','CHAIN_PAUSED')`),
   index('automation_runs_history_idx').on(t.tenantId, t.appId, t.ruleId, t.startedAt.desc()),
 ]);
 

@@ -25,6 +25,13 @@ export const AUTOMATION_TENANT_RUN_RATE_LIMIT = 100;
 export const AUTOMATION_TENANT_RUN_RATE_WINDOW_MS = 60_000;
 export const AUTOMATION_TENANT_PENDING_LIMIT = 1_000;
 export const AUTOMATION_PROBLEM_CHAIN_FAILURE_LIMIT = 3;
+// P3-C C-3: guardrail audit rows (RATE_LIMITED / BACKLOG_LIMITED) are
+// throttled per (tenant, app, rule, action): the first row in each window
+// is always written; repeats inside the window are suppressed so a
+// sustained limit cannot flood the append-only audit table. The signal is
+// not lost -- the triggering event stays unprocessed and a later pass
+// outside the window writes a fresh row.
+export const AUTOMATION_GUARDRAIL_AUDIT_WINDOW_MS = 60_000;
 
 // P3-C C-0 (option a): maintenanceTenants() contexts carry the nil UUID as
 // userId; that identity is not a tenant member, so audit rows written from
@@ -728,7 +735,13 @@ export class AutomationService {
         }
       }
       return {
-        dryRun: true, sideEffects: false, eventType: cfg.trigger.eventType, recordId: row.id,
+        dryRun: true, sideEffects: false,
+        // P3-C C-3 disclosure: a dry run is a zero-side-effect preview and
+        // deliberately writes NO audit event and no run history (brief
+        // appendix 2, F8). The preview result is returned synchronously to
+        // the operator only; `auditTrail: 'none'` states that in the API.
+        auditTrail: 'none' as const,
+        eventType: cfg.trigger.eventType, recordId: row.id,
         triggerMatches, snapshotMatches, currentMatches, fieldVersionValid, authorized,
         wouldRun: triggerMatches === true && snapshotMatches && currentMatches && fieldVersionValid && authorized,
         actions: cfg.actions.map(({ actionId, type, targetAppId, targetFieldIds }) => ({
@@ -736,7 +749,8 @@ export class AutomationService {
         })),
         actionPlans,
         boundaries: 'Dry run resolves recipients and field changes against the current record only; ' +
-          'grants, workflow state and conditions are re-checked at execution time.',
+          'grants, workflow state and conditions are re-checked at execution time. ' +
+          'A dry run writes no audit event and leaves no run history: it is a zero-side-effect preview.',
         warning: cfg.trigger.eventType.startsWith('workflow.')
           ? 'Workflow event dry-run requires a persisted workflow event; this record-only preview does not simulate one.' : null,
       };
@@ -795,6 +809,19 @@ export class AutomationService {
       }
       return { resumed: true, rootCausationId };
     });
+  }
+
+  // P3-C C-3 throttle check: true when a guardrail audit row for the same
+  // (tenant, app, rule, action) already exists inside the throttle window.
+  private async guardrailAuditThrottled(tx: TenantTransaction, tenantId: string,
+    appId: string, ruleId: string, action: 'RATE_LIMITED' | 'BACKLOG_LIMITED') {
+    const recent = await tx.execute(sql`
+      SELECT 1 AS hit FROM automation_audit_events
+      WHERE tenant_id=${tenantId} AND app_id=${appId} AND rule_id=${ruleId} AND action=${action}
+        AND occurred_at >= clock_timestamp() - (${AUTOMATION_GUARDRAIL_AUDIT_WINDOW_MS} * interval '1 millisecond')
+      LIMIT 1
+    `);
+    return recent.rows.length > 0;
   }
 
   async processOutbox(context: TenantContext, limit = 100) {
@@ -859,11 +886,14 @@ export class AutomationService {
             `);
             const runCount = Number((recentRuns.rows[0] as { count: number }).count ?? 0);
             if (runCount >= AUTOMATION_TENANT_RUN_RATE_LIMIT) {
-              for (const candidate of candidates) await tx.insert(automationAuditEvents).values({
-                tenantId: context.tenantId, appId: candidate.rule.appId, ruleId: candidate.rule.id,
-                ruleVersion: candidate.version.version, ...auditActor(context), action: 'RATE_LIMITED',
-                details: { rootCausationId, eventId: event.eventId, limit: AUTOMATION_TENANT_RUN_RATE_LIMIT, windowMs: AUTOMATION_TENANT_RUN_RATE_WINDOW_MS },
-              });
+              for (const candidate of candidates) {
+                if (await this.guardrailAuditThrottled(tx, context.tenantId, candidate.rule.appId, candidate.rule.id, 'RATE_LIMITED')) continue;
+                await tx.insert(automationAuditEvents).values({
+                  tenantId: context.tenantId, appId: candidate.rule.appId, ruleId: candidate.rule.id,
+                  ruleVersion: candidate.version.version, ...auditActor(context), action: 'RATE_LIMITED',
+                  details: { rootCausationId, eventId: event.eventId, limit: AUTOMATION_TENANT_RUN_RATE_LIMIT, windowMs: AUTOMATION_TENANT_RUN_RATE_WINDOW_MS },
+                });
+              }
               continue;
             }
             const backlog = await tx.execute(sql`
@@ -875,11 +905,14 @@ export class AutomationService {
             `);
             const pendingCount = Number((backlog.rows[0] as { count: number }).count ?? 0);
             if (pendingCount > AUTOMATION_TENANT_PENDING_LIMIT) {
-              for (const candidate of candidates) await tx.insert(automationAuditEvents).values({
-                tenantId: context.tenantId, appId: candidate.rule.appId, ruleId: candidate.rule.id,
-                ruleVersion: candidate.version.version, ...auditActor(context), action: 'BACKLOG_LIMITED',
-                details: { rootCausationId, eventId: event.eventId, pendingCount, limit: AUTOMATION_TENANT_PENDING_LIMIT },
-              });
+              for (const candidate of candidates) {
+                if (await this.guardrailAuditThrottled(tx, context.tenantId, candidate.rule.appId, candidate.rule.id, 'BACKLOG_LIMITED')) continue;
+                await tx.insert(automationAuditEvents).values({
+                  tenantId: context.tenantId, appId: candidate.rule.appId, ruleId: candidate.rule.id,
+                  ruleVersion: candidate.version.version, ...auditActor(context), action: 'BACKLOG_LIMITED',
+                  details: { rootCausationId, eventId: event.eventId, pendingCount, limit: AUTOMATION_TENANT_PENDING_LIMIT },
+                });
+              }
               continue;
             }
           for (const candidate of candidates) {
@@ -994,6 +1027,14 @@ export class AutomationService {
                   : `REPEATED_FAILURES_LIMIT_${AUTOMATION_PROBLEM_CHAIN_FAILURE_LIMIT}`,
                 lastRunId: run.id,
               }).onConflictDoNothing();
+              // P3-C C-2: CHAIN_PAUSED is a real audit action from here --
+              // every chain pause (repeated failures or depth limit) writes
+              // exactly one audit row, keyed to the run that paused it.
+              await tx.insert(automationAuditEvents).values({
+                tenantId: context.tenantId, appId: event.appId, ruleId: candidate.rule.id,
+                ruleVersion: candidate.version.version, ...auditActor(context), action: 'CHAIN_PAUSED',
+                details: { rootCausationId: event.rootCausationId ?? event.eventId, runId: run.id, reason: status },
+              });
               const admins = await tx.select({ userId: tenantMembers.userId }).from(tenantMembers).where(and(
                 eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.isAdmin, true), isNull(tenantMembers.disabledAt),
               ));
@@ -1232,7 +1273,7 @@ export class AutomationService {
   }
 
   private async executeNotify(tx: TenantTransaction, delegated: TenantContext, args: {
-    appId: string; ruleId: string;
+    appId: string; ruleId: string; runId: string; idempotencyKey: string;
     action: AutomationRuleConfig['actions'][number]; record: RecordResponse;
     eventId: string | null; readableFieldIds: string[];
   }) {
@@ -1246,6 +1287,12 @@ export class AutomationService {
         tenantId: delegated.tenantId, userId, sourceType: 'RECORD' as const, appId: args.appId,
         recordId: args.record.id, eventId: args.eventId,
         ruleKey: `automation:${args.ruleId}:${args.action.actionId}`,
+        // P3-C C-1: every automation notification carries its run and
+        // action idempotency key in the payload, so event-less (manual)
+        // notifications -- whose (tenant, app, event, user, rule_key)
+        // unique key cannot fire with a NULL event -- can still be
+        // reconciled back to exactly one run action by the audit tool.
+        payload: { runId: args.runId, actionId: args.action.actionId, actionIdempotencyKey: args.idempotencyKey },
         title, body, emailState: 'skipped' as const,
       }))).onConflictDoNothing();
     }
@@ -1386,13 +1433,27 @@ export class AutomationService {
         isNull(records.deletedAt)));
       if (!recordRow) throw new NotFoundException('Record not found');
       const runId = randomUUID();
+      // P3-C C-1: a concurrent manual trigger carrying the same
+      // idempotency key can pass the pre-check above and collide on the
+      // run unique constraint. That collision is a replay, not an error:
+      // insert with ON CONFLICT DO NOTHING and return the existing run.
       const [run] = await tx.insert(automationRuns).values({
         id: runId, tenantId: context.tenantId, appId, ruleId, ruleVersion: rule.currentVersion,
         eventId: null, triggerIdentity: identity,
         idempotencyKey: `${identity}:${ruleId}:${rule.currentVersion}`,
         recordId: input.recordId, rootCausationId: runId, parentRunId: null, causationDepth: 1,
         originRuleId: ruleId, originActionId: null, status: 'RUNNING',
-      }).returning();
+      }).onConflictDoNothing().returning();
+      if (!run) {
+        const [winner] = await tx.select().from(automationRuns).where(and(
+          eq(automationRuns.tenantId, context.tenantId),
+          eq(automationRuns.idempotencyKey, `${identity}:${ruleId}:${rule.currentVersion}`)));
+        if (!winner) throw new ConflictException('Manual run collided with an existing run that could not be read back');
+        const winnerActions = await tx.select().from(automationRunActions).where(and(
+          eq(automationRunActions.tenantId, context.tenantId), eq(automationRunActions.runId, winner.id)))
+          .orderBy(automationRunActions.position);
+        return { run: winner, actions: winnerActions, deduplicated: true };
+      }
       const actionRows: { action: AutomationRuleConfig['actions'][number];
         row: { actionId: string; idempotencyKey: string } }[] = [];
       for (const [position, action] of cfg.actions.entries()) {

@@ -38,6 +38,11 @@
 // rule_key categories across distinct events, so grouping them by rule_key
 // counts distinct deliveries as duplicates. No assertion is weakened: every
 // key the schema actually enforces is still required to be duplicate-free.
+// Population note (P3-C C-1): automation notifications carry
+// payload.runId + payload.actionIdempotencyKey from P3-C onwards, so
+// event-less RECORD notifications (manual runs) can be reconciled back to
+// exactly one automation_run_actions row; check 3c enforces that linkage
+// and per-run duplicate-freedom for the automation population.
 // Exit code is non-zero when any check fails. Output is JSON.
 import { createRequire } from 'node:module';
 
@@ -142,6 +147,27 @@ try {
      FROM outbox WHERE processed_at IS NOT NULL`)).rows[0];
   record('processed outbox sample readable', true,
     `${processed.total} processed outbox rows, ${processed.empty} with empty delivery lists (rules may legitimately match nobody)`);
+
+  // 3c. Event-less automation notifications (manual runs, P3-C C-1): each
+  // must link back via payload to a real run action, and no (run, user,
+  // rule_key) may carry more than one notification.
+  const manualUnlinked = (await client.query(
+    `SELECT count(*)::int AS n FROM notifications n
+     WHERE n.source_type = 'RECORD' AND n.event_id IS NULL AND n.rule_key LIKE 'automation:%'
+       AND (n.payload IS NULL OR n.payload->>'runId' IS NULL OR n.payload->>'actionIdempotencyKey' IS NULL
+         OR NOT EXISTS (SELECT 1 FROM automation_run_actions a
+           WHERE a.tenant_id = n.tenant_id AND a.run_id = (n.payload->>'runId')::uuid
+             AND a.idempotency_key = n.payload->>'actionIdempotencyKey'))`)).rows[0].n;
+  record('manual automation notifications reconcile to run actions', manualUnlinked === 0,
+    `${manualUnlinked} event-less automation notifications without a matching run action`);
+  const manualDuplicates = (await client.query(
+    `SELECT count(*)::int AS n FROM (
+       SELECT tenant_id, payload->>'runId' AS run_id, user_id, rule_key, count(*) AS c
+       FROM notifications
+       WHERE source_type = 'RECORD' AND event_id IS NULL AND rule_key LIKE 'automation:%'
+       GROUP BY 1, 2, 3, 4 HAVING count(*) > 1) d`)).rows[0].n;
+  record('manual automation notification duplicates', manualDuplicates === 0,
+    `${manualDuplicates} duplicated (run, user, rule_key) manual notification keys`);
 } finally {
   await client.end();
 }
