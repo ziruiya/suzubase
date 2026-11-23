@@ -4,7 +4,7 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, automationAuditEvents, automationCadencePlans, automationCadenceSlots, automationDateBackfills, automationGrants, automationRuleVersions, automationRunActions, automationRuns,
-  automationRules, automationProblemChains, automationSchedules, eq, groupMembers, inArray, isNull, notifications, outbox, records, sql, tenantMembers, TenantContext, TenantTransaction, withTenantTransaction, workflowAssignments,
+  automationRules, automationProblemChains, automationSchedules, automationWebhookAttempts, automationWebhookDeliveries, automationWebhookEndpoints, eq, groupMembers, inArray, isNull, notifications, outbox, records, sql, tenantMembers, TenantContext, TenantTransaction, withTenantTransaction, workflowAssignments,
   type AutomationRuleConfig,
 } from '@suzubase/db';
 import {
@@ -22,6 +22,18 @@ import { serializeRecord } from './record-events';
 import { RecordService } from './records';
 import { WorkflowRuntimeService } from './workflow-runtime';
 import { randomUUID } from 'node:crypto';
+import {
+  checkWebhookUrl, classifyTransportResult, decryptWebhookSecret, defaultWebhookResolver, defaultWebhookTransport,
+  encryptWebhookSecret, hashPayload, resolvePublicIps, summarizeResponse, webhookRetryDelayMs, webhookSignature,
+  webhookUrlHash, WEBHOOK_MAX_ATTEMPTS, WEBHOOK_MAX_REQUEST_BYTES, WEBHOOK_TIMEOUT_MS, WEBHOOK_CLAIM_LEASE_MS,
+  type WebhookPolicy, type WebhookResolver, type WebhookTransport,
+} from './automation-webhook';
+
+export interface AutomationWebhookDeps {
+  resolver?: WebhookResolver;
+  transport?: WebhookTransport;
+  random?: () => number;
+}
 import { identifier, parseInput } from './validation';
 
 const eventTypes = ['record.created', 'record.updated', 'record.deleted', 'workflow.transitioned', 'workflow.rejected', 'schedule.fixed', 'schedule.dateRelative'] as const;
@@ -155,6 +167,9 @@ const config = z.strictObject({
       sourceFieldId: identifier.optional(),
     })).max(100).optional(),
     workflowActionId: identifier.optional(),
+    webhook: z.strictObject({
+      endpointId: identifier,
+    }).optional(),
   })).max(50).refine((actions) => new Set(actions.map(({ actionId }) => actionId)).size === actions.length),
 }).superRefine((value, ctx) => {
   const { trigger } = value;
@@ -275,6 +290,12 @@ const config = z.strictObject({
     if (action.type === 'ADVANCE_WORKFLOW' && !action.workflowActionId) {
       ctx.addIssue({ code: 'custom', message: 'ADVANCE_WORKFLOW actions require a workflow action' });
     }
+    if (action.type === 'WEBHOOK' && !action.webhook?.endpointId) {
+      ctx.addIssue({ code: 'custom', message: 'WEBHOOK actions require a webhook endpoint' });
+    }
+    if (action.type !== 'WEBHOOK' && action.webhook) {
+      ctx.addIssue({ code: 'custom', message: 'Only WEBHOOK actions take a webhook configuration' });
+    }
   }
 });
 const createRuleInput = z.strictObject({ name: z.string().trim().min(1).max(120), config });
@@ -293,6 +314,18 @@ const manualRunInput = z.strictObject({
   recordId: identifier,
   idempotencyKey: z.string().trim().min(1).max(120).optional(),
 });
+const webhookEndpointInput = z.strictObject({
+  name: z.string().trim().min(1).max(120),
+  url: z.string().trim().min(1).max(2000),
+  policy: z.enum(['AUTO_RETRY_AT_LEAST_ONCE', 'MANUAL_ON_UNCERTAIN']),
+  secret: z.string().min(8).max(500)
+});
+const webhookEndpointUpdateInput = z.strictObject({
+  name: z.string().trim().min(1).max(120).optional(),
+  url: z.string().trim().min(1).max(2000).optional(),
+  policy: z.enum(['AUTO_RETRY_AT_LEAST_ONCE', 'MANUAL_ON_UNCERTAIN']).optional(),
+});
+const webhookSecretInput = z.strictObject({ secret: z.string().min(8).max(500) });
 
 export const automationHttp = {
   createRuleInput,
@@ -321,6 +354,14 @@ export const automationHttp = {
   }),
   auditPage: z.looseObject({ items: z.array(z.unknown()), total: z.number().int() }),
   summary: z.looseObject({ rules: z.array(z.unknown()), backlog: z.number().int(), unprocessedEvents: z.number().int() }),
+  webhookEndpointInput,
+  webhookEndpointUpdateInput,
+  webhookSecretInput,
+  webhookEndpoint: z.looseObject({
+    id: identifier, name: z.string(), url: z.string(), policy: z.string(),
+    keyVersion: z.number().int(), validated: z.boolean(),
+  }),
+  webhookDeliveryPage: z.looseObject({ items: z.array(z.unknown()), attempts: z.array(z.unknown()), total: z.number().int() }),
   result: z.looseObject({}),
 };
 
@@ -521,7 +562,8 @@ function cycleFindings(rules: { appId: string; config: AutomationRuleConfig }[])
 @Injectable()
 export class AutomationService {
   constructor(private readonly schema: AppSchemaService, private readonly authorization: AuthorizationService,
-    private readonly recordWrites: RecordService, private readonly workflowRuntime: WorkflowRuntimeService) {}
+    private readonly recordWrites: RecordService, private readonly workflowRuntime: WorkflowRuntimeService,
+    private readonly webhookDeps: AutomationWebhookDeps = {}) {}
 
   list(context: TenantContext, appId: string) {
     return withTenantTransaction(context, async (tx) => {
@@ -880,9 +922,21 @@ export class AutomationService {
           actionPlans.push({ actionId: action.actionId, type: action.type,
             workflowActionId: action.workflowActionId, currentStatus: row.status ?? null,
             note: 'Workflow state, automation opt-in and action conditions are re-evaluated at execution time.' });
+        } else if (action.type === 'WEBHOOK') {
+          const [endpoint] = action.webhook?.endpointId ? await tx.select().from(automationWebhookEndpoints)
+            .where(and(eq(automationWebhookEndpoints.tenantId, context.tenantId),
+              eq(automationWebhookEndpoints.id, action.webhook.endpointId))) : [];
+          actionPlans.push({ actionId: action.actionId, type: action.type,
+            endpointId: action.webhook?.endpointId ?? null,
+            endpointUrl: endpoint?.url ?? null, policy: endpoint?.policy ?? null,
+            endpointValidated: endpoint ? endpoint.validatedUrlHash === webhookUrlHash(endpoint.url) : false,
+            payloadPreview: { recordId: row.id,
+              fields: Object.keys(record.data).filter((id) => readableIds.has(id)) },
+            note: 'Dry run never calls the endpoint. A real run enqueues a durable delivery; ' +
+              'the webhook worker performs the HTTP call asynchronously.' });
         } else {
           actionPlans.push({ actionId: action.actionId, type: action.type,
-            note: 'Webhook delivery is implemented in P3-D; in P3-B the action fails explicitly.' });
+            note: 'Action type has no dry-run planner.' });
         }
       }
       return {
@@ -2326,8 +2380,7 @@ export class AutomationService {
       case 'UPDATE_FIELDS': return this.executeUpdateFields(tx, delegated, args);
       case 'CREATE_RECORD': return this.executeCreateRecord(tx, delegated, args);
       case 'ADVANCE_WORKFLOW': return this.executeAdvanceWorkflow(tx, delegated, args);
-      case 'WEBHOOK': throw codedError('WEBHOOK_NOT_IMPLEMENTED_P3D',
-        'Webhook actions are delivered in P3-D and fail explicitly in P3-B');
+      case 'WEBHOOK': return this.executeWebhook(tx, delegated, args);
       default: throw codedError('ACTION_TYPE_UNSUPPORTED', 'Unsupported action type: ' + args.action.type);
     }
   }
@@ -2538,6 +2591,386 @@ export class AutomationService {
         eq(automationRunActions.tenantId, context.tenantId), eq(automationRunActions.runId, runId)))
         .orderBy(automationRunActions.position);
       return { run: finalRun, actions: finalActions, deduplicated: false };
+    });
+  }
+
+
+  // ---------------------------------------------------------------------
+  // P3-D wave 1: Webhook endpoints, delivery enqueue and the worker-side
+  // delivery engine (A-5). The run action only enqueues a durable
+  // delivery (frozen payload built from the event-time record snapshot);
+  // HTTP happens here, driven by the worker, never inside the run
+  // transaction. Action SUCCEEDED therefore means "delivery durably
+  // queued"; the delivery row is the source of truth for the HTTP
+  // outcome (see P3-REPORT, P3-D wave 1).
+  // ---------------------------------------------------------------------
+
+  private webhookResolver(): WebhookResolver {
+    return this.webhookDeps.resolver ?? defaultWebhookResolver;
+  }
+
+  private webhookTransport(): WebhookTransport {
+    return this.webhookDeps.transport ?? defaultWebhookTransport;
+  }
+
+  private endpointView(row: typeof automationWebhookEndpoints.$inferSelect) {
+    return {
+      id: row.id, name: row.name, url: row.url, policy: row.policy,
+      keyVersion: row.keyVersion, previousKeyVersion: row.previousKeyVersion,
+      rotatedAt: row.rotatedAt, secretSet: true,
+      validated: row.validatedUrlHash !== null && row.validatedUrlHash === webhookUrlHash(row.url),
+      validatedAt: row.validatedAt, createdAt: row.createdAt, updatedAt: row.updatedAt,
+    };
+  }
+
+  listWebhookEndpoints(context: TenantContext, appId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const rows = await tx.select().from(automationWebhookEndpoints).where(and(
+        eq(automationWebhookEndpoints.tenantId, context.tenantId),
+        eq(automationWebhookEndpoints.appId, appId),
+      )).orderBy(automationWebhookEndpoints.createdAt);
+      return rows.map((row) => this.endpointView(row));
+    });
+  }
+
+  createWebhookEndpoint(context: TenantContext, appId: string, input: z.infer<typeof webhookEndpointInput>) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const resolved = await resolvePublicIps(input.url, this.webhookResolver());
+      if ('error' in resolved) throw new BadRequestException({ code: resolved.error.code, message: resolved.error.message });
+      const [row] = await tx.insert(automationWebhookEndpoints).values({
+        tenantId: context.tenantId, appId, name: input.name, url: input.url, policy: input.policy,
+        secretEnc: encryptWebhookSecret(input.secret), keyVersion: 1,
+        validatedUrlHash: webhookUrlHash(input.url), validatedAt: new Date().toISOString(),
+        createdBy: context.userId,
+      }).returning();
+      return this.endpointView(row);
+    });
+  }
+
+  updateWebhookEndpoint(context: TenantContext, appId: string, endpointId: string,
+    input: z.infer<typeof webhookEndpointUpdateInput>) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const [existing] = await tx.select().from(automationWebhookEndpoints).where(and(
+        eq(automationWebhookEndpoints.tenantId, context.tenantId),
+        eq(automationWebhookEndpoints.appId, appId), eq(automationWebhookEndpoints.id, endpointId)));
+      if (!existing) throw new NotFoundException('Webhook endpoint not found');
+      const patch: Partial<typeof automationWebhookEndpoints.$inferInsert> = { updatedAt: new Date().toISOString() };
+      if (input.name !== undefined) patch.name = input.name;
+      if (input.policy !== undefined) patch.policy = input.policy;
+      if (input.url !== undefined && input.url !== existing.url) {
+        // Structural safety is enforced at save time; the DNS/IP gate is
+        // re-run by validate + by every delivery attempt. Changing the
+        // URL clears validation: nothing may be delivered until an
+        // administrator re-validates the endpoint.
+        const safety = checkWebhookUrl(input.url);
+        if (!safety.ok) throw new BadRequestException({ code: safety.code, message: safety.message });
+        patch.url = input.url;
+        patch.validatedUrlHash = null;
+        patch.validatedAt = null;
+      }
+      const [row] = await tx.update(automationWebhookEndpoints).set(patch).where(and(
+        eq(automationWebhookEndpoints.tenantId, context.tenantId),
+        eq(automationWebhookEndpoints.id, endpointId))).returning();
+      return this.endpointView(row);
+    });
+  }
+
+  validateWebhookEndpoint(context: TenantContext, appId: string, endpointId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const [existing] = await tx.select().from(automationWebhookEndpoints).where(and(
+        eq(automationWebhookEndpoints.tenantId, context.tenantId),
+        eq(automationWebhookEndpoints.appId, appId), eq(automationWebhookEndpoints.id, endpointId)));
+      if (!existing) throw new NotFoundException('Webhook endpoint not found');
+      const resolved = await resolvePublicIps(existing.url, this.webhookResolver());
+      if ('error' in resolved) throw new BadRequestException({ code: resolved.error.code, message: resolved.error.message });
+      const [row] = await tx.update(automationWebhookEndpoints).set({
+        validatedUrlHash: webhookUrlHash(existing.url), validatedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      }).where(and(eq(automationWebhookEndpoints.tenantId, context.tenantId),
+        eq(automationWebhookEndpoints.id, endpointId))).returning();
+      return { ...this.endpointView(row), resolvedAddresses: resolved.ips.length };
+    });
+  }
+
+  rotateWebhookEndpointSecret(context: TenantContext, appId: string, endpointId: string,
+    input: z.infer<typeof webhookSecretInput>) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const [existing] = await tx.select().from(automationWebhookEndpoints).where(and(
+        eq(automationWebhookEndpoints.tenantId, context.tenantId),
+        eq(automationWebhookEndpoints.appId, appId), eq(automationWebhookEndpoints.id, endpointId)));
+      if (!existing) throw new NotFoundException('Webhook endpoint not found');
+      // Rotation keeps the outgoing key as "previous" so receivers can
+      // verify in-flight deliveries during the rotation window. New
+      // attempts always sign with the current key; each attempt row
+      // records the key version it used, so historical verification
+      // stays exact.
+      const [row] = await tx.update(automationWebhookEndpoints).set({
+        previousSecretEnc: existing.secretEnc, previousKeyVersion: existing.keyVersion,
+        secretEnc: encryptWebhookSecret(input.secret), keyVersion: existing.keyVersion + 1,
+        rotatedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      }).where(and(eq(automationWebhookEndpoints.tenantId, context.tenantId),
+        eq(automationWebhookEndpoints.id, endpointId))).returning();
+      return this.endpointView(row);
+    });
+  }
+
+  private async executeWebhook(tx: TenantTransaction, delegated: TenantContext, args: {
+    appId: string; ruleId: string; runId: string;
+    action: AutomationRuleConfig['actions'][number]; record: RecordResponse;
+    eventId: string | null; idempotencyKey: string; readableFieldIds: string[];
+  }) {
+    const endpointId = args.action.webhook?.endpointId;
+    if (!endpointId) throw codedError('WEBHOOK_ENDPOINT_NOT_CONFIGURED', 'Webhook action has no endpoint configured');
+    const [endpoint] = await tx.select().from(automationWebhookEndpoints).where(and(
+      eq(automationWebhookEndpoints.tenantId, delegated.tenantId),
+      eq(automationWebhookEndpoints.appId, args.appId), eq(automationWebhookEndpoints.id, endpointId)));
+    if (!endpoint) throw codedError('WEBHOOK_ENDPOINT_NOT_FOUND', 'Webhook endpoint not found: ' + endpointId);
+    const [run] = await tx.select({ ruleVersion: automationRuns.ruleVersion }).from(automationRuns)
+      .where(and(eq(automationRuns.tenantId, delegated.tenantId), eq(automationRuns.id, args.runId)));
+    // Frozen payload: built ONLY from the event-time record snapshot the
+    // run already carries (readable fields only). Delivery never re-reads
+    // live business values.
+    const snapshot: Record<string, unknown> = {};
+    for (const fieldId of args.readableFieldIds) {
+      if (Object.hasOwn(args.record.data, fieldId)) snapshot[fieldId] = args.record.data[fieldId];
+    }
+    const deliveryId = randomUUID();
+    const payload: Record<string, unknown> = {
+      deliveryId, eventId: args.eventId, ruleId: args.ruleId,
+      ruleVersion: run?.ruleVersion ?? null, runId: args.runId, actionId: args.action.actionId,
+      recordId: args.record.id, record: snapshot, occurredAt: new Date().toISOString(),
+    };
+    const body = JSON.stringify(payload);
+    const payloadHash = hashPayload(body);
+    const [delivery] = await tx.insert(automationWebhookDeliveries).values({
+      tenantId: delegated.tenantId, appId: args.appId, runId: args.runId, actionId: args.action.actionId,
+      deliveryId, endpointId: endpoint.id, endpointUrl: endpoint.url, policy: endpoint.policy,
+      requestSummary: { urlHost: new URL(endpoint.url).host, payloadHash, payloadBytes: Buffer.byteLength(body) },
+      signatureVersion: 'v1', keyVersion: endpoint.keyVersion, payload, payloadHash,
+      status: 'PENDING', nextAttemptAt: new Date().toISOString(),
+    }).onConflictDoNothing().returning();
+    if (!delivery) {
+      const [existing] = await tx.select({ deliveryId: automationWebhookDeliveries.deliveryId })
+        .from(automationWebhookDeliveries).where(and(
+          eq(automationWebhookDeliveries.tenantId, delegated.tenantId),
+          eq(automationWebhookDeliveries.runId, args.runId),
+          eq(automationWebhookDeliveries.actionId, args.action.actionId)));
+      if (!existing) throw codedError('WEBHOOK_DELIVERY_LOST', 'Webhook delivery could not be created or read back');
+      return { resultRef: `webhook-delivery:${existing.deliveryId}` };
+    }
+    return { resultRef: `webhook-delivery:${deliveryId}` };
+  }
+
+  listWebhookDeliveries(context: TenantContext, appId: string,
+    query: { status?: string; limit: number; offset: number }) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const where = and(eq(automationWebhookDeliveries.tenantId, context.tenantId),
+        eq(automationWebhookDeliveries.appId, appId),
+        query.status ? eq(automationWebhookDeliveries.status, query.status) : undefined);
+      const items = await tx.select({
+        id: automationWebhookDeliveries.id, deliveryId: automationWebhookDeliveries.deliveryId,
+        runId: automationWebhookDeliveries.runId, actionId: automationWebhookDeliveries.actionId,
+        endpointId: automationWebhookDeliveries.endpointId, endpointUrl: automationWebhookDeliveries.endpointUrl,
+        policy: automationWebhookDeliveries.policy, status: automationWebhookDeliveries.status,
+        attempts: automationWebhookDeliveries.attempts, nextAttemptAt: automationWebhookDeliveries.nextAttemptAt,
+        responseStatus: automationWebhookDeliveries.responseStatus, errorType: automationWebhookDeliveries.errorType,
+        keyVersion: automationWebhookDeliveries.keyVersion, payloadHash: automationWebhookDeliveries.payloadHash,
+        createdAt: automationWebhookDeliveries.createdAt, updatedAt: automationWebhookDeliveries.updatedAt,
+      }).from(automationWebhookDeliveries).where(where)
+        .orderBy(sql`${automationWebhookDeliveries.createdAt} DESC, ${automationWebhookDeliveries.id} DESC`)
+        .limit(query.limit).offset(query.offset);
+      const [{ total }] = await tx.select({ total: sql<number>`count(*)::int` })
+        .from(automationWebhookDeliveries).where(where);
+      const attempts = items.length ? await tx.select().from(automationWebhookAttempts).where(and(
+        eq(automationWebhookAttempts.tenantId, context.tenantId),
+        inArray(automationWebhookAttempts.deliveryRowId, items.map((item) => item.id)),
+      )).orderBy(automationWebhookAttempts.attemptNumber) : [];
+      return { items, attempts, total };
+    });
+  }
+
+  resendWebhookDelivery(context: TenantContext, appId: string, deliveryRowId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const [delivery] = await tx.select().from(automationWebhookDeliveries).where(and(
+        eq(automationWebhookDeliveries.tenantId, context.tenantId),
+        eq(automationWebhookDeliveries.appId, appId), eq(automationWebhookDeliveries.id, deliveryRowId)));
+      if (!delivery) throw new NotFoundException('Webhook delivery not found');
+      if (delivery.status !== 'MANUAL_REVIEW_REQUIRED') {
+        throw new ConflictException('Only deliveries awaiting manual review can be resent');
+      }
+      // Manual resend reuses the SAME delivery identity and appends a new
+      // attempt; it never creates a second delivery for the action.
+      await tx.update(automationWebhookDeliveries).set({
+        status: 'PENDING', nextAttemptAt: new Date().toISOString(), claimToken: null, claimedAt: null,
+        errorType: null, updatedAt: new Date().toISOString(),
+      }).where(and(eq(automationWebhookDeliveries.tenantId, context.tenantId),
+        eq(automationWebhookDeliveries.id, deliveryRowId)));
+      const [run] = await tx.select({ ruleId: automationRuns.ruleId, ruleVersion: automationRuns.ruleVersion })
+        .from(automationRuns).where(and(eq(automationRuns.tenantId, context.tenantId),
+          eq(automationRuns.id, delivery.runId)));
+      if (run) await tx.insert(automationAuditEvents).values({
+        tenantId: context.tenantId, appId, ruleId: run.ruleId, ruleVersion: run.ruleVersion,
+        actorId: context.userId, action: 'WEBHOOK_DELIVERY_RESEND',
+        details: { deliveryId: delivery.deliveryId, deliveryRowId, attemptsBefore: delivery.attempts },
+      });
+      return { resent: true, deliveryId: delivery.deliveryId, status: 'PENDING' };
+    });
+  }
+
+  async processWebhookDeliveries(context: TenantContext, options: { now?: Date; limit?: number } = {}) {
+    const now = options.now ?? new Date();
+    const limit = options.limit ?? 50;
+    const leaseCutoff = new Date(now.getTime() - WEBHOOK_CLAIM_LEASE_MS);
+    const claimed = await withTenantTransaction(context, async (tx) => {
+      const due = await tx.execute(sql`
+        SELECT id FROM automation_webhook_deliveries
+        WHERE tenant_id = ${context.tenantId}
+          AND status IN ('PENDING','RETRY_SCHEDULED','DELIVERY_UNCERTAIN')
+          AND (next_attempt_at IS NULL OR next_attempt_at <= ${now.toISOString()})
+          AND (claimed_at IS NULL OR claimed_at <= ${leaseCutoff.toISOString()})
+        ORDER BY next_attempt_at NULLS FIRST, created_at
+        LIMIT ${limit}
+      `);
+      const claimedRows: { id: string; claimToken: string }[] = [];
+      for (const row of due.rows as { id: string }[]) {
+        const claimToken = randomUUID();
+        const updated = await tx.execute(sql`
+          UPDATE automation_webhook_deliveries
+          SET claim_token = ${claimToken}, claimed_at = ${now.toISOString()}, updated_at = ${now.toISOString()}
+          WHERE tenant_id = ${context.tenantId} AND id = ${row.id}
+            AND (claimed_at IS NULL OR claimed_at <= ${leaseCutoff.toISOString()})
+          RETURNING id
+        `);
+        if (updated.rows.length) claimedRows.push({ id: row.id, claimToken });
+      }
+      return claimedRows;
+    });
+    const summary = { claimed: claimed.length, attempted: 0, succeeded: 0, retryScheduled: 0,
+      uncertain: 0, manualReview: 0, permanentFailed: 0 };
+    for (const entry of claimed) {
+      const outcome = await this.attemptWebhookDelivery(context, entry.id, entry.claimToken, now);
+      summary.attempted++;
+      if (outcome === 'SUCCEEDED') summary.succeeded++;
+      else if (outcome === 'RETRY_SCHEDULED') summary.retryScheduled++;
+      else if (outcome === 'DELIVERY_UNCERTAIN') summary.uncertain++;
+      else if (outcome === 'MANUAL_REVIEW_REQUIRED') summary.manualReview++;
+      else if (outcome === 'PERMANENT_FAILED') summary.permanentFailed++;
+    }
+    return summary;
+  }
+
+  private async attemptWebhookDelivery(context: TenantContext, deliveryRowId: string,
+    claimToken: string, now: Date): Promise<string> {
+    const loaded = await withTenantTransaction(context, async (tx) => {
+      const [delivery] = await tx.select().from(automationWebhookDeliveries).where(and(
+        eq(automationWebhookDeliveries.tenantId, context.tenantId),
+        eq(automationWebhookDeliveries.id, deliveryRowId),
+        eq(automationWebhookDeliveries.claimToken, claimToken)));
+      if (!delivery) return null;
+      const [endpoint] = delivery.endpointId ? await tx.select().from(automationWebhookEndpoints).where(and(
+        eq(automationWebhookEndpoints.tenantId, context.tenantId),
+        eq(automationWebhookEndpoints.id, delivery.endpointId))) : [undefined];
+      return { delivery, endpoint };
+    });
+    if (!loaded) return 'SKIPPED';
+    const { delivery, endpoint } = loaded;
+    const policy = (delivery.policy ?? endpoint?.policy ?? 'AUTO_RETRY_AT_LEAST_ONCE') as WebhookPolicy;
+    const attemptNumber = delivery.attempts + 1;
+
+    const finalize = async (record: {
+      outcome: 'SUCCEEDED' | 'RETRYABLE_FAILURE' | 'UNCERTAIN' | 'PERMANENT_FAILURE' | 'BLOCKED';
+      errorType: string; httpStatus?: number; keyVersion?: number; pinnedIp?: string;
+      response?: { summary: string; bytes: number; sha256: string }; retryAfterMs?: number | null;
+    }): Promise<string> => {
+      let status: string;
+      let nextAttemptAt: Date | null = null;
+      let errorType: string | null = record.errorType === 'NONE' ? null : record.errorType;
+      if (record.outcome === 'SUCCEEDED') status = 'SUCCEEDED';
+      else if (record.outcome === 'PERMANENT_FAILURE' || record.outcome === 'BLOCKED') status = 'PERMANENT_FAILED';
+      else if (policy === 'MANUAL_ON_UNCERTAIN') status = 'MANUAL_REVIEW_REQUIRED';
+      else if (attemptNumber >= WEBHOOK_MAX_ATTEMPTS) {
+        // Budget exhausted: an uncertain outcome can never be declared
+        // failed (the receiver may have processed it) -- it goes to a
+        // human. A definite failure is terminal.
+        status = record.outcome === 'UNCERTAIN' ? 'MANUAL_REVIEW_REQUIRED' : 'PERMANENT_FAILED';
+        if (record.outcome !== 'UNCERTAIN') errorType = 'RETRY_BUDGET_EXHAUSTED:' + record.errorType;
+      } else {
+        status = record.outcome === 'UNCERTAIN' ? 'DELIVERY_UNCERTAIN' : 'RETRY_SCHEDULED';
+        const delay = webhookRetryDelayMs(attemptNumber, record.retryAfterMs ?? null,
+          this.webhookDeps.random ?? Math.random);
+        nextAttemptAt = new Date(now.getTime() + delay);
+      }
+      await withTenantTransaction(context, async (tx) => {
+        await tx.insert(automationWebhookAttempts).values({
+          tenantId: context.tenantId, appId: delivery.appId, deliveryRowId: delivery.id,
+          deliveryId: delivery.deliveryId, attemptNumber, keyVersion: record.keyVersion ?? null,
+          outcome: record.outcome, httpStatus: record.httpStatus ?? null,
+          errorType: record.errorType === 'NONE' ? null : record.errorType,
+          responseSummary: record.response?.summary ?? null,
+          responseBytes: record.response?.bytes ?? null, responseHash: record.response?.sha256 ?? null,
+          pinnedIp: record.pinnedIp ?? null, startedAt: now.toISOString(), completedAt: new Date().toISOString(),
+        });
+        await tx.update(automationWebhookDeliveries).set({
+          attempts: attemptNumber, status, errorType, nextAttemptAt: nextAttemptAt?.toISOString() ?? null,
+          responseStatus: record.httpStatus ?? delivery.responseStatus,
+          keyVersion: record.keyVersion ?? delivery.keyVersion,
+          claimToken: null, claimedAt: null, updatedAt: new Date().toISOString(),
+        }).where(and(eq(automationWebhookDeliveries.tenantId, context.tenantId),
+          eq(automationWebhookDeliveries.id, delivery.id)));
+      });
+      return status;
+    };
+
+    if (!endpoint) {
+      return finalize({ outcome: 'BLOCKED', errorType: 'ENDPOINT_NOT_FOUND' });
+    }
+    if (!endpoint.validatedUrlHash || endpoint.validatedUrlHash !== webhookUrlHash(endpoint.url)) {
+      return finalize({ outcome: 'BLOCKED', errorType: 'ENDPOINT_NOT_VALIDATED' });
+    }
+    const resolved = await resolvePublicIps(endpoint.url, this.webhookResolver());
+    if ('error' in resolved) {
+      const permanent = resolved.error.code !== 'WEBHOOK_DNS_FAILED';
+      return finalize({
+        outcome: permanent ? 'BLOCKED' : 'RETRYABLE_FAILURE', errorType: resolved.error.code,
+      });
+    }
+    const pinnedIp = resolved.ips[0];
+    let secret: string;
+    try { secret = decryptWebhookSecret(endpoint.secretEnc); } catch {
+      return finalize({ outcome: 'BLOCKED', errorType: 'SECRET_UNREADABLE', pinnedIp });
+    }
+    const body = JSON.stringify(delivery.payload ?? {});
+    if (Buffer.byteLength(body) > WEBHOOK_MAX_REQUEST_BYTES) {
+      return finalize({ outcome: 'BLOCKED', errorType: 'PAYLOAD_TOO_LARGE', pinnedIp });
+    }
+    const eventId = String((delivery.payload as Record<string, unknown> | null)?.eventId ?? delivery.deliveryId);
+    const timestamp = String(Math.floor(now.getTime() / 1000));
+    const signature = webhookSignature(secret, timestamp, eventId, body);
+    const url = new URL(endpoint.url);
+    const result = await this.webhookTransport()({
+      url, pinnedIp, body, timeoutMs: WEBHOOK_TIMEOUT_MS,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Suzubase-Delivery-Id': delivery.deliveryId,
+        'X-Suzubase-Event-Id': eventId,
+        'X-Suzubase-Timestamp': timestamp,
+        'X-Suzubase-Key-Version': String(endpoint.keyVersion),
+        'X-Suzubase-Signature': 'v1=' + signature,
+      },
+    });
+    const classification = classifyTransportResult(result, now);
+    return finalize({
+      outcome: classification.outcome, errorType: classification.errorType,
+      httpStatus: result.type === 'response' ? result.status : undefined,
+      keyVersion: endpoint.keyVersion, pinnedIp,
+      response: result.type === 'response' ? summarizeResponse(result.bodyText) : undefined,
+      retryAfterMs: classification.retryAfterMs,
     });
   }
 
@@ -2879,6 +3312,34 @@ export class AutomationService {
     } else if (cfg.trigger.dateRelative) {
       findings.push({ code: 'SCHEDULE_CONFIG_UNEXPECTED', severity: 'BLOCKING' });
     }
+    // P3-D wave 1: webhook endpoint safety is part of publish preflight.
+    // An unsafe or unvalidated endpoint blocks publication.
+    for (const action of cfg.actions) {
+      if (action.type !== 'WEBHOOK') continue;
+      const endpointId = action.webhook?.endpointId;
+      if (!endpointId) {
+        findings.push({ code: 'WEBHOOK_ENDPOINT_NOT_CONFIGURED', severity: 'BLOCKING' });
+        continue;
+      }
+      const [endpoint] = await tx.select().from(automationWebhookEndpoints).where(and(
+        eq(automationWebhookEndpoints.tenantId, context.tenantId),
+        eq(automationWebhookEndpoints.appId, appId), eq(automationWebhookEndpoints.id, endpointId)));
+      if (!endpoint) {
+        findings.push({ code: 'WEBHOOK_ENDPOINT_NOT_FOUND', severity: 'BLOCKING' });
+        continue;
+      }
+      const safety = checkWebhookUrl(endpoint.url);
+      if (!safety.ok) {
+        findings.push({ code: safety.code, severity: 'BLOCKING' });
+        continue;
+      }
+      if (!endpoint.validatedUrlHash || endpoint.validatedUrlHash !== webhookUrlHash(endpoint.url)) {
+        findings.push({ code: 'WEBHOOK_ENDPOINT_NOT_VALIDATED', severity: 'BLOCKING' });
+        continue;
+      }
+      const resolved = await resolvePublicIps(endpoint.url, this.webhookResolver());
+      if ('error' in resolved) findings.push({ code: resolved.error.code, severity: 'BLOCKING' });
+    }
     const [grant] = await tx.select().from(automationGrants).where(and(
       eq(automationGrants.tenantId, context.tenantId), eq(automationGrants.ruleId, version.ruleId),
       eq(automationGrants.ruleVersion, version.version), isNull(automationGrants.revokedAt),
@@ -2940,6 +3401,56 @@ export class AutomationController {
     @Param('appId') appId: string, @Param('rootCausationId') rootCausationId: string) {
     return this.automation.resumePausedChain(context, parseInput(identifier, appId),
       parseInput(identifier, rootCausationId));
+  }
+
+  @Get('webhook-endpoints')
+  listWebhookEndpoints(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string) {
+    return this.automation.listWebhookEndpoints(context, parseInput(identifier, appId));
+  }
+
+  @Post('webhook-endpoints')
+  createWebhookEndpoint(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Body() body: unknown) {
+    return this.automation.createWebhookEndpoint(context, parseInput(identifier, appId),
+      parseInput(webhookEndpointInput, body));
+  }
+
+  @Put('webhook-endpoints/:endpointId')
+  updateWebhookEndpoint(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('endpointId') endpointId: string, @Body() body: unknown) {
+    return this.automation.updateWebhookEndpoint(context, parseInput(identifier, appId),
+      parseInput(identifier, endpointId), parseInput(webhookEndpointUpdateInput, body));
+  }
+
+  @Post('webhook-endpoints/:endpointId/validate')
+  validateWebhookEndpoint(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('endpointId') endpointId: string) {
+    return this.automation.validateWebhookEndpoint(context, parseInput(identifier, appId),
+      parseInput(identifier, endpointId));
+  }
+
+  @Post('webhook-endpoints/:endpointId/rotate-secret')
+  rotateWebhookEndpointSecret(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('endpointId') endpointId: string, @Body() body: unknown) {
+    return this.automation.rotateWebhookEndpointSecret(context, parseInput(identifier, appId),
+      parseInput(identifier, endpointId), parseInput(webhookSecretInput, body));
+  }
+
+  @Get('webhook-deliveries')
+  listWebhookDeliveries(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Query('status') status?: string, @Query('limit') limit?: string, @Query('offset') offset?: string) {
+    return this.automation.listWebhookDeliveries(context, parseInput(identifier, appId), {
+      status: status || undefined,
+      limit: Math.min(Math.max(Number(limit ?? 50) || 50, 1), 200),
+      offset: Math.max(Number(offset ?? 0) || 0, 0),
+    });
+  }
+
+  @Post('webhook-deliveries/:deliveryRowId/resend')
+  resendWebhookDelivery(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('deliveryRowId') deliveryRowId: string) {
+    return this.automation.resendWebhookDelivery(context, parseInput(identifier, appId),
+      parseInput(identifier, deliveryRowId));
   }
 
   @Get('runs')

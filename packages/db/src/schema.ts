@@ -546,6 +546,7 @@ export type AutomationRuleConfig = {
     updates?: { fieldId: string; mode: 'set' | 'increment' | 'decrement' | 'clear' | 'copy'; value?: unknown; sourceFieldId?: string }[];
     mappings?: { targetFieldId: string; mode: 'constant' | 'source'; value?: unknown; sourceFieldId?: string }[];
     workflowActionId?: string;
+    webhook?: { endpointId: string };
   }[];
 };
 
@@ -790,6 +791,14 @@ export const automationWebhookDeliveries = pgTable('automation_webhook_deliverie
   actionId: uuid('action_id').notNull(),
   deliveryId: uuid('delivery_id').notNull().defaultRandom(),
   endpointId: uuid('endpoint_id'),
+  endpointUrl: text('endpoint_url'),
+  policy: text(),
+  keyVersion: integer('key_version'),
+  payload: jsonb().$type<Record<string, unknown>>(),
+  payloadHash: text('payload_hash'),
+  claimToken: uuid('claim_token'),
+  claimedAt: time('claimed_at'),
+  updatedAt: time('updated_at').notNull().defaultNow(),
   requestSummary: jsonb('request_summary').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
   signatureVersion: text('signature_version'),
   attempts: integer().notNull().default(0),
@@ -801,8 +810,55 @@ export const automationWebhookDeliveries = pgTable('automation_webhook_deliverie
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
   unique().on(t.tenantId, t.deliveryId),
+  unique().on(t.tenantId, t.runId, t.actionId),
   foreignKey({ columns: [t.tenantId, t.appId, t.runId, t.actionId], foreignColumns: [automationRunActions.tenantId, automationRunActions.appId, automationRunActions.runId, automationRunActions.actionId] }),
   check('automation_webhook_status', sql`${t.status} IN ('PENDING','SUCCEEDED','RETRY_SCHEDULED','DELIVERY_UNCERTAIN','PERMANENT_FAILED','MANUAL_REVIEW_REQUIRED')`),
+]);
+
+export const automationWebhookEndpoints = pgTable('automation_webhook_endpoints', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  name: text().notNull(),
+  url: text().notNull(),
+  policy: text().notNull(),
+  secretEnc: text('secret_enc').notNull(),
+  keyVersion: integer('key_version').notNull().default(1),
+  previousSecretEnc: text('previous_secret_enc'),
+  previousKeyVersion: integer('previous_key_version'),
+  rotatedAt: time('rotated_at'),
+  validatedUrlHash: text('validated_url_hash'),
+  validatedAt: time('validated_at'),
+  createdBy: uuid('created_by').notNull(),
+  createdAt: time('created_at').notNull().defaultNow(),
+  updatedAt: time('updated_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
+  foreignKey({ columns: [t.tenantId, t.createdBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  check('automation_webhook_endpoints_policy', sql`${t.policy} IN ('AUTO_RETRY_AT_LEAST_ONCE','MANUAL_ON_UNCERTAIN')`),
+]);
+
+export const automationWebhookAttempts = pgTable('automation_webhook_attempts', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  deliveryRowId: uuid('delivery_row_id').notNull(),
+  deliveryId: uuid('delivery_id').notNull(),
+  attemptNumber: integer('attempt_number').notNull(),
+  keyVersion: integer('key_version'),
+  outcome: text().notNull(),
+  httpStatus: integer('http_status'),
+  errorType: text('error_type'),
+  responseSummary: text('response_summary'),
+  responseBytes: integer('response_bytes'),
+  responseHash: text('response_hash'),
+  pinnedIp: text('pinned_ip'),
+  startedAt: time('started_at').notNull().defaultNow(),
+  completedAt: time('completed_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  unique().on(t.tenantId, t.deliveryRowId, t.attemptNumber),
 ]);
 
 export const automationAuditEvents = pgTable('automation_audit_events', {

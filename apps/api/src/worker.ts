@@ -72,6 +72,10 @@ async function main() {
           if (dateRelative.backfilledRecords || dateRelative.claimed || dateRelative.missed || dateRelative.invalidated) {
             console.info('Automation date-relative schedules', { tenantId: context.tenantId, ...dateRelative });
           }
+          const webhookDeliveries = await automation.processWebhookDeliveries(context);
+          if (webhookDeliveries.attempted) {
+            console.info("Automation webhook deliveries", { tenantId: context.tenantId, ...webhookDeliveries });
+          }
           const pruned = await automation.pruneRunHistory(context);
           if (pruned.pruned) console.info('Automation run history pruned', { tenantId: context.tenantId, ...pruned });
         } catch (error) {
