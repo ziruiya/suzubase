@@ -26,6 +26,18 @@ export const AUTOMATION_TENANT_RUN_RATE_WINDOW_MS = 60_000;
 export const AUTOMATION_TENANT_PENDING_LIMIT = 1_000;
 export const AUTOMATION_PROBLEM_CHAIN_FAILURE_LIMIT = 3;
 
+// P3-C C-0 (option a): maintenanceTenants() contexts carry the nil UUID as
+// userId; that identity is not a tenant member, so audit rows written from
+// such a context must not claim it as actor. System actions are recorded
+// with actor_id NULL and actor_type 'SYSTEM' (migration 0043); every other
+// context keeps its real member actor with actor_type 'USER'.
+export const SYSTEM_ACTOR_USER_ID = '00000000-0000-0000-0000-000000000000';
+export function auditActor(context: TenantContext): { actorId: string | null; actorType: 'USER' | 'SYSTEM' } {
+  return context.userId === SYSTEM_ACTOR_USER_ID
+    ? { actorId: null, actorType: 'SYSTEM' }
+    : { actorId: context.userId, actorType: 'USER' };
+}
+
 export function automationUpdateNeeded(currentValue: unknown, targetValue: unknown) {
   if (Object.is(currentValue, targetValue)) return false;
   if (typeof currentValue === 'object' && typeof targetValue === 'object' && currentValue !== null && targetValue !== null) {
@@ -849,7 +861,7 @@ export class AutomationService {
             if (runCount >= AUTOMATION_TENANT_RUN_RATE_LIMIT) {
               for (const candidate of candidates) await tx.insert(automationAuditEvents).values({
                 tenantId: context.tenantId, appId: candidate.rule.appId, ruleId: candidate.rule.id,
-                ruleVersion: candidate.version.version, actorId: context.userId, action: 'RATE_LIMITED',
+                ruleVersion: candidate.version.version, ...auditActor(context), action: 'RATE_LIMITED',
                 details: { rootCausationId, eventId: event.eventId, limit: AUTOMATION_TENANT_RUN_RATE_LIMIT, windowMs: AUTOMATION_TENANT_RUN_RATE_WINDOW_MS },
               });
               continue;
@@ -865,7 +877,7 @@ export class AutomationService {
             if (pendingCount > AUTOMATION_TENANT_PENDING_LIMIT) {
               for (const candidate of candidates) await tx.insert(automationAuditEvents).values({
                 tenantId: context.tenantId, appId: candidate.rule.appId, ruleId: candidate.rule.id,
-                ruleVersion: candidate.version.version, actorId: context.userId, action: 'BACKLOG_LIMITED',
+                ruleVersion: candidate.version.version, ...auditActor(context), action: 'BACKLOG_LIMITED',
                 details: { rootCausationId, eventId: event.eventId, pendingCount, limit: AUTOMATION_TENANT_PENDING_LIMIT },
               });
               continue;
@@ -1498,18 +1510,23 @@ export class AutomationService {
   // Brief §5.4 / C4: hot run history is retained for 90 days. Terminal runs
   // older than that are pruned with their action rows, except runs still
   // referenced by a paused problem chain. Audit events are never pruned.
-  // (No audit row is written for pruning itself: automation_audit_events
-  // requires a tenant-member actor and no system actor exists; the worker
-  // logs the returned counts.)
+  // P3-C C-0: pruning itself is audited — one RUN_HISTORY_PRUNED row per
+  // (app, rule, version) group, written with the caller's audit actor
+  // (SYSTEM with actor_id NULL under the worker's maintenance context).
+  // The problem-chain exclusion uses NOT EXISTS: a chain row whose
+  // last_run_id is NULL must not silently disable all pruning the way
+  // NOT IN did.
   async pruneRunHistory(context: TenantContext) {
     return withTenantTransaction(context, async (tx) => {
-      const referenced = tx.select({ id: automationProblemChains.lastRunId }).from(automationProblemChains)
-        .where(eq(automationProblemChains.tenantId, context.tenantId));
-      const stale = await tx.select({ id: automationRuns.id }).from(automationRuns).where(and(
+      const stale = await tx.select({
+        id: automationRuns.id, appId: automationRuns.appId,
+        ruleId: automationRuns.ruleId, ruleVersion: automationRuns.ruleVersion,
+      }).from(automationRuns).where(and(
         eq(automationRuns.tenantId, context.tenantId),
         sql`${automationRuns.completedAt} < clock_timestamp() - interval '90 days'`,
         sql`${automationRuns.status} NOT IN ('QUEUED','RUNNING')`,
-        sql`${automationRuns.id} NOT IN (${referenced})`,
+        sql`NOT EXISTS (SELECT 1 FROM automation_problem_chains pc
+          WHERE pc.tenant_id = ${context.tenantId} AND pc.last_run_id = ${automationRuns.id})`,
       ));
       if (!stale.length) return { pruned: 0 };
       const ids = stale.map(({ id }) => id);
@@ -1517,6 +1534,20 @@ export class AutomationService {
         eq(automationRunActions.tenantId, context.tenantId), inArray(automationRunActions.runId, ids)));
       await tx.delete(automationRuns).where(and(
         eq(automationRuns.tenantId, context.tenantId), inArray(automationRuns.id, ids)));
+      const groups = new Map<string, { appId: string; ruleId: string; ruleVersion: number; prunedCount: number }>();
+      for (const row of stale) {
+        const key = `${row.appId}:${row.ruleId}:${row.ruleVersion}`;
+        const group = groups.get(key) ?? { appId: row.appId, ruleId: row.ruleId, ruleVersion: row.ruleVersion, prunedCount: 0 };
+        group.prunedCount++;
+        groups.set(key, group);
+      }
+      for (const group of groups.values()) {
+        await tx.insert(automationAuditEvents).values({
+          tenantId: context.tenantId, appId: group.appId, ruleId: group.ruleId,
+          ruleVersion: group.ruleVersion, ...auditActor(context), action: 'RUN_HISTORY_PRUNED',
+          details: { prunedCount: group.prunedCount, retentionDays: 90 },
+        });
+      }
       return { pruned: ids.length };
     });
   }

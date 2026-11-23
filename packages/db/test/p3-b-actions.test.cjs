@@ -533,7 +533,18 @@ test('P3-B T-4 manual runs, C4 query APIs and the 90-day retention policy', asyn
     const auditAfter = await audit.query(
       `SELECT count(*)::int AS count FROM automation_audit_events WHERE tenant_id=$1 AND app_id=$2`,
       [owner.tenantId, app.id]);
-    assert.equal(auditAfter.rows[0].count, auditBefore.rows[0].count, 'audit events are never pruned');
+    // P3-C C-0: pre-existing audit events are still never pruned, but the
+    // pruning itself now writes one RUN_HISTORY_PRUNED row (owner context
+    // here, so the actor is the owner member with actor_type 'USER').
+    const pruneAudit = await audit.query(
+      `SELECT actor_id, actor_type, details FROM automation_audit_events
+       WHERE tenant_id=$1 AND app_id=$2 AND action='RUN_HISTORY_PRUNED'`,
+      [owner.tenantId, app.id]);
+    assert.equal(pruneAudit.rowCount, 1, 'pruning writes its RUN_HISTORY_PRUNED audit row');
+    assert.equal(pruneAudit.rows[0].actor_id, owner.userId);
+    assert.equal(pruneAudit.rows[0].actor_type, 'USER');
+    assert.equal(auditAfter.rows[0].count, auditBefore.rows[0].count + pruneAudit.rowCount,
+      'audit events are never pruned; only the prune audit row is added');
   } finally { await audit.end(); }
 });
 

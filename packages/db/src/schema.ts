@@ -716,7 +716,8 @@ export const automationAuditEvents = pgTable('automation_audit_events', {
   appId: uuid('app_id').notNull(),
   ruleId: uuid('rule_id').notNull(),
   ruleVersion: integer('rule_version'),
-  actorId: uuid('actor_id').notNull(),
+  actorId: uuid('actor_id'),
+  actorType: text('actor_type').notNull().default('USER'),
   action: text().notNull(),
   details: jsonb().$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
   occurredAt: time('occurred_at').notNull().defaultNow(),
@@ -724,6 +725,8 @@ export const automationAuditEvents = pgTable('automation_audit_events', {
   primaryKey({ columns: [t.tenantId, t.id] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.ruleId], foreignColumns: [automationRules.tenantId, automationRules.appId, automationRules.id] }),
   foreignKey({ columns: [t.tenantId, t.actorId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  check('automation_audit_events_actor_type_check', sql`${t.actorType} IN ('USER','SYSTEM')`),
+  check('automation_audit_events_actor_consistency_check', sql`(${t.actorType} = 'USER' AND ${t.actorId} IS NOT NULL) OR (${t.actorType} = 'SYSTEM' AND ${t.actorId} IS NULL)`),
   index('automation_audit_rule_idx').on(t.tenantId, t.ruleId, t.occurredAt.desc()),
 ]);
 
