@@ -1206,3 +1206,12 @@ as ordered.
 - wave3 偏差 2：V-05 未消费事件按执行时版本绑定（§5.2 解释）。
 - wave3 偏差 3：S-(e) 周期汇总的实现边界（逐条通知＋同 batch 集合，无聚合引擎）。
 - wave3 偏差 5（未决置顶）：托管 CI run 45133671478 三次 failure 于 Integration tests 步，本地同 HEAD 两次 169/169；日志未取得，定性待签收环节处理。
+
+
+## P3-D CI 修复（wave3-5 未决项关闭）
+
+- **根因（测试对环境的隐含假设，非产品 bug、非 ci.yaml 缺口）**：Webhook 端点密钥由 API 进程以 AES-256-GCM 加密落库，加密密钥派生自环境变量 SUZUBASE_SYSTEM_NOTIFICATION_SECRET（SUZUBASE_WEBHOOK_SECRET_KEY 未设时回退该值，见 apps/api/src/automation-webhook.ts encryptionKey）。托管 CI 的 ci.yaml 在「Set integration system notification credential」步以 openssl rand -hex 32 每轮生成随机值并写入 GITHUB_ENV，API 进程与后续测试步本应共用该值。但 P3-D 新增的两个测试文件（packages/db/test/p3-d-webhooks.test.cjs、packages/db/test/p3-d-wave3.test.cjs）在文件顶层无条件把该变量覆写为写死的测试值，随后以进程内引擎执行投递时用错误密钥解密端点密钥，全部投递以 SECRET_UNREADABLE 被 BLOCKED、终态 PERMANENT_FAILED、假端点零命中。本地自建栈因 API 进程恰好也使用同一写死值而全绿，掩盖了该假设——与 wave3 段记录的首轮本机 12 项失败为同一根因（当时误判为已按「CI 口径」统一 env，实际统一的是本机栈而非 CI 的随机值口径）。
+- **复现证据（CI 口径，独立复现克隆 ~/dev/suzubase-ci-repro @f2a18c3）**：全新 Postgres 容器＋随机密钥（openssl rand -hex 32，与 ci.yaml 同法）＋迁移＋API 起于 127.0.0.1:3000＋pnpm test 全量：157 pass / 12 fail，失败清单与 CI 形态一致——p3-d-webhooks 11 项（成功投递签名、5xx 重试、429 Retry-After、6 次重试预算、超时不确定、连接中断不确定、MANUAL 不确定停等、手动重发、3xx 不跟随、幂等、密钥轮换）＋p3-d-wave3 的 V-06 补充 1 项（端点已处理但响应丢失）；复现库回读 automation_webhook_deliveries/attempts：12 条投递全部 error_type=SECRET_UNREADABLE / outcome=BLOCKED。同口径下 migration.test.cjs 通过——此前本机栈的迁移所有权断言失败是本机栈 MIGRATION_DATABASE_URL 用户口径问题，不在 CI 失败清单内。
+- **改动清单（提交 9382c59，仅 2 个测试文件、10 增 2 删）**：两文件顶层的无条件赋值改为 `??=`（仅当环境未提供时才落回写死值作本地栈回退），并加注原因。未改任何断言、未 skip 任何用例、未动审计 check 1 抽样、未动 M3 导入路径、未改 ci.yaml、未改产品代码。
+- **双口径验证**：① CI 口径（复现克隆 @9382c59，全新空库＋每轮随机密钥）：pnpm test **169/169 全绿**，typecheck 全包干净。② 本地回退口径（API 以写死值启动、测试进程不带该环境变量，靠 ??= 回退对齐）：两文件 **27/27 全绿**。
+- **托管 CI 结论**：run **45139370741**（HEAD 9382c59）completed **success**——job build-and-test 全部步骤绿，含 step 12 Integration tests 与此前被 skipped 的 step 13 Audit integrity、step 15 Browser tests。wave3-5 未决项就此关闭；P3 全阶段总结表中 P3-D 行的「托管 CI 未取得绿」表述以本节为准更新为已取得绿（run 45139370741）。
