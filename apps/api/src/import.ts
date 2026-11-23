@@ -109,6 +109,8 @@ export interface PkgPackage {
   recordEvents: any[];
   workflowEvents: any[];
   config: { acl: any; notificationRules: any[]; relations: any[]; apiTokens: any[] };
+  /** P3-D wave 2: automation section; null for pre-wave-2 packages. */
+  automation: AutomationPackage | null;
   directory: { users: { id: string; email: string; loginName: string | null; displayName: string | null; disabled: boolean }[];
     groups: { id: string; name: string; memberUserIds: string[] }[];
     organizations: { id: string; name: string; parentId: string | null }[] };
@@ -134,6 +136,9 @@ export function readPackage(archive: Buffer): PkgPackage {
   const history = json<any>('data/history.json');
   const config = json<any>('data/config.json');
   const directory = json<any>('data/directory.json');
+  const automationBody = entries['data/automation.json'];
+  const automation = automationBody
+    ? JSON.parse(Buffer.from(automationBody).toString('utf8')) as AutomationPackage : null;
   const attachmentBodies = new Map<string, Buffer>();
   for (const [path, body] of Object.entries(entries)) {
     if (path.startsWith('attachments/')) attachmentBodies.set(path, Buffer.from(body));
@@ -145,7 +150,7 @@ export function readPackage(archive: Buffer): PkgPackage {
     workflows: workflows.definitions ?? [], records: records.records ?? [], tableRows: rows.rows ?? [],
     references: references.references ?? [], filesMeta: attachments.files ?? [], comments: comments.comments ?? [],
     recordEvents: history.recordEvents ?? [], workflowEvents: history.workflowEvents ?? [],
-    config, directory, attachmentBodies,
+    config, directory, attachmentBodies, automation,
   };
 }
 
@@ -480,6 +485,41 @@ export function preflightPackage(pkg: PkgPackage, archive: Buffer) {
         message: `Lookup target lives in another application (${reference.targetAppCode ?? reference.targetAppId}); it resolves only through a cross-application dependency decision` });
     }
   }
+  // P3-D wave 2: automation section integrity. A malformed section is a
+  // fatal preflight problem; dangling webhook endpoint references are
+  // missing references (the rule imports as a disabled draft and the
+  // reference is reported, never guessed).
+  if (pkg.automation) {
+    if (pkg.automation.schemaVersion !== AUTOMATION_PACKAGE_SCHEMA_VERSION) {
+      errors.push({ object: 'automation', message:
+        `Automation section schema version ${pkg.automation.schemaVersion} is not supported by this deployment (expects ${AUTOMATION_PACKAGE_SCHEMA_VERSION})` });
+    }
+    if (!Array.isArray(pkg.automation.rules) || !Array.isArray(pkg.automation.endpoints)) {
+      errors.push({ object: 'automation', message: 'Automation section is malformed: rules and endpoints must be arrays' });
+    } else {
+      const ruleIds = new Set<string>();
+      for (const rule of pkg.automation.rules) {
+        if (ruleIds.has(rule.sourceRuleId)) {
+          errors.push({ object: 'automation-rule', referrer: rule.sourceRuleId,
+            message: 'Duplicate automation rule id in the package' });
+        }
+        ruleIds.add(rule.sourceRuleId);
+      }
+      const endpointIds = new Set(pkg.automation.endpoints.map((endpoint) => endpoint.sourceEndpointId));
+      for (const rule of pkg.automation.rules) {
+        for (const version of rule.versions) {
+          for (const action of version.actions) {
+            if (action.type === 'WEBHOOK' && action.webhook?.endpointId &&
+              !endpointIds.has(action.webhook.endpointId)) {
+              missingReferences.push({ object: 'automation-webhook', referrer: rule.sourceRuleId,
+                missingTarget: action.webhook.endpointId,
+                message: 'Webhook action references an endpoint that is not in the package; the reference stays unresolved after import' });
+            }
+          }
+        }
+      }
+    }
+  }
   // Preserved auto numbers and unique values must not collide inside the package.
   const autoSeen = new Set<string>();
   const uniqueSeen = new Map<string, string>();
@@ -611,11 +651,17 @@ export function remapAssignees(sources: any[] | undefined, job: JobRow, fieldMap
 // inserts outbox rows, so an import produces exactly zero notifications.
 // ---------------------------------------------------------------------------
 import {
-  appCounters, appVersions, autoNumberCounters, commentMentions, fields as fieldRows, fileReferences, files,
+  appCounters, appVersions, autoNumberCounters, automationRules, automationRuleVersions,
+  automationWebhookEndpoints, commentMentions, fields as fieldRows, fileReferences, files,
   recordComments, recordEvents, recordReferences, recordTableRows, recordUniqueValues,
   recordWorkflowState, records, workflowActions, workflowAssignments, workflowDefinitions, workflowEvents,
   workflowStates,
 } from '@suzubase/db';
+import {
+  AUTOMATION_PACKAGE_SCHEMA_VERSION, automationVersionAppIds, remapAutomationVersion,
+  type AutomationPackage, type AutomationResolvers,
+} from './automation-package';
+import { cycleFindings } from './automation';
 import type { FieldDefinition } from '@suzubase/shared-types';
 import { AuthorizationService } from './authorization';
 import { assignAutoNumber, numberScope } from './auto-number';
@@ -623,12 +669,24 @@ import { projectSearchValues } from './search-projection';
 import { uniqueKey } from './schema-preflight';
 import { attachmentKey, localAttachmentStorage } from './storage';
 
+export interface AutomationImportState {
+  createdRules: any[];
+  unresolved: any[];
+  credentialsPending: any[];
+  grantRequirements: any[];
+  cycleFindings: any[];
+}
+export function emptyAutomationState(): AutomationImportState {
+  return { createdRules: [], unresolved: [], credentialsPending: [], grantRequirements: [], cycleFindings: [] };
+}
+
 interface ExecState {
   map: IdMap;
   droppedAcl: any[];
   droppedAssignees: any[];
   disabledDependencies: any[];
   pendingDependencies: any[];
+  automation: AutomationImportState;
 }
 
 @Injectable()
@@ -1296,6 +1354,284 @@ export class ImportExecutionService {
     await this.saveMap(tx, job, state);
   }
 
+
+  // ----- P3-D wave 2: automation import (brief S7.2/S7.3, V-08) ----------
+  // Imported rules are ALWAYS disabled drafts: never enabled, never
+  // published-effective, never granted, and importing records never
+  // triggers them (the executor writes no outbox rows, so no run, no
+  // notification and no webhook delivery can result). Webhook endpoints
+  // are recreated as credential placeholders. Schedule rows are NOT
+  // copied: cadence/date-relative plans are recomputed by the target
+  // environment when a rule is re-published and enabled there.
+
+  /** Resolve an application that an earlier import brought into this
+   * tenant, through that job's persisted entity mapping (never a guess). */
+  private async resolveImportedApp(tx: TenantTransaction, job: JobRow, sourceAppId: string) {
+    const candidates = await tx.select({
+      entityMapping: importJobs.entityMapping, targetAppId: importJobs.targetAppId,
+    }).from(importJobs).where(and(eq(importJobs.tenantId, job.tenantId),
+      eq(importJobs.sourceAppId, sourceAppId),
+      sql`${importJobs.status} IN ('ready', 'activated')`, sql`${importJobs.id} <> ${job.id}`));
+    for (const candidate of candidates) {
+      if (!candidate.targetAppId) continue;
+      const fields = new Map<string, string>();
+      for (const row of candidate.entityMapping as SourceIdMapRow[]) {
+        if (row.objectType === 'field') fields.set(row.sourceId, row.targetId);
+      }
+      return { targetAppId: candidate.targetAppId, fields };
+    }
+    return null;
+  }
+
+  private async automationResolvers(tx: TenantTransaction, job: JobRow, pkg: PkgPackage,
+    state: ExecState, targetAppId: string): Promise<AutomationResolvers> {
+    const crossApps = new Map<string, { targetAppId: string; fields: Map<string, string> }>();
+    if (pkg.automation) {
+      const referenced = new Set<string>();
+      for (const rule of pkg.automation.rules) {
+        for (const version of rule.versions) {
+          for (const id of automationVersionAppIds(version)) {
+            if (id !== pkg.app.id) referenced.add(id);
+          }
+        }
+      }
+      for (const sourceAppId of referenced) {
+        const resolved = await this.resolveImportedApp(tx, job, sourceAppId);
+        if (resolved) crossApps.set(sourceAppId, resolved);
+      }
+    }
+    return {
+      field: (id) => state.map.get('field', id) ?? null,
+      targetField: (appSourceId, fieldId) => appSourceId === pkg.app.id
+        ? (state.map.get('field', fieldId) ?? null)
+        : (crossApps.get(appSourceId)?.fields.get(fieldId) ?? null),
+      app: (id) => id === pkg.app.id ? targetAppId : (crossApps.get(id)?.targetAppId ?? null),
+      user: (id) => job.userMapping[id] ?? null,
+      group: (id) => job.groupMapping[id] ?? null,
+      workflowState: (id) => state.map.get('workflowState', id) ?? null,
+      workflowAction: (id) => state.map.get('workflowAction', id) ?? null,
+      endpoint: (id) => state.map.get('webhookEndpoint', id) ?? null,
+    };
+  }
+
+  async batchAutomation(tx: TenantTransaction, ctx: TenantContext, job: JobRow,
+    pkg: PkgPackage, state: ExecState, targetAppId: string) {
+    if (!pkg.automation) return;
+    const { tenantId } = ctx;
+    const auto = state.automation;
+    const resolvers = await this.automationResolvers(tx, job, pkg, state, targetAppId);
+
+    for (const endpoint of pkg.automation.endpoints) {
+      if (state.map.get('webhookEndpoint', endpoint.sourceEndpointId)) continue;
+      const targetId = randomUUID();
+      await tx.insert(automationWebhookEndpoints).values({
+        tenantId, appId: targetAppId, id: targetId, name: endpoint.name, url: endpoint.url,
+        policy: endpoint.policy as 'AUTO_RETRY_AT_LEAST_ONCE' | 'MANUAL_ON_UNCERTAIN',
+        // Placeholder: the package carries no secret material by design.
+        secretEnc: '', credentialPending: true, keyVersion: 1,
+        validatedUrlHash: null, validatedAt: null, createdBy: ctx.userId,
+      });
+      state.map.set('webhookEndpoint', endpoint.sourceEndpointId, targetId);
+      auto.credentialsPending.push({
+        sourceEndpointId: endpoint.sourceEndpointId, targetEndpointId: targetId,
+        name: endpoint.name, url: endpoint.url, action: 'supply-secret',
+      });
+      await this.imports.audit(tx, ctx, { ...job, targetAppId }, {
+        action: 'write', objectType: 'webhook-endpoint', objectId: targetId,
+        fieldSurface: ['name', 'url', 'policy', 'credentialPending'],
+      });
+    }
+
+    const importedConfigs: { appId: string; config: any }[] = [];
+    for (const rule of pkg.automation.rules) {
+      if (state.map.get('automationRule', rule.sourceRuleId)) continue;
+      const targetRuleId = state.map.assign('automationRule', rule.sourceRuleId);
+      await tx.insert(automationRules).values({
+        tenantId, appId: targetAppId, id: targetRuleId, name: rule.name,
+        currentVersion: null, enabled: false,
+        archivedAt: rule.archived ? new Date().toISOString() : null, createdBy: ctx.userId,
+      });
+      const createdVersions: number[] = [];
+      for (const version of [...rule.versions].sort((a, b) => a.version - b.version)) {
+        const remapped = remapAutomationVersion(version, resolvers, rule.sourceRuleId);
+        await tx.insert(automationRuleVersions).values({
+          tenantId, appId: targetAppId, ruleId: targetRuleId, version: version.version,
+          schemaVersion: version.schemaVersion, sourceSchemaVersion: version.sourceSchemaVersion,
+          trigger: remapped.trigger, conditions: remapped.conditions, actions: remapped.actions,
+          status: 'draft', createdBy: ctx.userId,
+        });
+        for (const entry of remapped.unresolved) auto.unresolved.push({ ...entry, targetRuleId });
+        if (remapped.grantRequirement) {
+          // Requirement only: no automation_grants row is ever written by
+          // an import. Re-approval happens in the target through the
+          // ordinary grant flow after re-preflight (brief S7.3).
+          auto.grantRequirements.push({
+            sourceRuleId: rule.sourceRuleId, targetRuleId, version: version.version,
+            requirement: remapped.grantRequirement,
+          });
+        }
+        createdVersions.push(version.version);
+        importedConfigs.push({ appId: targetAppId, config: {
+          schemaVersion: version.schemaVersion, trigger: remapped.trigger,
+          conditions: remapped.conditions, actions: remapped.actions,
+        } });
+      }
+      auto.createdRules.push({
+        sourceRuleId: rule.sourceRuleId, targetRuleId, name: rule.name,
+        versions: createdVersions, enabled: false, status: 'draft',
+      });
+      await this.imports.audit(tx, ctx, { ...job, targetAppId }, {
+        action: 'write', objectType: 'automation-rule', objectId: targetRuleId,
+        fieldSurface: ['definition', 'versions', 'enabled=false', 'status=draft'],
+      });
+    }
+
+    // Static cycle check re-run in the target environment: the imported
+    // configs are analysed together with every currently enabled rule's
+    // current version in this tenant. BLOCKING findings are recorded as
+    // blockers (they also block publish through the ordinary preflight);
+    // POTENTIAL findings are warnings.
+    const enabledRows = await tx.select({
+      appId: automationRules.appId, trigger: automationRuleVersions.trigger,
+      conditions: automationRuleVersions.conditions, actions: automationRuleVersions.actions,
+    }).from(automationRules).innerJoin(automationRuleVersions, and(
+      eq(automationRuleVersions.tenantId, automationRules.tenantId),
+      eq(automationRuleVersions.appId, automationRules.appId),
+      eq(automationRuleVersions.ruleId, automationRules.id),
+      eq(automationRuleVersions.version, automationRules.currentVersion),
+    )).where(and(eq(automationRules.tenantId, tenantId), eq(automationRules.enabled, true),
+      sql`${automationRules.archivedAt} IS NULL`));
+    const cycles = cycleFindings([
+      ...enabledRows.map((row) => ({ appId: row.appId, config: {
+        schemaVersion: 1, trigger: row.trigger, conditions: row.conditions, actions: row.actions,
+      } as any })),
+      ...importedConfigs,
+    ]);
+    auto.cycleFindings = cycles.map((cycle) => ({
+      code: cycle.code, severity: cycle.code === 'BLOCKING_CYCLE' ? 'BLOCKING' : 'WARNING',
+      apps: cycle.apps,
+    }));
+
+    // Persist the automation detail on the job so the finalizer can fold
+    // it into the pending-completion list and the difference report with
+    // exactly the same shape the dry-run preview produces.
+    const mergedPending = {
+      ...((job.pending ?? {}) as Record<string, unknown>),
+      automationImport: {
+        createdRules: auto.createdRules, unresolved: auto.unresolved,
+        credentialsPending: auto.credentialsPending,
+        grantRequirements: auto.grantRequirements, cycleFindings: auto.cycleFindings,
+      },
+    };
+    await tx.update(importJobs).set({ pending: mergedPending })
+      .where(eq(importJobs.id, job.id));
+    await this.saveMap(tx, job, state);
+  }
+
+  /**
+   * Dry-run difference report for the automation section (brief S7.2):
+   * previews, against the job's current mappings and this tenant's
+   * already-restored applications, what an import would create, which
+   * references would stay unresolved, what a human must still supply
+   * (webhook secrets, grant re-approval) and the package-internal cycle
+   * verdict. Zero writes of any kind.
+   */
+  async automationDryRun(context: TenantContext, jobId: string) {
+    const job = await withTenantTransaction(context, async (tx) => {
+      await this.imports.requireAdmin(tx, context);
+      return this.imports.jobRow(tx, context, jobId);
+    });
+    const archive = await readFile(importPackagePath(context.tenantId, jobId)).catch(() => {
+      throw new BadRequestException('Uploaded package file is missing');
+    });
+    const pkg = readPackage(archive);
+    if (!pkg.automation) {
+      return {
+        automation: null,
+        willCreate: { rules: 0, ruleVersions: 0, webhookEndpoints: 0 },
+        unresolved: [] as any[], manualActions: [] as any[], cycleFindings: [] as any[],
+        grantsEffective: false, rulesEnabled: false,
+        scheduleHandling: 'Package carries no automation section; nothing to preview.',
+      };
+    }
+    const packageFieldIds = new Set<string>(pkg.rawFields.map((field) => field.fieldId));
+    for (const version of pkg.versions) for (const field of version.fields) packageFieldIds.add(field.fieldId);
+    const workflowStateIds = new Set(pkg.workflows.flatMap((wf) => wf.states.map((s: any) => s.id)));
+    const workflowActionIds = new Set(pkg.workflows.flatMap((wf) => wf.actions.map((a: any) => a.id)));
+    const endpointIds = new Set(pkg.automation.endpoints.map((endpoint) => endpoint.sourceEndpointId));
+    const crossApps = new Map<string, { targetAppId: string; fields: Map<string, string> }>();
+    await withTenantTransaction(context, async (tx) => {
+      const referenced = new Set<string>();
+      for (const rule of pkg.automation!.rules) {
+        for (const version of rule.versions) {
+          for (const id of automationVersionAppIds(version)) {
+            if (id !== pkg.app.id) referenced.add(id);
+          }
+        }
+      }
+      for (const sourceAppId of referenced) {
+        const resolved = await this.resolveImportedApp(tx, job, sourceAppId);
+        if (resolved) crossApps.set(sourceAppId, resolved);
+      }
+    });
+    const resolvers: AutomationResolvers = {
+      field: (id) => packageFieldIds.has(id) ? id : null,
+      targetField: (appSourceId, fieldId) => appSourceId === pkg.app.id
+        ? (packageFieldIds.has(fieldId) ? fieldId : null)
+        : (crossApps.get(appSourceId)?.fields.has(fieldId) ? fieldId : null),
+      app: (id) => id === pkg.app.id || crossApps.has(id) ? id : null,
+      user: (id) => job.userMapping[id] ?? null,
+      group: (id) => job.groupMapping[id] ?? null,
+      workflowState: (id) => workflowStateIds.has(id) ? id : null,
+      workflowAction: (id) => workflowActionIds.has(id) ? id : null,
+      endpoint: (id) => endpointIds.has(id) ? id : null,
+    };
+    const unresolved: any[] = [];
+    const manualActions: any[] = [];
+    const configs: { appId: string; config: any }[] = [];
+    let ruleVersions = 0;
+    for (const rule of pkg.automation.rules) {
+      for (const version of rule.versions) {
+        ruleVersions += 1;
+        const remapped = remapAutomationVersion(version, resolvers, rule.sourceRuleId);
+        unresolved.push(...remapped.unresolved);
+        if (remapped.grantRequirement) {
+          manualActions.push({
+            kind: 'grant-reauthorization', sourceRuleId: rule.sourceRuleId,
+            version: version.version, requirement: remapped.grantRequirement,
+            note: 'Grants never transfer. Re-run preflight and re-approve the grant in the target before the rule can be enabled.',
+          });
+        }
+        configs.push({ appId: pkg.app.id, config: {
+          schemaVersion: version.schemaVersion, trigger: version.trigger,
+          conditions: version.conditions, actions: version.actions,
+        } });
+      }
+    }
+    for (const endpoint of pkg.automation.endpoints) {
+      manualActions.push({
+        kind: 'webhook-credential', sourceEndpointId: endpoint.sourceEndpointId,
+        name: endpoint.name, url: endpoint.url, action: 'supply-secret',
+        note: 'The endpoint is imported as a credential placeholder and cannot deliver until a signing secret is supplied.',
+      });
+    }
+    const cycles = cycleFindings(configs).map((cycle) => ({
+      code: cycle.code, severity: cycle.code === 'BLOCKING_CYCLE' ? 'BLOCKING' : 'WARNING',
+      apps: cycle.apps,
+    }));
+    return {
+      automation: { schemaVersion: pkg.automation.schemaVersion },
+      willCreate: {
+        rules: pkg.automation.rules.length, ruleVersions,
+        webhookEndpoints: pkg.automation.endpoints.length,
+        ruleStatus: 'disabled-draft', grantsEffective: false,
+      },
+      unresolved, manualActions, cycleFindings: cycles,
+      grantsEffective: false, rulesEnabled: false,
+      scheduleHandling: 'No source schedule rows are copied; cadence and date-relative plans are recomputed by the target environment when a rule is re-published and enabled there.',
+    };
+  }
+
   /** A cross-app reference resolves through an earlier import of the target
    * application in this tenant (its source_id_map), never by guessing. */
   private async resolveCrossAppRecord(tx: TenantTransaction, job: JobRow, pkg: PkgPackage,
@@ -1452,6 +1788,43 @@ export class ImportFinalizer {
         });
       }
     }
+    // P3-D wave 2: automation pending. The import batch persisted its
+    // detail under pending.automationImport (kept across finalizer
+    // rewrites as automation.importState). Unresolved references and
+    // BLOCKING cycle findings count toward pending completion; grant
+    // re-approvals and webhook credentials are explicit manual follow-ups
+    // that do NOT block application activation, because the imported
+    // rules are disabled drafts that cannot execute until an
+    // administrator re-authorizes them in the target (brief S7.3).
+    const storedAutomation = (previous.automationImport ?? previous.automation?.importState ?? null) as any;
+    let automationPending: any = null;
+    let automationBlockers = 0;
+    if (pkg.automation) {
+      const stored = storedAutomation ?? {
+        createdRules: [], unresolved: [], credentialsPending: [],
+        grantRequirements: [], cycleFindings: [],
+      };
+      const blockingCycles = (stored.cycleFindings ?? [])
+        .filter((finding: any) => finding.severity === 'BLOCKING');
+      automationBlockers = (stored.unresolved ?? []).length + blockingCycles.length;
+      automationPending = {
+        importState: stored,
+        rules: stored.createdRules ?? [],
+        unresolved: stored.unresolved ?? [],
+        credentialsPending: stored.credentialsPending ?? [],
+        grantRequirements: stored.grantRequirements ?? [],
+        cycleFindings: stored.cycleFindings ?? [],
+        manualActions: [
+          ...(stored.credentialsPending ?? []).map((entry: any) => ({
+            kind: 'webhook-credential', ...entry,
+          })),
+          ...(stored.grantRequirements ?? []).map((entry: any) => ({
+            kind: 'grant-reauthorization', ...entry,
+          })),
+        ],
+        scheduleHandling: 'No source schedule rows were copied; cadence and date-relative plans are recomputed by the target environment when a rule is re-published and enabled there.',
+      };
+    }
     const unmappedUsers = pkg.directory.users
       .filter((user) => !job.userMapping[user.id])
       .map((user) => ({ id: user.id, name: directoryNames.get(user.id) ?? null, email: user.email }));
@@ -1462,11 +1835,12 @@ export class ImportFinalizer {
     const droppedAcl: any[] = [];
     if (published) remapAcl(published.aclConfiguration, job, map, droppedAcl);
     const unresolvedAssignees = assignees.filter((entry) => !entry.resolution).length;
-    const completion = unresolvedAssignees + dependencies.length + references.length === 0
+    const completion = unresolvedAssignees + dependencies.length + references.length + automationBlockers === 0
       ? 'complete' as const : 'pending' as const;
     return {
       pending: {
         assignees, assigneeResolutions: resolutions, dependencies, references,
+        automation: automationPending,
         unmappedUsers, unmappedGroups, droppedAcl,
         disabledDependencies: Object.entries(job.dependencyDecisions)
           .filter(([, decision]) => (decision as DependencyDecision)?.action === 'disable')
@@ -1581,6 +1955,32 @@ export class ImportFinalizer {
         });
       }
     }
+    if (pending.automation) {
+      for (const entry of pending.automation.unresolved ?? []) {
+        notInherited.push({
+          item: 'automation reference',
+          reason: `Automation rule ${entry.ruleSourceId ?? ''} v${entry.version ?? ''}: ${entry.kind} reference ${entry.sourceId} (${entry.context}) has no target mapping; it stays unresolved on the disabled draft and blocks completion until remapped.`,
+        });
+      }
+      for (const entry of pending.automation.credentialsPending ?? []) {
+        notInherited.push({
+          item: 'webhook credential',
+          reason: `Webhook endpoint "${entry.name}" (${entry.url}) was imported as a credential placeholder; a signing secret must be supplied in the target before it can deliver. No secret material was in the package.`,
+        });
+      }
+      for (const entry of pending.automation.grantRequirements ?? []) {
+        notInherited.push({
+          item: 'automation grant',
+          reason: `Automation rule ${entry.sourceRuleId} v${entry.version} needs its grant re-approved in the target; imported grants never take effect.`,
+        });
+      }
+      for (const finding of (pending.automation.cycleFindings ?? []).filter((entry: any) => entry.severity === 'BLOCKING')) {
+        notInherited.push({
+          item: 'automation cycle check',
+          reason: `Re-running the static cycle check in the target found a BLOCKING cycle (${finding.code}); the affected rules cannot be published until the loop is removed.`,
+        });
+      }
+    }
     const pendingTokenReissues = pkg.config.apiTokens.map((token) => ({
       name: token.name, scope: token.scope, sourceTokenId: token.id, reissuedAt: null as string | null,
     }));
@@ -1603,6 +2003,18 @@ export class ImportFinalizer {
           unmapped: pending.unmappedGroups,
         },
       },
+      automation: pending.automation ? {
+        rulesImported: (pending.automation.rules ?? []).length,
+        ruleVersionsImported: (pending.automation.rules ?? [])
+          .reduce((sum: number, rule: any) => sum + (rule.versions?.length ?? 0), 0),
+        rulesEnabled: 0,
+        grantsEffective: 0,
+        unresolved: pending.automation.unresolved ?? [],
+        credentialsPending: pending.automation.credentialsPending ?? [],
+        grantRequirements: pending.automation.grantRequirements ?? [],
+        cycleFindings: pending.automation.cycleFindings ?? [],
+        scheduleHandling: pending.automation.scheduleHandling,
+      } : null,
       verification: {
         recordsMatch: matches.records, tableRowsMatch: matches.tableRows,
         attachments: { checked: fileRowsRestored.length, failed: attachmentFailures },
@@ -1769,6 +2181,7 @@ export class ImportOrchestrator {
     const state: ExecState = {
       map: new IdMap(claimed.entityMapping as SourceIdMapRow[]),
       droppedAcl: [], droppedAssignees: [], disabledDependencies: [], pendingDependencies: [],
+      automation: emptyAutomationState(),
     };
     try {
       let job = claimed;
@@ -1778,7 +2191,7 @@ export class ImportOrchestrator {
       });
       const batches = [
         this.execution.batchFiles, this.execution.batchRecords, this.execution.batchComments,
-        this.execution.batchHistory, this.execution.batchReferences,
+        this.execution.batchHistory, this.execution.batchReferences, this.execution.batchAutomation,
       ];
       for (const batch of batches) {
         await withTenantTransaction(ctx, async (tx) => {
@@ -1891,6 +2304,7 @@ export class ImportOrchestrator {
       const state: ExecState = {
         map: new IdMap(job.entityMapping as SourceIdMapRow[]),
         droppedAcl: [], droppedAssignees: [], disabledDependencies: [], pendingDependencies: [],
+        automation: emptyAutomationState(),
       };
       for (const [sourceFieldId, decision] of Object.entries(decisions)) {
         const targetFieldId = state.map.get('field', sourceFieldId);
@@ -1904,6 +2318,7 @@ export class ImportOrchestrator {
           const scratch: ExecState = {
             map: state.map, droppedAcl: [], droppedAssignees: [],
             disabledDependencies: [], pendingDependencies: [],
+            automation: emptyAutomationState(),
           };
           const lookup = sourceField.lookup
             ? this.execution.remapReferenceConfigPublic(sourceField.lookup, 'lookup', sourceFieldId, pkg, fresh, scratch)
@@ -1964,7 +2379,8 @@ export class ImportOrchestrator {
       const pending = refreshed.pending as any;
       throw new BadRequestException(
         `Import is still pending completion: ${pending.assignees?.filter((a: any) => !a.resolution).length ?? 0} assignee(s), ` +
-        `${pending.dependencies?.length ?? 0} dependency(ies), ${pending.references?.length ?? 0} reference(s) unresolved. ` +
+        `${pending.dependencies?.length ?? 0} dependency(ies), ${pending.references?.length ?? 0} reference(s), ` +
+        `${(pending.automation?.unresolved?.length ?? 0) + (pending.automation?.cycleFindings?.filter((finding: any) => finding.severity === 'BLOCKING').length ?? 0)} automation item(s) unresolved. ` +
         'Resolve them, explicitly disable or skip them, or cancel the import.');
     }
     return withTenantTransaction(context, async (tx) => {
@@ -2162,6 +2578,11 @@ export class ImportController {
   @Post(':jobId/validate')
   validate(@AuthenticatedTenant() context: TenantContext, @Param('jobId') jobId: string) {
     return this.execution.validate(context, parseInput(identifier, jobId));
+  }
+
+  @Post(':jobId/automation-dry-run')
+  automationDryRun(@AuthenticatedTenant() context: TenantContext, @Param('jobId') jobId: string) {
+    return this.execution.automationDryRun(context, parseInput(identifier, jobId));
   }
 
   @Post(':jobId/resume')

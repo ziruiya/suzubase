@@ -357,6 +357,7 @@ export const automationHttp = {
   webhookEndpoint: z.looseObject({
     id: identifier, name: z.string(), url: z.string(), policy: z.string(),
     keyVersion: z.number().int(), validated: z.boolean(),
+    credentialPending: z.boolean().optional(),
   }),
   webhookDeliveryPage: z.looseObject({ items: z.array(z.unknown()), attempts: z.array(z.unknown()), total: z.number().int() }),
   result: z.looseObject({}),
@@ -519,7 +520,7 @@ function supportedCondition(item: Condition, field: FieldDefinition) {
   return true;
 }
 
-function cycleFindings(rules: { appId: string; config: AutomationRuleConfig }[]) {
+export function cycleFindings(rules: { appId: string; config: AutomationRuleConfig }[]) {
   const edges = rules.flatMap((rule, sourceIndex) => rule.config.actions.flatMap((action) => {
     const producedEvent = {
       CREATE_RECORD: 'record.created', UPDATE_FIELDS: 'record.updated', ADVANCE_WORKFLOW: 'workflow.transitioned',
@@ -2619,7 +2620,8 @@ export class AutomationService {
     return {
       id: row.id, name: row.name, url: row.url, policy: row.policy,
       keyVersion: row.keyVersion, previousKeyVersion: row.previousKeyVersion,
-      rotatedAt: row.rotatedAt, secretSet: true,
+      rotatedAt: row.rotatedAt, secretSet: !row.credentialPending && row.secretEnc.length > 0,
+      credentialPending: row.credentialPending,
       validated: row.validatedUrlHash !== null && row.validatedUrlHash === webhookUrlHash(row.url),
       validatedAt: row.validatedAt, createdAt: row.createdAt, updatedAt: row.updatedAt,
     };
@@ -2711,8 +2713,12 @@ export class AutomationService {
       // records the key version it used, so historical verification
       // stays exact.
       const [row] = await tx.update(automationWebhookEndpoints).set({
-        previousSecretEnc: existing.secretEnc, previousKeyVersion: existing.keyVersion,
-        secretEnc: encryptWebhookSecret(input.secret), keyVersion: existing.keyVersion + 1,
+        // A placeholder endpoint (M1 import) has no outgoing key: the
+        // supplied secret becomes key version 1 with no previous key.
+        previousSecretEnc: existing.credentialPending ? null : existing.secretEnc,
+        previousKeyVersion: existing.credentialPending ? null : existing.keyVersion,
+        secretEnc: encryptWebhookSecret(input.secret), credentialPending: false,
+        keyVersion: existing.credentialPending ? existing.keyVersion : existing.keyVersion + 1,
         rotatedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       }).where(and(eq(automationWebhookEndpoints.tenantId, context.tenantId),
         eq(automationWebhookEndpoints.id, endpointId))).returning();
@@ -2731,6 +2737,10 @@ export class AutomationService {
       eq(automationWebhookEndpoints.tenantId, delegated.tenantId),
       eq(automationWebhookEndpoints.appId, args.appId), eq(automationWebhookEndpoints.id, endpointId)));
     if (!endpoint) throw codedError('WEBHOOK_ENDPOINT_NOT_FOUND', 'Webhook endpoint not found: ' + endpointId);
+    if (endpoint.credentialPending) {
+      throw codedError('WEBHOOK_CREDENTIAL_REQUIRED',
+        'Webhook endpoint has no signing secret yet (imported placeholder); supply the secret before it can deliver');
+    }
     const [run] = await tx.select({ ruleVersion: automationRuns.ruleVersion }).from(automationRuns)
       .where(and(eq(automationRuns.tenantId, delegated.tenantId), eq(automationRuns.id, args.runId)));
     // Frozen payload: built ONLY from the event-time record snapshot the
@@ -2931,6 +2941,9 @@ export class AutomationService {
 
     if (!endpoint) {
       return finalize({ outcome: 'BLOCKED', errorType: 'ENDPOINT_NOT_FOUND' });
+    }
+    if (endpoint.credentialPending) {
+      return finalize({ outcome: 'BLOCKED', errorType: 'WEBHOOK_CREDENTIAL_REQUIRED' });
     }
     if (!endpoint.validatedUrlHash || endpoint.validatedUrlHash !== webhookUrlHash(endpoint.url)) {
       return finalize({ outcome: 'BLOCKED', errorType: 'ENDPOINT_NOT_VALIDATED' });
@@ -3332,6 +3345,12 @@ export class AutomationService {
         eq(automationWebhookEndpoints.appId, appId), eq(automationWebhookEndpoints.id, endpointId)));
       if (!endpoint) {
         findings.push({ code: 'WEBHOOK_ENDPOINT_NOT_FOUND', severity: 'BLOCKING' });
+        continue;
+      }
+      if (endpoint.credentialPending) {
+        // M1-imported placeholder: no signing secret exists yet, so the
+        // endpoint cannot deliver. The message names the remedy.
+        findings.push({ code: 'WEBHOOK_CREDENTIAL_REQUIRED', severity: 'BLOCKING' });
         continue;
       }
       const safety = checkWebhookUrl(endpoint.url);

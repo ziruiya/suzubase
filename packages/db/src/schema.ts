@@ -823,6 +823,7 @@ export const automationWebhookEndpoints = pgTable('automation_webhook_endpoints'
   url: text().notNull(),
   policy: text().notNull(),
   secretEnc: text('secret_enc').notNull(),
+  credentialPending: boolean('credential_pending').notNull().default(false),
   keyVersion: integer('key_version').notNull().default(1),
   previousSecretEnc: text('previous_secret_enc'),
   previousKeyVersion: integer('previous_key_version'),

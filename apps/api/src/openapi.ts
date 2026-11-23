@@ -440,6 +440,10 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   ['/imports/{jobId}/error-report']: { get: { reply: z.looseObject({}),
     description: 'Object/row/field-level preflight error report for a failed validation.' } },
   ['/imports/{jobId}/audit']: { get: { reply: z.array(migrationAuditEntry) } },
+  ['/imports/{jobId}/automation-dry-run']: { post: { reply: z.looseObject({
+    automation: z.unknown(), willCreate: z.looseObject({}), unresolved: z.array(z.looseObject({})),
+    manualActions: z.array(z.looseObject({})), cycleFindings: z.array(z.looseObject({})),
+  }), conflict: errorSchema } },
   ['/imports/{jobId}/validate']: { post: { reply: migrationJob, conflict: errorSchema,
     description: 'Runs full preflight: package integrity, version compatibility, item-by-item reference integrity and field-structure checks.' } },
   ['/imports/{jobId}/resume']: { post: { reply: migrationJob, conflict: errorSchema } },

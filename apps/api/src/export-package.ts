@@ -23,6 +23,11 @@ import { strToU8, unzipSync, zipSync } from 'fflate';
  *                                    lookup/related configs, API token metadata (G3-05)
  *   data/directory.json            - source user/group/organization identities
  *                                    referenced by the package (mapping input)
+ *   data/automation.json           - P3-D wave 2: automation rules, rule
+ *                                    versions, grant REQUIREMENTS and the
+ *                                    non-sensitive webhook endpoint config.
+ *                                    Never secret material (neither plaintext
+ *                                    nor ciphertext); absent in old packages.
  *   attachments/<fileId>/v<version>/body - attachment file bodies (G3-03)
  *
  * Validity rules (contracts 4 SS4.6):
@@ -49,6 +54,7 @@ export const OBJECT_TYPES = [
   'attachmentVersions', 'comments', 'historyEvents', 'workflowEvents',
   'aclEntries', 'notificationRules', 'apiTokenMetadata', 'userReferences',
   'groupReferences', 'organizationReferences',
+  'automationRules', 'automationRuleVersions', 'automationWebhookEndpoints',
 ] as const;
 export type ObjectType = (typeof OBJECT_TYPES)[number];
 export type ObjectCounts = Record<ObjectType, number>;
@@ -88,8 +94,11 @@ export interface CountDiff { type: ObjectType; expected: number; actual: number 
 
 /** Pre-seal reconciliation (G3-01): returns every mismatching object type. */
 export function reconcileCounts(expected: ObjectCounts, actual: ObjectCounts): CountDiff[] {
-  return OBJECT_TYPES.filter((type) => expected[type] !== actual[type])
-    .map((type) => ({ type, expected: expected[type], actual: actual[type] }));
+  // Missing keys read as 0: manifests written before the automation
+  // section existed carry no automation counts, and they must still
+  // reconcile against a payload counted by current code (and vice versa).
+  return OBJECT_TYPES.filter((type) => (expected[type] ?? 0) !== (actual[type] ?? 0))
+    .map((type) => ({ type, expected: expected[type] ?? 0, actual: actual[type] ?? 0 }));
 }
 
 export interface PackagePayload {
@@ -167,6 +176,10 @@ export function countPayload(payload: PackagePayload): ObjectCounts {
   counts.aclEntries = (config?.acl.app.length ?? 0) + (config?.acl.record.length ?? 0) + (config?.acl.field.length ?? 0);
   counts.notificationRules = config?.notificationRules.length ?? 0;
   counts.apiTokenMetadata = config?.apiTokens.length ?? 0;
+  const automation = read<{ rules: { versions: unknown[] }[]; endpoints: unknown[] }>('data/automation.json');
+  counts.automationRules = automation?.rules.length ?? 0;
+  counts.automationRuleVersions = automation?.rules.reduce((sum, rule) => sum + rule.versions.length, 0) ?? 0;
+  counts.automationWebhookEndpoints = automation?.endpoints.length ?? 0;
   const directory = read<{ users: unknown[]; groups: unknown[]; organizations: unknown[] }>('data/directory.json');
   counts.userReferences = directory?.users.length ?? 0;
   counts.groupReferences = directory?.groups.length ?? 0;

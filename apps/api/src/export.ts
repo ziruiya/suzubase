@@ -8,7 +8,8 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
   and, apiTokens, apps, appVersions, commentMentions, eq, exportJobs, fields as fieldRows, files, groupMembers, inArray,
   memberGroups, organizations, recordComments, recordEvents, recordReferences, recordTableRows, recordWorkflowState,
-  appCounters, autoNumberCounters, records, sql, tenantMembers, users, workflowAssignments, workflowDefinitions, workflowEvents,
+  appCounters, autoNumberCounters, automationGrants, automationRules, automationRuleVersions,
+  automationWebhookEndpoints, records, sql, tenantMembers, users, workflowAssignments, workflowDefinitions, workflowEvents,
   deploymentInstance, withTenantTransaction, type TenantContext, type TenantTransaction,
 } from '@suzubase/db';
 import { AppSchemaService } from './app-schema';
@@ -20,6 +21,9 @@ import {
   MINIMUM_PROGRAM_VERSION, PACKAGE_FORMAT_VERSION, SENSITIVE_DATA_NOTICE, countPayload, emptyCounts,
   sealPackage, type ObjectCounts, type PackageManifest,
 } from './export-package';
+import {
+  AUTOMATION_PACKAGE_SCHEMA_VERSION, type AutomationPackage,
+} from './automation-package';
 
 function exportDirectory() {
   return process.env.EXPORT_DIRECTORY ??
@@ -356,6 +360,58 @@ export class ExportService {
       createdAt: apiTokens.createdAt, revokedAt: apiTokens.revokedAt, issuedBy: apiTokens.issuedBy,
     }).from(apiTokens).where(and(eq(apiTokens.tenantId, tenantId), eq(apiTokens.appId, appId)));
 
+    // ---- P3-D wave 2 automation (brief S7.1): rule definitions, every
+    // rule version, grant REQUIREMENTS and the non-sensitive webhook
+    // endpoint configuration. Secret material never enters the package:
+    // neither the plaintext secret nor its AES-256-GCM ciphertext is
+    // read here at all. Run history is NOT exported as replayable state;
+    // business history travels in data/history.json under the existing
+    // M1 contract, untouched by this section.
+    const automationRuleRows = await tx.select().from(automationRules).where(and(
+      eq(automationRules.tenantId, tenantId), eq(automationRules.appId, appId)))
+      .orderBy(automationRules.createdAt);
+    const automationVersionRows = automationRuleRows.length ? await tx.select().from(automationRuleVersions)
+      .where(and(eq(automationRuleVersions.tenantId, tenantId), eq(automationRuleVersions.appId, appId)))
+      .orderBy(automationRuleVersions.version) : [];
+    const automationGrantRows = automationVersionRows.length ? await tx.select().from(automationGrants)
+      .where(and(eq(automationGrants.tenantId, tenantId), eq(automationGrants.appId, appId))) : [];
+    const automationEndpointRows = await tx.select().from(automationWebhookEndpoints).where(and(
+      eq(automationWebhookEndpoints.tenantId, tenantId), eq(automationWebhookEndpoints.appId, appId)))
+      .orderBy(automationWebhookEndpoints.createdAt);
+    const automationPackage: AutomationPackage = {
+      schemaVersion: AUTOMATION_PACKAGE_SCHEMA_VERSION,
+      endpoints: automationEndpointRows.map((row) => ({
+        sourceEndpointId: row.id, name: row.name, url: row.url, policy: row.policy,
+        keyVersion: row.keyVersion, credentialRequired: true as const,
+        credentialPendingInSource: row.credentialPending,
+        validatedInSource: row.validatedUrlHash !== null &&
+          row.validatedUrlHash === createHash('sha256').update(row.url).digest('hex'),
+      })),
+      rules: automationRuleRows.map((rule) => ({
+        sourceRuleId: rule.id, name: rule.name, enabledInSource: rule.enabled,
+        currentVersion: rule.currentVersion, archived: rule.archivedAt !== null,
+        versions: automationVersionRows.filter((version) => version.ruleId === rule.id)
+          .map((version) => {
+            const grants = automationGrantRows.filter((grant) =>
+              grant.ruleId === rule.id && grant.ruleVersion === version.version);
+            const grant = grants.find((entry) => entry.revokedAt === null) ?? grants[0];
+            return {
+              version: version.version, schemaVersion: version.schemaVersion,
+              sourceSchemaVersion: version.sourceSchemaVersion, status: version.status,
+              trigger: version.trigger, conditions: version.conditions, actions: version.actions,
+              // Requirement list only: what the source approved. The
+              // approver identity and timestamps are NOT exported and no
+              // grant becomes effective in the target environment.
+              grantRequirement: grant ? {
+                sourceAppId: grant.sourceAppId, readableFieldIds: grant.readableFieldIds,
+                targetAppIds: grant.targetAppIds, writableFieldIds: grant.writableFieldIds,
+                allowedOperations: grant.allowedOperations,
+              } : null,
+            };
+          }),
+      })),
+    };
+
     // ---- Directory: source identities referenced anywhere in the package.
     const userIds = new Set<string>();
     const groupIds = new Set<string>();
@@ -377,6 +433,15 @@ export class ExportService {
     for (const rule of published.notificationRules) for (const recipient of rule.recipients) {
       if ('id' in recipient) addSubject(recipient);
     }
+    for (const rule of automationPackage.rules) {
+      for (const version of rule.versions) {
+        for (const action of version.actions) {
+          for (const id of action.notify?.recipientUserIds ?? []) userIds.add(id);
+          for (const id of action.notify?.recipientGroupIds ?? []) groupIds.add(id);
+        }
+      }
+    }
+    for (const row of automationRuleRows) userIds.add(row.createdBy);
     for (const token of tokenRows) userIds.add(token.issuedBy);
     const directoryUsers = userIds.size ? await tx.select({
       id: users.id, email: users.email, loginName: users.loginName, displayName: users.displayName,
@@ -441,6 +506,7 @@ export class ExportService {
           issuedBy: token.issuedBy, createdAt: token.createdAt, revokedAt: token.revokedAt,
         })),
       }),
+      'data/automation.json': JSON.stringify(automationPackage),
       'data/directory.json': JSON.stringify({
         users: directoryUsers, groups: directoryGroups.map((group) => ({
           id: group.id, name: group.name,
@@ -468,6 +534,10 @@ export class ExportService {
     expected.aclEntries = acl.app.length + acl.record.length + acl.field.length;
     expected.notificationRules = published.notificationRules.length;
     expected.apiTokenMetadata = tokenRows.length;
+    expected.automationRules = automationPackage.rules.length;
+    expected.automationRuleVersions = automationPackage.rules
+      .reduce((sum, rule) => sum + rule.versions.length, 0);
+    expected.automationWebhookEndpoints = automationPackage.endpoints.length;
     expected.userReferences = directoryUsers.length;
     expected.groupReferences = directoryGroups.length;
     expected.organizationReferences = directoryOrganizations.length;
@@ -485,6 +555,8 @@ export class ExportService {
           apiTokens: tokenRows.length ? 'included' : 'absent',
           workflows: definitionRows.length ? 'included' : 'absent',
           comments: app.commentsEnabled ? 'included' : 'absent',
+          automation: automationPackage.rules.length || automationPackage.endpoints.length
+            ? 'included' : 'absent',
           attachments: attachmentEntries.length ? 'included' : 'absent',
         },
         attachments: attachmentEntries, sensitiveDataNotice: SENSITIVE_DATA_NOTICE,
