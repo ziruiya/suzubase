@@ -1,4 +1,4 @@
-import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type LookupConfiguration, type RelatedConfiguration, type TableConfiguration, type NotificationRule, type NotificationDelivery, type WorkflowCondition, type AssigneeSource, type ViewCondition } from '@suzubase/shared-types';
+import { fieldTypes, type AclConfiguration, type ApiTokenAction, type AutoNumberConfiguration, type CategoryConfiguration, type FieldChange, type FieldOption, type RecordData, type RecordResponse, type ViewConfiguration, type TextSearchMode, type Formula, type LayoutElement, type FieldDefinition, type FormLayout, type IndexPurpose, type FieldType, type LookupConfiguration, type RelatedConfiguration, type TableConfiguration, type NotificationRule, type NotificationDelivery, type WorkflowCondition, type AssigneeSource, type ViewCondition } from '@suzubase/shared-types';
 import { sql } from 'drizzle-orm';
 import {
   bigint, boolean, check, foreignKey, index, integer, jsonb, pgEnum, pgSchema, pgTable, primaryKey, uniqueIndex,
@@ -120,6 +120,7 @@ export const appVersions = pgTable('app_versions', {
   notificationRules: jsonb('notification_rules').$type<NotificationRule[]>().notNull().default(sql`'[]'::jsonb`),
   migrationReport: jsonb('migration_report').$type<unknown>(),
   viewConfiguration: jsonb('view_configuration').$type<ViewConfiguration>().notNull().default(sql`'{"views":[],"defaultId":null}'::jsonb`),
+  categoryConfiguration: jsonb('category_configuration').$type<CategoryConfiguration>().notNull().default(sql`'{"enabled":false,"nodes":[]}'::jsonb`),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.version] }),
   foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
@@ -331,6 +332,33 @@ export const recordTableRows = pgTable('record_table_rows', {
     name: 'record_table_rows_field_fk',
     columns: [t.tenantId, t.appId, t.fieldId],
     foreignColumns: [fields.tenantId, fields.appId, fields.fieldId],
+  }),
+]);
+
+/**
+ * P4-T1: record <-> category assignments. Category nodes live in the
+ * versioned app_versions.category_configuration JSONB (identity = node id,
+ * stable across schema versions), so category_id has no FK target table;
+ * integrity (node exists in the published tree, delete-with-records is
+ * refused) is enforced by the category service and publish preflight.
+ */
+export const recordCategories = pgTable('record_categories', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  recordId: uuid('record_id').notNull(),
+  categoryId: uuid('category_id').notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.recordId, t.categoryId] }),
+  index('record_categories_category_idx').on(t.tenantId, t.appId, t.categoryId),
+  foreignKey({
+    name: 'record_categories_app_fk',
+    columns: [t.tenantId, t.appId],
+    foreignColumns: [apps.tenantId, apps.id],
+  }),
+  foreignKey({
+    name: 'record_categories_record_fk',
+    columns: [t.tenantId, t.appId, t.recordId],
+    foreignColumns: [records.tenantId, records.appId, records.id],
   }),
 ]);
 

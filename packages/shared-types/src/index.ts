@@ -14,6 +14,8 @@ export interface RecordResponse {
   createdAt: string;
   updatedBy: string;
   updatedAt: string;
+  /** P4-T1: category node ids assigned to this record (empty when none). */
+  categoryIds?: string[];
   /** Present only for migration-restored records (contracts 4 SS4.5.3). */
   migration?: {
     importJobId: string;

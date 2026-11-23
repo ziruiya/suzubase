@@ -1,4 +1,4 @@
-import type { AutoNumberConfiguration, FieldOption, FieldType, FormLayout, Formula, LayoutElement, LookupConfiguration, RelatedConfiguration, TableConfiguration, TextSearchMode, ViewConfiguration } from '@suzubase/shared-types';
+import type { AutoNumberConfiguration, CategoryConfiguration, FieldOption, FieldType, FormLayout, Formula, LayoutElement, LookupConfiguration, RelatedConfiguration, TableConfiguration, TextSearchMode, ViewConfiguration } from '@suzubase/shared-types';
 
 export interface Profile {
   tenantId: string;
@@ -48,6 +48,7 @@ export interface App extends AppSummary, ViewConfiguration {
   localDrafts: boolean;
   fields: Field[];
   formLayout: FormLayout;
+  categories: CategoryConfiguration;
   can: { create: boolean; edit: boolean; delete: boolean; manage: boolean; export: boolean };
 }
 

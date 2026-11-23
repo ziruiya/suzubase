@@ -170,6 +170,36 @@ function targetOptions(source: any): { value: string; label: string; disabled: b
   }));
 }
 
+/**
+ * P4-T1 category resolution (frozen spec): kintone record values carry
+ * category NAMES only; the tree itself is not readable through the REST
+ * API. Given an out-of-band captured tree (nodes keyed by stable id), a
+ * name resolves only when exactly ONE node in the whole tree carries it.
+ * Zero matches (unknown name) or multiple matches (duplicate names
+ * anywhere, including under different parents) are identity ambiguity:
+ * the value is reported as UNRESOLVED_CATEGORY_IDENTITY, never guessed by
+ * position or merged, and the caller must block activation for the app.
+ */
+export function resolveKintoneCategories(
+  nodes: { id: string; parentId: string | null; name: string }[],
+  recordValues: { recordId: string; names: string[] }[],
+): { resolved: Record<string, string[]>; unresolved: { recordId: string; name: string; code: 'UNRESOLVED_CATEGORY_IDENTITY' }[] } {
+  const idsByName = new Map<string, string[]>();
+  for (const node of nodes) idsByName.set(node.name, [...(idsByName.get(node.name) ?? []), node.id]);
+  const resolved: Record<string, string[]> = {};
+  const unresolved: { recordId: string; name: string; code: 'UNRESOLVED_CATEGORY_IDENTITY' }[] = [];
+  for (const { recordId, names } of recordValues) {
+    const ids: string[] = [];
+    for (const name of names) {
+      const candidates = idsByName.get(name) ?? [];
+      if (candidates.length === 1) ids.push(candidates[0]);
+      else unresolved.push({ recordId, name, code: 'UNRESOLVED_CATEGORY_IDENTITY' });
+    }
+    resolved[recordId] = ids;
+  }
+  return { resolved, unresolved };
+}
+
 export function mapKintoneField(source: any, options: {
   fields?: any[];
   acceptCalcDataOnly?: boolean;
@@ -216,9 +246,15 @@ export function mapKintoneField(source: any, options: {
     };
   }
   if (type === 'CATEGORY') return {
-    ...base, targetType: null, status: 'UNSUPPORTED',
-    reason: 'P2 category tree is not implemented; dropdown downgrade is not equivalent',
-    sourceUnavailable: false, upgradeRequired: true,
+    // P4-T1: the platform now implements category trees, but the kintone
+    // REST API cannot read the source tree (only in-page JS exposes names)
+    // and record values carry names only. Extraction must capture the
+    // tree out of band and resolve every value through
+    // resolveKintoneCategories; anything ambiguous stays UNRESOLVED and
+    // blocks activation (UNRESOLVED_CATEGORY_IDENTITY).
+    ...base, targetType: null, status: 'UNRESOLVED',
+    reason: 'Category tree requires out-of-band capture; record values are names only and must resolve unambiguously (UNRESOLVED_CATEGORY_IDENTITY otherwise)',
+    sourceUnavailable: false, upgradeRequired: false,
   };
   if (type === 'UNKNOWN' || !direct[type]) return {
     ...base, targetType: null, status: 'UNSUPPORTED',

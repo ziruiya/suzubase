@@ -45,7 +45,7 @@ test('all Drizzle migrations run from an empty PostgreSQL database and can be re
       'automation_audit_events', 'automation_cadence_plans', 'automation_cadence_slots', 'automation_date_backfills', 'automation_grants', 'automation_problem_chains', 'automation_rule_versions', 'automation_rules',
       'automation_run_actions', 'automation_runs', 'automation_schedules', 'automation_webhook_attempts', 'automation_webhook_deliveries', 'automation_webhook_endpoints',
       'comment_mentions', 'csv_jobs', 'deployment_instance', 'export_jobs', 'fields', 'file_references', 'files', 'group_members', 'import_jobs', 'issued_auto_numbers', 'login_credentials', 'member_groups', 'migration_audit_log', 'migration_tokens', 'notifications', 'organizations', 'outbox', 'permission_audit',
-      'record_comments', 'record_create_keys', 'record_events', 'record_references', 'record_search_values', 'record_table_rows', 'record_unique_values', 'record_workflow_state', 'records', 'runtime_indexes', 'tenant_members', 'tenants', 'users',
+      'record_categories', 'record_comments', 'record_create_keys', 'record_events', 'record_references', 'record_search_values', 'record_table_rows', 'record_unique_values', 'record_workflow_state', 'records', 'runtime_indexes', 'tenant_members', 'tenants', 'users',
       'workflow_actions', 'workflow_assignments', 'workflow_definitions', 'workflow_events', 'workflow_states',
     ]);
     assert.ok(rows.every(({ relrowsecurity, owner }) => relrowsecurity && owner === 'suzubase_migration'));

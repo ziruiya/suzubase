@@ -1,5 +1,5 @@
 import { Temporal } from '@js-temporal/polyfill';
-import { multiOptionFieldTypes, optionFieldTypes, type FormLayout, type RecordData, type RecordResponse, type TableField, type TableRow } from '@suzubase/shared-types';
+import { multiOptionFieldTypes, optionFieldTypes, type CategoryNode, type FormLayout, type RecordData, type RecordResponse, type TableField, type TableRow } from '@suzubase/shared-types';
 import { useEffect, useRef, useState } from 'react';
 import { Controller, useForm, useWatch } from 'react-hook-form';
 import { z } from 'zod';
@@ -281,6 +281,7 @@ export function RecordEditor({
   }, [allowDraft, app.id, app.schemaVersion, record?.id, profile.tenantId, profile.userId]);
 
   const [selecting, setSelecting] = useState<Field>();
+  const [categoryIds, setCategoryIds] = useState<string[]>(record?.categoryIds ?? []);
   const watchedValues = useWatch({ control: form.control });
   function editableValues(values: RecordData): RecordData {
     return Object.fromEntries(fields.filter(({ editable, fieldId }) => editable && Object.hasOwn(values, fieldId))
@@ -334,10 +335,11 @@ export function RecordEditor({
     if (invalid) return;
     setState('submitting');
     const path = appPath(app.id) + '/records';
+    const categories = app.categories?.enabled ? { categoryIds } : {};
     try {
       const saved = baseline
-        ? await api<RecordResponse>(path + '/' + baseline.id, token, json('PUT', { revision: baseline.revision, data }))
-        : await api<RecordResponse>(path, token, { ...json('POST', { data }), headers: { 'Idempotency-Key': replayKey.current } });
+        ? await api<RecordResponse>(path + '/' + baseline.id, token, json('PUT', { revision: baseline.revision, data, ...categories }))
+        : await api<RecordResponse>(path, token, { ...json('POST', { data, ...categories }), headers: { 'Idempotency-Key': replayKey.current } });
       setState('success');
       if (allowDraft) await removeDrafts(ownDraft).catch(() => undefined);
       onSaved(saved);
@@ -357,6 +359,17 @@ export function RecordEditor({
     }
   }
   const busy = state === 'submitting';
+  const orderedCategories: { node: CategoryNode; depth: number }[] = [];
+  if (app.categories) {
+    const walk = (parentId: string | null, depth: number) => {
+      for (const node of app.categories.nodes.filter((entry) => entry.parentId === parentId)
+        .sort((a, b) => a.sortOrder - b.sortOrder)) {
+        orderedCategories.push({ node, depth });
+        walk(node.id, depth + 1);
+      }
+    };
+    walk(null, 0);
+  }
   return <form className="editor stack" onSubmit={form.handleSubmit(submit)} noValidate>
     <div className="inline spread"><h2>{record ? 'Edit record ' + record.recordNo : 'New record'}</h2>
       <button type="button" onClick={onCancel} disabled={busy}>Cancel</button></div>
@@ -432,6 +445,14 @@ export function RecordEditor({
         setState('editing');
         setSelecting(undefined);
       }} />}
+    {app.categories?.enabled && orderedCategories.length > 0 && <fieldset className="stack">
+      <legend>Categories</legend>
+      {orderedCategories.map(({ node, depth }) => <label className="option" key={node.id} style={{ marginLeft: depth * 20 }}>
+        <input type="checkbox" checked={categoryIds.includes(node.id)} disabled={busy}
+          onChange={(event) => setCategoryIds((previous) => event.target.checked
+            ? [...previous, node.id] : previous.filter((id) => id !== node.id))} /> {node.name}
+      </label>)}
+    </fieldset>}
     <p className="muted">Date and time use {profile.timeZone}.</p>
     {allowDraft ? <details><summary>About local drafts</summary>
       <p>Drafts stay in this browser and expire after {profile.draftExpiryHours / 24} days. Signing out clears your drafts.
