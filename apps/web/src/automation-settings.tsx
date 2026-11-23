@@ -21,6 +21,27 @@ type ManualResult = { run: Run; actions: RunAction[]; deduplicated: boolean };
 type ProblemChain = {
   rootCausationId: string; reason: string; lastRunId: string | null; pausedAt: string | null;
 };
+type WebhookEndpoint = {
+  id: string; name: string; url: string; policy: string; keyVersion: number;
+  previousKeyVersion: number | null; rotatedAt: string | null; secretSet: boolean;
+  validated: boolean; validatedAt: string | null;
+};
+type WebhookDelivery = {
+  id: string; deliveryId: string; runId: string; actionId: string;
+  endpointId: string | null; endpointUrl: string | null; policy: string | null;
+  status: string; attempts: number; nextAttemptAt: string | null;
+  responseStatus: number | null; errorType: string | null; keyVersion: number | null;
+  createdAt: string; updatedAt: string;
+};
+type WebhookAttempt = {
+  id: string; deliveryRowId: string; attemptNumber: number; keyVersion: number | null;
+  outcome: string; httpStatus: number | null; errorType: string | null; startedAt: string;
+};
+
+const AUTO_POLICY_RISK = 'AUTO_RETRY_AT_LEAST_ONCE: delivery is retried automatically (up to 6 attempts in total). ' +
+  'This can deliver the same event more than once — 可能重复投递、接收方应按投递 ID 去重。';
+const MANUAL_POLICY_RISK = 'MANUAL_ON_UNCERTAIN: nothing is retried automatically. ' +
+  '外部系统可能已经处理本次请求，重新发送可能造成重复业务操作。';
 
 // P3-C C-2: only statuses a run can actually carry. RATE_LIMITED and
 // BACKLOG_LIMITED are audit signals, never run statuses; the legacy P3-A
@@ -42,6 +63,10 @@ export function AutomationSettings({ app, token }: { app: App; token: string }) 
   const [detail, setDetail] = useState<RunDetail>();
   const [chains, setChains] = useState<ProblemChain[]>([]);
   const [manualRuleId, setManualRuleId] = useState('');
+  const [endpoints, setEndpoints] = useState<WebhookEndpoint[]>([]);
+  const [deliveries, setDeliveries] = useState<WebhookDelivery[]>([]);
+  const [attempts, setAttempts] = useState<WebhookAttempt[]>([]);
+  const [rotateSecret, setRotateSecret] = useState('');
   const [manualResult, setManualResult] = useState<ManualResult>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -61,6 +86,15 @@ export function AutomationSettings({ app, token }: { app: App; token: string }) 
   async function loadChains() {
     setChains(await api<ProblemChain[]>(path + '/problem-chains', token));
   }
+  async function loadEndpoints() {
+    setEndpoints(await api<WebhookEndpoint[]>(path + '/webhook-endpoints', token));
+  }
+  async function loadDeliveries() {
+    const result = await api<{ items: WebhookDelivery[]; attempts: WebhookAttempt[]; total: number }>(
+      path + '/webhook-deliveries?limit=50', token);
+    setDeliveries(result.items);
+    setAttempts(result.attempts);
+  }
   async function loadDetail(runId: string) {
     setDetail(await api<RunDetail>(path + '/runs/' + runId, token));
   }
@@ -75,6 +109,12 @@ export function AutomationSettings({ app, token }: { app: App; token: string }) 
     }).catch((error) => { if (!abort.signal.aborted) setError(message(error)); });
     void api<ProblemChain[]>(path + '/problem-chains', token, request).then(setChains)
       .catch((error) => { if (!abort.signal.aborted) setError(message(error)); });
+    void api<WebhookEndpoint[]>(path + '/webhook-endpoints', token, request).then(setEndpoints)
+      .catch((error) => { if (!abort.signal.aborted) setError(message(error)); });
+    void api<{ items: WebhookDelivery[]; attempts: WebhookAttempt[]; total: number }>(
+      path + '/webhook-deliveries?limit=50', token, request).then((result) => {
+      setDeliveries(result.items); setAttempts(result.attempts);
+    }).catch((error) => { if (!abort.signal.aborted) setError(message(error)); });
     return () => abort.abort();
   }, [path, token]);
 
@@ -125,6 +165,52 @@ export function AutomationSettings({ app, token }: { app: App; token: string }) 
         : result.deduplicated
           ? 'An existing run was returned for this idempotency key; no new run was started.'
           : 'Manual run finished with status ' + result.run.status + '.');
+    });
+  }
+
+  function createEndpoint(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    void run(async () => {
+      await api(path + '/webhook-endpoints', token, json('POST', {
+        name: String(data.get('name') ?? ''), url: String(data.get('url') ?? ''),
+        policy: String(data.get('policy') ?? 'AUTO_RETRY_AT_LEAST_ONCE'),
+        secret: String(data.get('secret') ?? ''),
+      }));
+      await loadEndpoints();
+      setNotice('Webhook endpoint saved and validated.');
+    });
+  }
+
+  function validateEndpoint(endpoint: WebhookEndpoint) {
+    void run(async () => {
+      await api(path + '/webhook-endpoints/' + endpoint.id + '/validate', token, json('POST'));
+      await loadEndpoints();
+      setNotice('Endpoint re-validated: ' + endpoint.url);
+    });
+  }
+
+  function rotateEndpoint(endpoint: WebhookEndpoint) {
+    if (!rotateSecret) { setError('Enter the new signing secret before rotating.'); return; }
+    void run(async () => {
+      await api(path + '/webhook-endpoints/' + endpoint.id + '/rotate-secret', token,
+        json('POST', { secret: String(data.get('secret') ?? ''), }));
+      setRotateSecret('');
+      await loadEndpoints();
+      setNotice('Signing secret rotated. New attempts sign with the new key version; ' +
+        'the previous key stays available to receivers for in-flight deliveries.');
+    });
+  }
+
+  function resendDelivery(delivery: WebhookDelivery) {
+    const confirmed = window.confirm(
+      '外部系统可能已经处理本次请求，重新发送可能造成重复业务操作。\n\nResend delivery ' +
+      delivery.deliveryId + ' as a new attempt on the same delivery?');
+    if (!confirmed) return;
+    void run(async () => {
+      await api(path + '/webhook-deliveries/' + delivery.id + '/resend', token, json('POST'));
+      await loadDeliveries();
+      setNotice('Delivery queued for resend under the same delivery ID.');
     });
   }
 
@@ -222,6 +308,62 @@ export function AutomationSettings({ app, token }: { app: App; token: string }) 
       <div className="inline"><button type="button" disabled={busy}
         onClick={() => retry(manualResult.run.id)}>Retry failed actions</button></div>
     </div>}
+
+    <h3>Webhook endpoints</h3>
+    <p className="muted">{AUTO_POLICY_RISK}</p>
+    <p className="muted">{MANUAL_POLICY_RISK}</p>
+    <form className="stack" onSubmit={createEndpoint}>
+      <label>Name <input name="name" required maxLength={120} /></label>
+      <label>URL (HTTPS only) <input name="url" required maxLength={2000} placeholder="https://example.com/webhook" /></label>
+      <label>Retry policy <select name="policy" defaultValue="AUTO_RETRY_AT_LEAST_ONCE">
+        <option value="AUTO_RETRY_AT_LEAST_ONCE">AUTO_RETRY_AT_LEAST_ONCE — automatic retries, at-least-once</option>
+        <option value="MANUAL_ON_UNCERTAIN">MANUAL_ON_UNCERTAIN — no automatic retry, manual resend only</option>
+      </select></label>
+      <label>Signing secret <input name="secret" required minLength={8} maxLength={500} type="password" autoComplete="new-password" /></label>
+      <div className="inline"><button type="submit" className="primary" disabled={busy}>Save endpoint</button></div>
+    </form>
+    <div className="automation-scroll"><table>
+      <thead><tr><th>Name</th><th>URL</th><th>Policy</th><th>Key version</th><th>Validated</th><th></th></tr></thead>
+      <tbody>{endpoints.map((endpoint) => <tr key={endpoint.id}>
+        <td>{endpoint.name}</td><td>{endpoint.url}</td><td>{endpoint.policy}</td>
+        <td>{endpoint.keyVersion}{endpoint.previousKeyVersion ? ' (previous ' + endpoint.previousKeyVersion + ')' : ''}</td>
+        <td>{endpoint.validated ? 'Yes' : 'No — re-validation required before delivery'}</td>
+        <td><div className="inline">
+          <button type="button" disabled={busy} onClick={() => validateEndpoint(endpoint)}>Validate</button>
+          <button type="button" disabled={busy} onClick={() => rotateEndpoint(endpoint)}>Rotate secret</button>
+        </div></td>
+      </tr>)}</tbody>
+    </table></div>
+    {!endpoints.length && <p className="muted">No webhook endpoints yet.</p>}
+    <label>New secret for rotation <input type="password" autoComplete="new-password" minLength={8} maxLength={500}
+      value={rotateSecret} onChange={(event) => setRotateSecret(event.target.value)} /></label>
+    <p className="muted">Changing an endpoint URL in the API clears its validation; deliveries pause until you validate it again.</p>
+
+    <h3>Webhook deliveries</h3>
+    <div className="inline">
+      <button type="button" disabled={busy} onClick={() => void run(loadDeliveries)}>Refresh deliveries</button>
+    </div>
+    <div className="automation-scroll"><table>
+      <thead><tr><th>Created</th><th>Delivery ID</th><th>Endpoint</th><th>Policy</th><th>Status</th>
+        <th>Attempts</th><th>HTTP</th><th>Last error</th><th>Next attempt</th><th></th></tr></thead>
+      <tbody>{deliveries.map((delivery) => <tr key={delivery.id}>
+        <td>{formatTime(delivery.createdAt)}</td><td>{delivery.deliveryId}</td>
+        <td>{delivery.endpointUrl ?? '—'}</td><td>{delivery.policy ?? '—'}</td><td>{delivery.status}</td>
+        <td>{delivery.attempts}</td><td>{delivery.responseStatus ?? '—'}</td>
+        <td>{delivery.errorType ?? '—'}</td><td>{formatTime(delivery.nextAttemptAt)}</td>
+        <td>{delivery.status === 'MANUAL_REVIEW_REQUIRED' &&
+          <button type="button" disabled={busy} onClick={() => resendDelivery(delivery)}>Resend manually</button>}</td>
+      </tr>)}</tbody>
+    </table></div>
+    {!deliveries.length && <p className="muted">No webhook deliveries yet.</p>}
+    {attempts.length > 0 && <div className="automation-scroll"><table>
+      <thead><tr><th>Delivery</th><th>Attempt</th><th>Key version</th><th>Outcome</th><th>HTTP</th><th>Error</th><th>Started</th></tr></thead>
+      <tbody>{attempts.map((attempt) => <tr key={attempt.id}>
+        <td>{deliveries.find((d) => d.id === attempt.deliveryRowId)?.deliveryId ?? attempt.deliveryRowId}</td>
+        <td>{attempt.attemptNumber}</td><td>{attempt.keyVersion ?? '—'}</td><td>{attempt.outcome}</td>
+        <td>{attempt.httpStatus ?? '—'}</td><td>{attempt.errorType ?? '—'}</td><td>{formatTime(attempt.startedAt)}</td>
+      </tr>)}</tbody>
+    </table></div>}
 
     <h3>Problem chains</h3>
     <p className="muted">Resuming a chain does not replay anything: events that arrived while the chain was paused were discarded and will not be re-run.</p>
