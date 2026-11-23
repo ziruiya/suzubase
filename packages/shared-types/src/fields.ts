@@ -106,7 +106,7 @@ export function lookupTargets(fields: FieldDefinition[]) {
 
 export const tableRowLimit = 100;
 export const tableFieldTypes = ['text', 'multiline', 'number', 'calculation', 'radio', 'checkbox', 'select',
-  'multiselect', 'date', 'time', 'datetime', 'url', 'user', 'organization', 'group'] as const;
+  'multiselect', 'date', 'time', 'datetime', 'url', 'user', 'organization', 'group', 'attachment'] as const;
 export type TableField = Pick<FieldDefinition, 'fieldId' | 'code' | 'name' | 'required' | 'uniqueValue' | 'options' | 'formula'> &
   { type: (typeof tableFieldTypes)[number] };
 export interface TableConfiguration {

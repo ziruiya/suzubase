@@ -231,7 +231,7 @@ export class RecordService {
     }
     await this.saveLookupReferences(tx, context, record, references);
     await this.reserveUniqueValues(tx, context, record);
-    await this.reconcileFiles(tx, context, record);
+    await this.reconcileFiles(tx, context, record, tables.replacements);
     await projectSearchValues(tx, context, record, fields);
     const eventId = await writeRecordEvent(tx, context, record, 'created', [...fieldChanges({}, data), ...tables.changes], source, undefined, causation);
     if (initial) await attachInitialWorkflow(tx, context.tenantId, record, initial, eventId);
@@ -284,6 +284,7 @@ export class RecordService {
       eq(records.appId, scope.appId), eq(records.id, scope.recordId), eq(records.revision, current.revision))).returning();
     if (!updated) throw new ConflictException('The parent record changed. Run preflight again.');
     await replaceTableRows(tx, scope, replacements);
+    await this.reconcileFiles(tx, context, serializeRecord(updated), replacements);
     await writeRecordEvent(tx, context, serializeRecord(updated), 'updated', changes, 'import');
   }
 
@@ -439,7 +440,7 @@ export class RecordService {
       await this.saveLookupReferences(tx, context, updated, references);
       await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, recordId));
       await this.reserveUniqueValues(tx, context, updated);
-      await this.reconcileFiles(tx, context, updated);
+      await this.reconcileFiles(tx, context, updated, tables.replacements);
       await projectSearchValues(tx, context, updated, definitions);
       const eventId = await writeRecordEvent(tx, context, updated, refresh ? 'lookup-refetched' : 'updated',
         [...fieldChanges(current.data, data), ...tables.changes], 'api', undefined, causation);
@@ -579,12 +580,36 @@ export class RecordService {
     });
   }
 
-  private async reconcileFiles(tx: TenantTransaction, context: TenantContext, record: RecordResponse) {
+  private async reconcileFiles(tx: TenantTransaction, context: TenantContext, record: RecordResponse,
+    replacements?: Map<string, TableRow[]>) {
     const definitions = await this.appSchema.getFields(tx, context, record.appId, record.schemaVersion);
     const attachments = definitions.filter(({ type }) => type === 'attachment').map(({ fieldId }) => ({
       fieldId, ids: JSON.parse(record.data[fieldId] || '[]') as string[],
     }));
-    if (attachments.length) await this.files.reconcile(tx, context, record.appId, record.id, attachments);
+    // P4-T2: subtable attachment references are derived from the same row
+    // replacement set that rewrites the rows, so references and rows can
+    // never drift apart within a write.
+    let table: { managedFieldIds: string[]; refs: { fieldId: string; rowId: string; subFieldId: string; fileId: string }[] } | undefined;
+    if (replacements) {
+      const refs: NonNullable<typeof table>['refs'] = [];
+      const managedFieldIds: string[] = [];
+      for (const [fieldId, rows] of replacements) {
+        const definition = definitions.find((field) => field.fieldId === fieldId);
+        const attachmentChildren = definition?.table?.fields.filter(({ type }) => type === 'attachment') ?? [];
+        if (!attachmentChildren.length) continue;
+        managedFieldIds.push(fieldId);
+        for (const row of rows) {
+          for (const child of attachmentChildren) {
+            const ids = JSON.parse(row.data[child.fieldId] || '[]') as string[];
+            for (const fileId of ids) refs.push({ fieldId, rowId: row.rowId, subFieldId: child.fieldId, fileId });
+          }
+        }
+      }
+      table = { managedFieldIds, refs };
+    }
+    if (attachments.length || table?.managedFieldIds.length) {
+      await this.files.reconcile(tx, context, record.appId, record.id, attachments, table);
+    }
   }
 
   private uniqueValuesScope(context: TenantContext, appId: string, recordId: string) {

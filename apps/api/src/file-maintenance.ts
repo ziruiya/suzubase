@@ -1,4 +1,4 @@
-import { and, eq, files, fileReferences, isNull, sql, type TenantContext, withTenantTransaction } from '@suzubase/db';
+import { and, eq, files, fileReferences, isNull, sql, tableFileReferences, type TenantContext, withTenantTransaction } from '@suzubase/db';
 import { attachmentKey, localAttachmentStorage, type StorageAdapter } from './storage';
 
 export interface FileRetention {
@@ -14,6 +14,9 @@ export async function cleanupFiles(context: TenantContext, retention: FileRetent
       sql`NOT EXISTS (SELECT 1 FROM ${fileReferences}
         WHERE ${fileReferences.tenantId} = ${files.tenantId} AND ${fileReferences.appId} = ${files.appId}
         AND ${fileReferences.fileId} = ${files.id})`,
+      sql`NOT EXISTS (SELECT 1 FROM ${tableFileReferences}
+        WHERE ${tableFileReferences.tenantId} = ${files.tenantId} AND ${tableFileReferences.appId} = ${files.appId}
+        AND ${tableFileReferences.fileId} = ${files.id})`,
       sql`((${files.state} = 'DELETED' AND ${files.deletedAt} <= now() - make_interval(hours => ${retention.deletedHours}))
         OR (${files.state} = 'TEMPORARY' AND ${files.createdAt} <= now() - make_interval(hours => ${retention.temporaryHours})))`,
     )).orderBy(files.createdAt, files.id).limit(100).for('update', { skipLocked: true });
