@@ -6,6 +6,7 @@ import { TableSettings, tableSettings } from './table-settings';
 import { PermissionsSettings } from './permissions-settings';
 import { NotificationSettings } from './notification-settings';
 import { WorkflowSettings } from './workflow-settings';
+import { AutomationSettings } from './automation-settings';
 import { ViewSettings } from './view-settings';
 import { IndexSettings } from './index-settings';
 import { ExportPanel } from './import-export';
@@ -13,7 +14,7 @@ import { LayoutDesigner } from './form-layout';
 import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
 
 type Draft = ViewConfiguration & { version: number | null; status: string | null; fields: Field[]; publishedFields: Field[]; formLayout: FormLayout };
-const tabs = ['Form', 'Views', 'Workflow', 'Notifications', 'Permissions', 'General', 'Import / export', 'Indexes'] as const;
+const tabs = ['Form', 'Views', 'Workflow', 'Automation', 'Notifications', 'Permissions', 'General', 'Import / export', 'Indexes'] as const;
 
 export function Settings({ app, session, narrow, onClose, reload }: {
   app: App; session: Session; narrow: boolean; onClose: () => void; reload: () => Promise<void>;
@@ -146,6 +147,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
     {active === 'Views' && <ViewSettings workflowStates={app.workflowStates} configuration={draft ?? app} fields={definitions} path={path}
       session={session} refresh={refreshDraft} />}
     {active === 'Workflow' && <WorkflowSettings app={app} token={token} fields={definitions} />}
+    {active === 'Automation' && <AutomationSettings app={app} token={token} />}
     {active === 'Notifications' && <NotificationSettings appId={app.id} token={token} fields={definitions} onSaved={refreshDraft} />}
     {active === 'Permissions' && <PermissionsSettings app={app} fields={definitions} session={session} refresh={refreshDraft} />}
     {active === 'General' && <form className="stack" onSubmit={(event) => {

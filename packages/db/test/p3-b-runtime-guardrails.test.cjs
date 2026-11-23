@@ -5,7 +5,7 @@ const { test } = require('node:test');
 const { addField, configureRuntime, createApp, expectRequest, login, provision, publish } = require('./support.cjs');
 
 const emptyGroup = { operator: 'and', groups: [] };
-const ruleConfig = (trigger, actions = [{ actionId: randomUUID(), type: 'NOTIFY' }]) => ({
+const ruleConfig = (trigger, actions = [{ actionId: randomUUID(), type: 'NOTIFY', notify: { recipientAssignee: true } }]) => ({
   schemaVersion: 1, trigger, conditions: { eventSnapshot: emptyGroup, currentState: emptyGroup }, actions,
 });
 
@@ -45,7 +45,7 @@ test('P3-B C6 source binding and C2 runtime guardrails use real API and worker p
         eventSnapshot: { operator: 'and', groups: [{ conditions: [{ fieldId: status.fieldId, operator: 'eq', value: 'draft' }] }] },
         currentState: { operator: 'and', groups: [{ conditions: [{ fieldId: status.fieldId, operator: 'eq', value: 'active' }] }] },
       },
-      actions: [{ actionId: randomUUID(), type: 'NOTIFY' }],
+      actions: [{ actionId: randomUUID(), type: 'NOTIFY', notify: { recipientAssignee: true } }],
     } },
   });
   await expectRequest(201, `${base}/automation/rules/${recordRule.rule.id}/grants`, {

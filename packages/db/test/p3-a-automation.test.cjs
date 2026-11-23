@@ -5,7 +5,7 @@ const { test } = require('node:test');
 const { addField, configureRuntime, createApp, expectRequest, login, provision, publish } = require('./support.cjs');
 
 const emptyGroup = { operator: 'and', groups: [] };
-const ruleConfig = (trigger, actions = [{ actionId: randomUUID(), type: 'NOTIFY' }], currentState = emptyGroup, eventSnapshot = emptyGroup) => ({
+const ruleConfig = (trigger, actions = [{ actionId: randomUUID(), type: 'NOTIFY', notify: { recipientAssignee: true } }], currentState = emptyGroup, eventSnapshot = emptyGroup) => ({
   schemaVersion: 1, trigger, conditions: { eventSnapshot, currentState }, actions,
 });
 
@@ -117,7 +117,7 @@ test('P3-A binds record/workflow events separately, rechecks snapshot/current/gr
     );
     assert.equal(workflowRuns.rowCount, 1);
     assert.match(workflowRuns.rows[0].trigger_identity, /^workflow\.transitioned:/);
-    assert.equal(workflowRuns.rows[0].status, 'ACTIONS_NOT_IMPLEMENTED');
+    assert.equal(workflowRuns.rows[0].status, 'SUCCEEDED');
     assert.equal(workflowRuns.rows[0].rule_version, workflowRule.version);
     assert.equal(workflowRuns.rows[0].causation_depth, 1);
     assert.ok(workflowRuns.rows[0].root_causation_id);
@@ -128,8 +128,8 @@ test('P3-A binds record/workflow events separately, rechecks snapshot/current/gr
       [owner.tenantId, app.id, workflowRule.id],
     );
     assert.equal(action.rowCount, 1);
-    assert.equal(action.rows[0].status, 'NOT_EXECUTED');
-    assert.equal(action.rows[0].error_code, 'P3B_DEFERRED');
+    assert.equal(action.rows[0].status, 'SUCCEEDED');
+    assert.equal(action.rows[0].error_code, null);
     const rejectedRecord = await write('/records', { data: { [status.fieldId]: 'draft' } });
     const rejectResult = await write(`/records/${rejectedRecord.id}/workflow/actions`, {
       action_id: reject.id, revision: rejectedRecord.revision,
@@ -171,6 +171,8 @@ test('P3-A binds record/workflow events separately, rechecks snapshot/current/gr
       name: 'Deterministic cycle',
       config: ruleConfig({ eventType: 'record.created' }, [{
         actionId: randomUUID(), type: 'CREATE_RECORD', targetAppId: app.id,
+        targetFieldIds: [status.fieldId],
+        mappings: [{ targetFieldId: status.fieldId, mode: 'constant', value: 'cycle' }],
       }]),
     });
 
@@ -187,6 +189,7 @@ test('P3-A binds record/workflow events separately, rechecks snapshot/current/gr
       name: 'Conditionally terminating cycle',
       config: ruleConfig({ eventType: 'record.updated', fieldId: status.fieldId, newValue: 'active' }, [{
         actionId: randomUUID(), type: 'UPDATE_FIELDS', targetFieldIds: [status.fieldId],
+        updates: [{ fieldId: status.fieldId, mode: 'set', value: 'active' }],
       }], {
         operator: 'and', groups: [{ conditions: [{ fieldId: status.fieldId, operator: 'eq', value: 'active' }] }],
       }),
@@ -225,7 +228,7 @@ test('P3-A binds record/workflow events separately, rechecks snapshot/current/gr
     );
     assert.equal(depthRuns.rowCount, 2);
     assert.ok(depthRuns.rows.some(({ record_id, status, causation_depth }) =>
-      record_id === depthFiveRecord.id && status === 'ACTIONS_NOT_IMPLEMENTED' && causation_depth === 5));
+      record_id === depthFiveRecord.id && status === 'SUCCEEDED' && causation_depth === 5));
     assert.ok(depthRuns.rows.some(({ record_id, status, causation_depth }) =>
       record_id === depthSixRecord.id && status === 'CHAIN_DEPTH_EXCEEDED' && causation_depth === 6));
     const depthNotice = await audit.query(

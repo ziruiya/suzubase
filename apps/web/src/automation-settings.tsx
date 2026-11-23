@@ -1,0 +1,226 @@
+import { useEffect, useState, type FormEvent } from 'react';
+import { api, appPath, json, message, type App } from './api';
+
+type SummaryRule = {
+  ruleId: string; name: string; enabled: boolean;
+  succeeded: number; failed: number; skipped: number;
+  lastStatus: string | null; lastRunAt: string | null; lastError: string | null;
+};
+type Summary = { rules: SummaryRule[]; backlog: number; unprocessedEvents: number };
+type Run = {
+  id: string; ruleId: string; ruleVersion: number; recordId: string; eventId: string | null;
+  triggerIdentity: string; status: string; lastError: string | null; attemptCount: number;
+  startedAt: string; completedAt: string | null;
+};
+type RunAction = {
+  actionId: string; position: number; status: string; errorCode: string | null;
+  resultRef: string | null; attemptCount: number; completedAt: string | null;
+};
+type RunDetail = { run: Run; actions: RunAction[] };
+type ManualResult = { run: Run; actions: RunAction[]; deduplicated: boolean };
+type ProblemChain = {
+  rootCausationId: string; reason: string; lastRunId: string | null; pausedAt: string | null;
+};
+
+const runStatuses = [
+  'QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'SKIPPED_CONDITION', 'SKIPPED_STALE',
+  'SKIPPED_UNAUTHORIZED', 'BLOCKED_CYCLE', 'CHAIN_DEPTH_EXCEEDED', 'ACTIONS_NOT_IMPLEMENTED',
+  'RATE_LIMITED', 'BACKLOG_LIMITED', 'CHAIN_PAUSED',
+] as const;
+
+const formatTime = (value: string | null) => value ?? '—';
+
+export function AutomationSettings({ app, token }: { app: App; token: string }) {
+  const path = appPath(app.id) + '/automation';
+  const [summary, setSummary] = useState<Summary>();
+  const [runs, setRuns] = useState<Run[]>([]);
+  const [total, setTotal] = useState(0);
+  const [statusFilter, setStatusFilter] = useState('');
+  const [ruleFilter, setRuleFilter] = useState('');
+  const [detail, setDetail] = useState<RunDetail>();
+  const [chains, setChains] = useState<ProblemChain[]>([]);
+  const [manualRuleId, setManualRuleId] = useState('');
+  const [manualResult, setManualResult] = useState<ManualResult>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  async function loadSummary() {
+    setSummary(await api<Summary>(path + '/summary', token));
+  }
+  async function loadRuns(status = statusFilter, ruleId = ruleFilter) {
+    const query = new URLSearchParams({ limit: '50' });
+    if (status) query.set('status', status);
+    if (ruleId) query.set('ruleId', ruleId);
+    const result = await api<{ items: Run[]; total: number }>(path + '/runs?' + query.toString(), token);
+    setRuns(result.items);
+    setTotal(result.total);
+  }
+  async function loadChains() {
+    setChains(await api<ProblemChain[]>(path + '/problem-chains', token));
+  }
+  async function loadDetail(runId: string) {
+    setDetail(await api<RunDetail>(path + '/runs/' + runId, token));
+  }
+
+  useEffect(() => {
+    const abort = new AbortController();
+    const request = { signal: abort.signal };
+    void api<Summary>(path + '/summary', token, request).then(setSummary)
+      .catch((error) => { if (!abort.signal.aborted) setError(message(error)); });
+    void api<{ items: Run[]; total: number }>(path + '/runs?limit=50', token, request).then((result) => {
+      setRuns(result.items); setTotal(result.total);
+    }).catch((error) => { if (!abort.signal.aborted) setError(message(error)); });
+    void api<ProblemChain[]>(path + '/problem-chains', token, request).then(setChains)
+      .catch((error) => { if (!abort.signal.aborted) setError(message(error)); });
+    return () => abort.abort();
+  }, [path, token]);
+
+  async function run(operation: () => Promise<void>) {
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try { await operation(); } catch (error) { setError(message(error)); } finally { setBusy(false); }
+  }
+
+  function changeStatus(status: string) {
+    setStatusFilter(status);
+    void run(async () => { await loadRuns(status, ruleFilter); });
+  }
+  function changeRule(ruleId: string) {
+    setRuleFilter(ruleId);
+    void run(async () => { await loadRuns(statusFilter, ruleId); });
+  }
+
+  function retry(runId: string) {
+    void run(async () => {
+      await api(path + '/runs/' + runId + '/retry', token, json('POST'));
+      await loadDetail(runId);
+      await loadRuns();
+      await loadSummary();
+      setNotice('Failed actions retried.');
+    });
+  }
+
+  function manual(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const ruleId = String(data.get('ruleId') ?? '');
+    const recordId = String(data.get('recordId') ?? '').trim();
+    const idempotencyKey = String(data.get('idempotencyKey') ?? '').trim();
+    setManualResult(undefined);
+    void run(async () => {
+      const result = await api<ManualResult>(path + '/rules/' + ruleId + '/manual-runs', token, json('POST', {
+        recordId, ...(idempotencyKey && { idempotencyKey }),
+      }));
+      setManualResult(result);
+      setDetail({ run: result.run, actions: result.actions });
+      await loadRuns();
+      await loadSummary();
+      setNotice(result.deduplicated
+        ? 'An existing run was returned for this idempotency key; no new run was started.'
+        : 'Manual run finished with status ' + result.run.status + '.');
+    });
+  }
+
+  function resume(chain: ProblemChain) {
+    void run(async () => {
+      await api(path + '/problem-chains/' + chain.rootCausationId + '/resume', token, json('POST'));
+      await loadChains();
+      setNotice('Problem chain resumed.');
+    });
+  }
+
+  const ruleName = (ruleId: string) => summary?.rules.find((rule) => rule.ruleId === ruleId)?.name ?? ruleId;
+
+  return <section className="stack" aria-label="Automation settings">
+    {error && <p role="alert">{error}</p>}
+    {notice && <p role="status">{notice}</p>}
+    <p>Actions run in order. If an action fails, the actions before it are not rolled back — retrying a failed run re-runs only the actions that did not succeed.</p>
+
+    <h3>Overview</h3>
+    {summary && <>
+      <p className="muted">Backlog · {summary.backlog} · Unprocessed events · {summary.unprocessedEvents}</p>
+      <div className="automation-scroll"><table>
+        <thead><tr><th>Rule</th><th>Enabled</th><th>Succeeded</th><th>Failed</th><th>Skipped</th>
+          <th>Last status</th><th>Last run</th><th>Last error</th></tr></thead>
+        <tbody>{summary.rules.map((rule) => <tr key={rule.ruleId}>
+          <td>{rule.name}</td><td>{rule.enabled ? 'Yes' : 'No'}</td><td>{rule.succeeded}</td>
+          <td>{rule.failed}</td><td>{rule.skipped}</td><td>{rule.lastStatus ?? '—'}</td>
+          <td>{formatTime(rule.lastRunAt)}</td><td>{rule.lastError ?? '—'}</td>
+        </tr>)}</tbody>
+      </table></div>
+      {!summary.rules.length && <p className="muted">No automation rules yet.</p>}
+    </>}
+
+    <h3>Run history</h3>
+    <div className="inline">
+      <label>Status <select value={statusFilter} onChange={(event) => changeStatus(event.target.value)}>
+        <option value="">All statuses</option>
+        {runStatuses.map((status) => <option key={status} value={status}>{status}</option>)}
+      </select></label>
+      <label>Rule <select value={ruleFilter} onChange={(event) => changeRule(event.target.value)}>
+        <option value="">All rules</option>
+        {(summary?.rules ?? []).map((rule) => <option key={rule.ruleId} value={rule.ruleId}>{rule.name}</option>)}
+      </select></label>
+      <button type="button" disabled={busy} onClick={() => void run(async () => { await loadRuns(); })}>Refresh runs</button>
+    </div>
+    <p className="muted">{total} run{total === 1 ? '' : 's'} in total · showing {runs.length}</p>
+    <div className="automation-scroll"><table>
+      <thead><tr><th>Started</th><th>Rule</th><th>Version</th><th>Record</th><th>Event</th><th>Trigger</th>
+        <th>Status</th><th>Attempts</th><th>Completed</th><th>Last error</th><th></th></tr></thead>
+      <tbody>{runs.map((item) => <tr key={item.id}>
+        <td>{formatTime(item.startedAt)}</td><td>{ruleName(item.ruleId)}</td><td>{item.ruleVersion}</td>
+        <td>{item.recordId}</td><td>{item.eventId ?? '—'}</td><td>{item.triggerIdentity}</td>
+        <td>{item.status}</td><td>{item.attemptCount}</td><td>{formatTime(item.completedAt)}</td>
+        <td>{item.lastError ?? '—'}</td>
+        <td><button type="button" disabled={busy} onClick={() => void run(async () => { await loadDetail(item.id); })}>View run</button></td>
+      </tr>)}</tbody>
+    </table></div>
+    {!runs.length && <p className="muted">No runs match these filters.</p>}
+
+    {detail && <div className="stack">
+      <h4>Run {detail.run.id}</h4>
+      <p className="muted">{ruleName(detail.run.ruleId)} · version {detail.run.ruleVersion} · {detail.run.status}
+        {detail.run.lastError && <> · {detail.run.lastError}</>}</p>
+      {detail.run.status === 'FAILED' && <div className="inline">
+        <button type="button" disabled={busy} onClick={() => retry(detail.run.id)}>Retry failed actions</button>
+      </div>}
+      <div className="automation-scroll"><table>
+        <thead><tr><th>#</th><th>Action</th><th>Status</th><th>Error code</th><th>Result reference</th>
+          <th>Attempts</th><th>Completed</th></tr></thead>
+        <tbody>{detail.actions.map((action) => <tr key={action.actionId}>
+          <td>{action.position + 1}</td><td>{action.actionId}</td><td>{action.status}</td>
+          <td>{action.errorCode ?? '—'}</td><td>{action.resultRef ?? '—'}</td>
+          <td>{action.attemptCount}</td><td>{formatTime(action.completedAt)}</td>
+        </tr>)}</tbody>
+      </table></div>
+      {!detail.actions.length && <p className="muted">This run has no recorded actions.</p>}
+      <div className="inline"><button type="button" onClick={() => setDetail(undefined)}>Close run</button></div>
+    </div>}
+
+    <h3>Manual run</h3>
+    <p className="muted">Manual runs are only accepted when the rule’s trigger allows them.</p>
+    <form className="stack" onSubmit={manual}>
+      <label>Rule <select name="ruleId" required value={manualRuleId} onChange={(event) => setManualRuleId(event.target.value)}>
+        <option value="">Select a rule</option>
+        {(summary?.rules ?? []).map((rule) => <option key={rule.ruleId} value={rule.ruleId}>{rule.name}</option>)}
+      </select></label>
+      <label>Record ID <input name="recordId" required /></label>
+      <label>Idempotency key (optional) <input name="idempotencyKey" maxLength={120} /></label>
+      <div className="inline"><button type="submit" className="primary" disabled={busy || !manualRuleId}>Start manual run</button></div>
+    </form>
+    {manualResult && <p role="status">Run status · {manualResult.run.status}
+      {manualResult.deduplicated ? ' · Deduplicated: an existing run was returned.' : ' · New run.'}</p>}
+
+    <h3>Problem chains</h3>
+    {!chains.length && <p className="muted">No paused problem chains.</p>}
+    <ul className="plain">{chains.map((chain) => <li className="inline" key={chain.rootCausationId}>
+      <span>{chain.reason} <span className="muted">· root {chain.rootCausationId}
+        {chain.lastRunId && <> · last run {chain.lastRunId}</>}
+        {chain.pausedAt && <> · paused {chain.pausedAt}</>}</span></span>
+      <button type="button" disabled={busy} onClick={() => resume(chain)}>Resume</button>
+    </li>)}</ul>
+  </section>;
+}
