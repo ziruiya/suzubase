@@ -9,7 +9,7 @@ Baseline HEAD before P3-A: `82e33d6`
 | Item | Status | Evidence / deviation |
 |---|---|---|
 | Core tables and migrations 0035-0039 | Incomplete then repaired | 0035 creates `automation_rules`, `automation_rule_versions`, `automation_grants`, `automation_runs`, `automation_run_actions`, `automation_schedules`, `automation_webhook_deliveries`, `automation_audit_events` plus outbox/record-event bindings. 0036-0039 add append-only audit, workflow event kinds, schema FK, and archive actions. 0036 incorrectly re-added `source_schema_version` already created by 0035; removed duplicate in this round. |
-| Seven core table constraints | Completed | Tenant composite keys, composite FKs, unique run/action keys, immutable published versions, append-only automation audit, RLS/runtime grants, and record/outbox tenant boundaries are present. |
+| Eight core table constraints | Completed | Tenant composite keys, composite FKs, unique run/action keys, immutable published versions, append-only automation audit, RLS/runtime grants, record/outbox tenant boundaries, and automation schedule constraints are present. |
 | Rule Schema and trigger binding | Completed | Versioned Zod schema in `apps/api/src/automation.ts`; record/workflow trigger types and field-change constraints are explicit. |
 | EVENT_SNAPSHOT / CURRENT_STATE | Completed | Implemented as distinct condition stages; event snapshot uses persisted snapshot/changes and current state re-reads the record before terminal action handling. |
 | SKIPPED_STALE and two-phase checks | Completed | A stale current-state result is terminal `SKIPPED_STALE`; event snapshot mismatch is `SKIPPED_CONDITION`; unauthorized state is `SKIPPED_UNAUTHORIZED`. |
@@ -33,6 +33,7 @@ Baseline HEAD before P3-A: `82e33d6`
 | `automation_run_actions` | `automation_run_actions` includes action/position/status/attempt/idempotency/error/timestamps | Compatible |
 | `automation_schedules` | `automation_schedules` includes rule version, record, schedule key, due time and invalidation fields | P3-A foundation; P3-C semantics remain deferred |
 | `automation_webhook_deliveries` | `automation_webhook_deliveries` includes stable delivery ID, request summary, retry fields and P3-D status values | P3-A foundation; P3-D HTTP delivery remains deferred |
+| `automation_audit_events` | Append-only rule/grant/publish/runtime guardrail audit records with immutable primary history | Compatible; append-only |
 
 ## Deviations and unresolved semantics
 
@@ -56,7 +57,7 @@ Baseline HEAD before P3-A: `82e33d6`
 | Class | Evidence |
 |---|---|
 | (a) P3-A test wiring/coverage defects | The P3-A test itself passed after the stale API port was removed. The new P3-A routes were also found missing from `/docs-json`; after explicit OpenAPI contracts were added, `GF-11` passed. The migration exact-table test was reconciled to include the eight P3-A tables. |
-| (b) Existing test regression | None was found. The first 77 failures were produced by the stale/wrong API process, and the clean rerun passed all 98 baseline tests plus the P3-A test. |
+| (b) Existing test regression | None was found. The first 77 failures were produced by the stale/wrong API process, and the clean rerun passed all 99 baseline tests plus the P3-A test. |
 
 ### Root cause and repair
 
@@ -94,7 +95,7 @@ Baseline HEAD before P3-A: `82e33d6`
 | Grant revocation | Completed | Revoke sets `revoked_at`; runtime filters active grants and test verifies `SKIPPED_UNAUTHORIZED`. |
 | Deterministic cycle | Completed | Static analysis can emit `BLOCKING_CYCLE`; publish preflight blocks it. |
 | Potential cycle | Completed | Static analysis emits `POTENTIAL_CYCLE` warning and permits publication. |
-| Causation through outbox | Completed | Outbox columns, run columns and exports are linked; chain-depth test records depth 5/6 behavior and admin notification. |
+| Causation through outbox | P3-A schema + SQL simulation | P3-A established outbox/run causal columns and SQL-simulated depth/cycle evidence. Real cross-rule action-chain propagation is validated in P3-B (C3). |
 | Business admin cross-app grant and preflight | API implementation present and passed | Real `/automation/rules/:id/grants`, `/preflight`, `/publish`, `/enable` routes exist and P3-A integration test passed them. |
 
 ## Commit and push status

@@ -4,7 +4,7 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, automationAuditEvents, automationGrants, automationRuleVersions, automationRunActions, automationRuns,
-  automationRules, eq, isNull, notifications, outbox, records, sql, tenantMembers, TenantContext, TenantTransaction, withTenantTransaction,
+  automationRules, automationProblemChains, eq, isNull, notifications, outbox, records, sql, tenantMembers, TenantContext, TenantTransaction, withTenantTransaction,
   type AutomationRuleConfig,
 } from '@suzubase/db';
 import { fieldContract, multiOptionFieldTypes, type FieldDefinition } from '@suzubase/shared-types';
@@ -17,6 +17,18 @@ import { normalizeValue } from './field-values';
 import { identifier, parseInput } from './validation';
 
 const eventTypes = ['record.created', 'record.updated', 'record.deleted', 'workflow.transitioned', 'workflow.rejected'] as const;
+export const AUTOMATION_TENANT_RUN_RATE_LIMIT = 100;
+export const AUTOMATION_TENANT_RUN_RATE_WINDOW_MS = 60_000;
+export const AUTOMATION_TENANT_PENDING_LIMIT = 1_000;
+export const AUTOMATION_PROBLEM_CHAIN_FAILURE_LIMIT = 3;
+
+export function automationUpdateNeeded(currentValue: unknown, targetValue: unknown) {
+  if (Object.is(currentValue, targetValue)) return false;
+  if (typeof currentValue === 'object' && typeof targetValue === 'object' && currentValue !== null && targetValue !== null) {
+    return JSON.stringify(currentValue) !== JSON.stringify(targetValue);
+  }
+  return true;
+}
 const condition = z.strictObject({
   fieldId: identifier,
   operator: z.enum(['eq', 'ne', 'gt', 'lt', 'gte', 'lte', 'contains', 'not_contains', 'empty', 'nonempty',
@@ -325,7 +337,7 @@ export class AutomationService {
           throw new BadRequestException('A target field is not writable by the granting administrator');
         }
       }
-      if (version.trigger.eventType.startsWith('record.') && input.sourceAppId !== appId) {
+      if (input.sourceAppId !== appId) {
         throw new BadRequestException('The trigger source must be the rule application');
       }
       const [grant] = await tx.insert(automationGrants).values({
@@ -462,6 +474,11 @@ export class AutomationService {
           eq(automationGrants.ruleVersion, rule.currentVersion), isNull(automationGrants.revokedAt),
         ));
         if (!grant) throw new ConflictException('An active automation grant is required');
+        const version = await this.readVersion(tx, context, appId, ruleId, rule.currentVersion);
+        const findings = await this.validateVersion(tx, context, appId, version);
+        if (findings.some(({ severity }) => severity === 'BLOCKING')) {
+          throw new ConflictException({ message: 'Automation preflight has blocking findings', findings });
+        }
       }
       await tx.update(automationRules).set({ enabled: input.enabled, updatedAt: sql`clock_timestamp()` })
         .where(and(eq(automationRules.tenantId, context.tenantId), eq(automationRules.appId, appId), eq(automationRules.id, ruleId)));
@@ -541,6 +558,43 @@ export class AutomationService {
     });
   }
 
+  listPausedChains(context: TenantContext) {
+    return withTenantTransaction(context, async (tx) =>
+      tx.select().from(automationProblemChains).where(and(
+        eq(automationProblemChains.tenantId, context.tenantId),
+        isNull(automationProblemChains.resumedAt),
+      )));
+  }
+
+  resumePausedChain(context: TenantContext, rootCausationId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      const [chain] = await tx.select().from(automationProblemChains).where(and(
+        eq(automationProblemChains.tenantId, context.tenantId),
+        eq(automationProblemChains.rootCausationId, rootCausationId),
+        isNull(automationProblemChains.resumedAt),
+      )).for('update');
+      if (!chain) throw new NotFoundException('Active paused automation problem chain not found');
+      await tx.update(automationProblemChains).set({
+        resumedAt: sql`clock_timestamp()`, resumedBy: context.userId,
+      }).where(and(
+        eq(automationProblemChains.tenantId, context.tenantId),
+        eq(automationProblemChains.rootCausationId, rootCausationId),
+        isNull(automationProblemChains.resumedAt),
+      ));
+      if (chain.lastRunId) {
+        const [run] = await tx.select().from(automationRuns).where(and(
+          eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.id, chain.lastRunId),
+        ));
+        if (run) await tx.insert(automationAuditEvents).values({
+          tenantId: context.tenantId, appId: run.appId, ruleId: run.ruleId, ruleVersion: run.ruleVersion,
+          actorId: context.userId, action: 'CHAIN_RESUMED',
+          details: { rootCausationId, reason: chain.reason },
+        });
+      }
+      return { resumed: true, rootCausationId };
+    });
+  }
+
   async processOutbox(context: TenantContext, limit = 100) {
     return withTenantTransaction(context, async (tx) => {
       const events = await tx.execute(sql`
@@ -584,6 +638,48 @@ export class AutomationService {
           )).where(and(eq(automationRules.tenantId, context.tenantId), eq(automationRules.appId, event.appId),
             eq(automationRules.enabled, true), isNull(automationRules.archivedAt),
             eq(automationRuleVersions.status, 'published')));
+            const rootCausationId = event.rootCausationId ?? event.eventId;
+            const [paused] = await tx.select().from(automationProblemChains).where(and(
+              eq(automationProblemChains.tenantId, context.tenantId),
+              eq(automationProblemChains.rootCausationId, rootCausationId),
+              isNull(automationProblemChains.resumedAt),
+            ));
+            if (paused) {
+              await tx.update(outbox).set({ automationProcessedAt: sql`clock_timestamp()` })
+                .where(and(eq(outbox.tenantId, context.tenantId), eq(outbox.appId, event.appId), eq(outbox.eventId, event.eventId)));
+              continue;
+            }
+            const recentRuns = await tx.execute(sql`
+              SELECT count(*)::int AS count
+              FROM automation_runs
+              WHERE tenant_id=${context.tenantId}
+                AND started_at >= clock_timestamp() - interval '60 seconds'
+            `);
+            const runCount = Number((recentRuns.rows[0] as { count: number }).count ?? 0);
+            if (runCount >= AUTOMATION_TENANT_RUN_RATE_LIMIT) {
+              for (const candidate of candidates) await tx.insert(automationAuditEvents).values({
+                tenantId: context.tenantId, appId: candidate.rule.appId, ruleId: candidate.rule.id,
+                ruleVersion: candidate.version.version, actorId: context.userId, action: 'RATE_LIMITED',
+                details: { rootCausationId, eventId: event.eventId, limit: AUTOMATION_TENANT_RUN_RATE_LIMIT, windowMs: AUTOMATION_TENANT_RUN_RATE_WINDOW_MS },
+              });
+              continue;
+            }
+            const backlog = await tx.execute(sql`
+              SELECT
+                (SELECT count(*)::int FROM automation_runs
+                  WHERE tenant_id=${context.tenantId} AND status IN ('QUEUED','RUNNING')) +
+                (SELECT count(*)::int FROM outbox
+                  WHERE tenant_id=${context.tenantId} AND automation_processed_at IS NULL) AS count
+            `);
+            const pendingCount = Number((backlog.rows[0] as { count: number }).count ?? 0);
+            if (pendingCount > AUTOMATION_TENANT_PENDING_LIMIT) {
+              for (const candidate of candidates) await tx.insert(automationAuditEvents).values({
+                tenantId: context.tenantId, appId: candidate.rule.appId, ruleId: candidate.rule.id,
+                ruleVersion: candidate.version.version, actorId: context.userId, action: 'BACKLOG_LIMITED',
+                details: { rootCausationId, eventId: event.eventId, pendingCount, limit: AUTOMATION_TENANT_PENDING_LIMIT },
+              });
+              continue;
+            }
           for (const candidate of candidates) {
             const cfg = this.configOf(candidate.version);
             const triggerChange = cfg.trigger.fieldId && event.changes.find((change) => change.fieldId === cfg.trigger.fieldId);
@@ -658,11 +754,19 @@ export class AutomationService {
               evaluateGroup(current.data, cfg.conditions.currentState, event.changes) &&
               (!cfg.trigger.fieldId || !('newValue' in cfg.trigger) || compare(valueAt(current.data, cfg.trigger.fieldId), cfg.trigger.newValue)));
             const identity = `${event.appId}:${event.eventId}:${eventType}:${candidate.rule.id}:${candidate.version.version}`;
+            const failedRuns = await tx.select({ id: automationRuns.id }).from(automationRuns).where(and(
+              eq(automationRuns.tenantId, context.tenantId),
+              eq(automationRuns.rootCausationId, event.rootCausationId ?? event.eventId),
+              eq(automationRuns.recordId, event.recordId),
+              eq(automationRuns.ruleId, candidate.rule.id),
+              eq(automationRuns.status, 'FAILED'),
+            ));
             const [repeated] = await tx.select({ id: automationRuns.id }).from(automationRuns).where(and(
               eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.rootCausationId, event.rootCausationId ?? event.eventId),
               eq(automationRuns.recordId, event.recordId), eq(automationRuns.ruleId, candidate.rule.id),
             )).limit(1);
             const status = event.causationDepth >= 5 ? 'CHAIN_DEPTH_EXCEEDED'
+              : failedRuns.length >= AUTOMATION_PROBLEM_CHAIN_FAILURE_LIMIT ? 'CHAIN_PAUSED'
               : repeated ? 'BLOCKED_CYCLE'
               : !grantValid ? 'SKIPPED_UNAUTHORIZED'
                 : !eventSnapshotPass ? 'SKIPPED_CONDITION'
@@ -680,6 +784,30 @@ export class AutomationService {
             }).onConflictDoNothing().returning();
             if (!run) continue;
             createdRuns++;
+            if (status === 'CHAIN_DEPTH_EXCEEDED' || status === 'CHAIN_PAUSED') {
+              await tx.insert(automationProblemChains).values({
+                tenantId: context.tenantId, rootCausationId: event.rootCausationId ?? event.eventId,
+                reason: status === 'CHAIN_DEPTH_EXCEEDED'
+                  ? 'CAUSATION_DEPTH_EXCEEDED'
+                  : `REPEATED_FAILURES_LIMIT_${AUTOMATION_PROBLEM_CHAIN_FAILURE_LIMIT}`,
+                lastRunId: run.id,
+              }).onConflictDoNothing();
+              const admins = await tx.select({ userId: tenantMembers.userId }).from(tenantMembers).where(and(
+                eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.isAdmin, true), isNull(tenantMembers.disabledAt),
+              ));
+              for (const { userId } of admins) await tx.insert(notifications).values({
+                tenantId: context.tenantId, userId, sourceType: 'SYSTEM',
+                ruleKey: 'AUTOMATION_PROBLEM_CHAIN_PAUSED',
+                title: 'Automation problem chain paused',
+                body: status === 'CHAIN_DEPTH_EXCEEDED'
+                  ? 'An automation chain exceeded the five-run depth limit and was paused.'
+                  : 'An automation problem chain repeated failures and was paused.',
+                sourceEventId: event.eventId, dedupKey: `automation-chain-paused:${event.rootCausationId ?? event.eventId}`,
+                eventType: 'AUTOMATION_PROBLEM_CHAIN_PAUSED', targetRole: 'TENANT_ADMIN',
+                payload: { runId: run.id, ruleId: candidate.rule.id, reason: status },
+                emailState: 'skipped',
+              }).onConflictDoNothing();
+            }
             for (const [position, action] of cfg.actions.entries()) {
               await tx.insert(automationRunActions).values({
                 tenantId: context.tenantId, appId: event.appId, runId: run.id, actionId: action.actionId,
@@ -785,6 +913,7 @@ export class AutomationService {
     ));
     if (!grant) findings.push({ code: 'GRANT_REQUIRED', severity: 'BLOCKING' });
     else {
+      if (grant.sourceAppId !== appId) findings.push({ code: 'SOURCE_APP_MISMATCH', severity: 'BLOCKING' });
       for (const id of fieldsFor(cfg)) if (!grant.readableFieldIds.includes(id)) findings.push({ code: 'READ_GRANT_MISSING', severity: 'BLOCKING', fieldId: id });
       for (const action of cfg.actions) {
         if (!grant.allowedOperations.includes(action.type)) findings.push({ code: 'OPERATION_GRANT_MISSING', severity: 'BLOCKING' });
@@ -816,6 +945,17 @@ export class AutomationService {
 @Controller('apps/:appId/automation')
 export class AutomationController {
   constructor(private readonly automation: AutomationService) {}
+
+  @Get('problem-chains')
+  listPausedChains(@AuthenticatedTenant() context: TenantContext) {
+    return this.automation.listPausedChains(context);
+  }
+
+  @Post('problem-chains/:rootCausationId/resume')
+  resumePausedChain(@AuthenticatedTenant() context: TenantContext,
+    @Param('rootCausationId') rootCausationId: string) {
+    return this.automation.resumePausedChain(context, parseInput(identifier, rootCausationId));
+  }
 
   @Get('rules')
   list(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string) {

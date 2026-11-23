@@ -266,6 +266,12 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
     get: { reply: z.array(automationHttp.rule) },
     post: { body: automationHttp.createRuleInput, reply: z.looseObject({ rule: automationHttp.rule, version: automationHttp.version }), conflict: errorSchema },
   },
+  [applications + '/automation/problem-chains']: {
+    get: { reply: z.array(z.looseObject({})) },
+  },
+  [applications + '/automation/problem-chains/{rootCausationId}/resume']: {
+    post: { reply: z.looseObject({ resumed: z.literal(true), rootCausationId: id }), conflict: errorSchema },
+  },
   [applications + '/automation/rules/{ruleId}/draft']: {
     put: { body: automationHttp.draftInput, reply: automationHttp.version, conflict: errorSchema },
   },

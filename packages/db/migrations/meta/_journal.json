@@ -281,6 +281,13 @@
       "when": 1795396504000,
       "tag": "0039_automation_rule_archive",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1795396505000,
+      "tag": "0040_p3b_runtime_guardrails",
+      "breakpoints": true
     }
   ]
 }
