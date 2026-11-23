@@ -13,7 +13,7 @@ const { addField, configureRuntime, createApp, expectRequest, login, provision, 
 // construct due schedule rows (the established P3-C pattern) and to
 // simulate a worker that died after creating a run but before finalizing
 // its plan (plan row reset -- never to fabricate an event or a result).
-process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET = 'p3d-test-secret';
+process.env.SUZUBASE_SYSTEM_NOTIFICATION_SECRET = 'p3d-test-system-secret';
 
 const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 const maintenanceContext = (tenantId) => Object.freeze({ tenantId, userId: NIL_UUID });
