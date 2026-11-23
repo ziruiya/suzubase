@@ -36,6 +36,8 @@ export interface FieldChange {
   fieldId: string;
   oldValue: string | null;
   newValue: string | null;
+  oldPresent?: boolean;
+  newPresent?: boolean;
 }
 export * from './views';
 export * from './acl';

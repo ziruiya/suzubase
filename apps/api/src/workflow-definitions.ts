@@ -32,7 +32,8 @@ const stateInput = z.strictObject({
   id: identifier, code: z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/), name, initial: z.boolean(), terminal: z.boolean(), assignees,
 });
 const actionInput = z.strictObject({
-  id: identifier, name, fromStateId: identifier, toStateId: identifier, conditions: z.array(workflowCondition).max(20), assignees,
+  id: identifier, name, eventType: z.enum(['transitioned', 'rejected']).default('transitioned'),
+  fromStateId: identifier, toStateId: identifier, conditions: z.array(workflowCondition).max(20), assignees,
 });
 const graphInput = z.strictObject({ states: z.array(stateInput).max(50), actions: z.array(actionInput).max(150) });
 const enabledInput = z.strictObject({ enabled: z.boolean() });

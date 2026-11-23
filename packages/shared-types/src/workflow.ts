@@ -23,6 +23,7 @@ export interface WorkflowState {
 export interface WorkflowAction {
   id: string;
   name: string;
+  eventType?: 'transitioned' | 'rejected';
   fromStateId: string;
   toStateId: string;
   conditions: WorkflowCondition[];

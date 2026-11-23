@@ -239,6 +239,7 @@ export const workflowActions = pgTable('workflow_actions', {
   workflowId: uuid('workflow_id').notNull(),
   id: uuid().notNull(),
   name: text().notNull(),
+  eventType: text('event_type').$type<'transitioned' | 'rejected'>().notNull().default('transitioned'),
   fromStateId: uuid('from_state_id').notNull(),
   toStateId: uuid('to_state_id').notNull(),
   conditions: jsonb('condition_expr').$type<WorkflowCondition[]>().notNull(),
@@ -421,6 +422,7 @@ export const recordEvents = pgTable('record_events', {
   objectId: uuid('object_id'),
   occurredAt: time('occurred_at').notNull().defaultNow(),
   changes: jsonb().$type<FieldChange[]>().notNull(),
+  snapshotData: jsonb('snapshot_data').$type<RecordData>().notNull().default(sql`'{}'::jsonb`),
   importJobId: uuid('import_job_id'),
   sourceActorId: text('source_actor_id'),
   sourceTimestamp: time('source_timestamp'),
@@ -442,6 +444,7 @@ export const workflowEvents = pgTable('workflow_events', {
   tenantId: tenantId(),
   appId: uuid('app_id').notNull(),
   eventId: uuid('event_id').notNull(),
+  eventType: text('event_type').$type<'transitioned' | 'rejected'>().notNull().default('transitioned'),
   workflowId: uuid('workflow_id').notNull(),
   actionId: uuid('action_id'),
   fromStateId: uuid('from_state_id'),
@@ -480,12 +483,219 @@ export const outbox = pgTable('outbox', {
   createdAt: time('created_at').notNull().defaultNow(),
   notifications: jsonb().$type<NotificationDelivery[]>().notNull().default(sql`'[]'::jsonb`),
   processedAt: time('processed_at'),
+  automationProcessedAt: time('automation_processed_at'),
+  rootCausationId: uuid('root_causation_id'),
+  parentRunId: uuid('parent_run_id'),
+  causationDepth: integer('causation_depth').notNull().default(0),
+  originRuleId: uuid('origin_rule_id'),
+  originActionId: uuid('origin_action_id'),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.eventId] }),
   foreignKey({
     columns: [t.tenantId, t.appId, t.eventId],
     foreignColumns: [recordEvents.tenantId, recordEvents.appId, recordEvents.eventId],
   }),
+]);
+
+export type AutomationConditionOperator = 'eq' | 'ne' | 'gt' | 'lt' | 'gte' | 'lte' | 'contains' |
+  'not_contains' | 'empty' | 'nonempty' | 'in' | 'contains_any' | 'contains_all' | 'changed_to';
+export type AutomationRuleConfig = {
+  schemaVersion: number;
+  trigger: {
+    eventType: 'record.created' | 'record.updated' | 'record.deleted' | 'workflow.transitioned' | 'workflow.rejected';
+    fieldId?: string;
+    oldValue?: unknown;
+    newValue?: unknown;
+    fromStateId?: string;
+    toStateId?: string;
+  };
+  conditions: {
+    eventSnapshot: { operator: 'and' | 'or'; groups: { conditions: {
+      fieldId: string; operator: AutomationConditionOperator; value?: unknown;
+    }[] }[] };
+    currentState: { operator: 'and' | 'or'; groups: { conditions: {
+      fieldId: string; operator: AutomationConditionOperator; value?: unknown;
+    }[] }[] };
+  };
+  actions: { actionId: string; type: string; targetAppId?: string; targetFieldIds?: string[] }[];
+};
+
+export const automationRules = pgTable('automation_rules', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  name: text().notNull(),
+  currentVersion: integer('current_version'),
+  enabled: boolean().notNull().default(false),
+  archivedAt: time('archived_at'),
+  createdBy: uuid('created_by').notNull(),
+  createdAt: time('created_at').notNull().defaultNow(),
+  updatedAt: time('updated_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId], foreignColumns: [apps.tenantId, apps.id] }),
+  foreignKey({ columns: [t.tenantId, t.createdBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  index('automation_rules_app_idx').on(t.tenantId, t.appId, t.enabled),
+]);
+
+export const automationRuleVersions = pgTable('automation_rule_versions', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  ruleId: uuid('rule_id').notNull(),
+  version: integer().notNull(),
+  schemaVersion: integer('schema_version').notNull(),
+  sourceSchemaVersion: integer('source_schema_version').notNull().default(1),
+  trigger: jsonb('trigger_json').$type<AutomationRuleConfig['trigger']>().notNull(),
+  conditions: jsonb('condition_json').$type<AutomationRuleConfig['conditions']>().notNull(),
+  actions: jsonb('actions_json').$type<AutomationRuleConfig['actions']>().notNull(),
+  status: text().$type<'draft' | 'published' | 'archived'>().notNull().default('draft'),
+  createdBy: uuid('created_by').notNull(),
+  createdAt: time('created_at').notNull().defaultNow(),
+  publishedBy: uuid('published_by'),
+  publishedAt: time('published_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.ruleId, t.version] }),
+  unique().on(t.tenantId, t.appId, t.ruleId, t.version),
+  foreignKey({ columns: [t.tenantId, t.appId, t.ruleId], foreignColumns: [automationRules.tenantId, automationRules.appId, automationRules.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.sourceSchemaVersion], foreignColumns: [appVersions.tenantId, appVersions.appId, appVersions.version] }),
+  foreignKey({ columns: [t.tenantId, t.createdBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  foreignKey({ columns: [t.tenantId, t.publishedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  check('automation_rule_version_status', sql`${t.status} IN ('draft','published','archived')`),
+]);
+
+export const automationGrants = pgTable('automation_grants', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  ruleId: uuid('rule_id').notNull(),
+  ruleVersion: integer('rule_version').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  sourceAppId: uuid('source_app_id').notNull(),
+  readableFieldIds: jsonb('readable_field_ids').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  targetAppIds: jsonb('target_app_ids').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  writableFieldIds: jsonb('writable_field_ids').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  allowedOperations: jsonb('allowed_operations').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  approvedBy: uuid('approved_by').notNull(),
+  approvedAt: time('approved_at').notNull().defaultNow(),
+  revokedAt: time('revoked_at'),
+  revokedBy: uuid('revoked_by'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.id] }),
+  unique().on(t.tenantId, t.ruleId, t.ruleVersion),
+  foreignKey({ columns: [t.tenantId, t.appId, t.ruleId, t.ruleVersion], foreignColumns: [automationRuleVersions.tenantId, automationRuleVersions.appId, automationRuleVersions.ruleId, automationRuleVersions.version] }),
+  foreignKey({ columns: [t.tenantId, t.sourceAppId], foreignColumns: [apps.tenantId, apps.id] }),
+  foreignKey({ columns: [t.tenantId, t.approvedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  foreignKey({ columns: [t.tenantId, t.revokedBy], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
+export const automationRuns = pgTable('automation_runs', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  ruleId: uuid('rule_id').notNull(),
+  ruleVersion: integer('rule_version').notNull(),
+  eventId: uuid('event_id').notNull(),
+  triggerIdentity: text('trigger_identity').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  recordId: uuid('record_id').notNull(),
+  batchId: uuid('batch_id'),
+  rootCausationId: uuid('root_causation_id').notNull(),
+  parentRunId: uuid('parent_run_id'),
+  causationDepth: integer('causation_depth').notNull(),
+  originRuleId: uuid('origin_rule_id'),
+  originActionId: uuid('origin_action_id'),
+  status: text().notNull(),
+  attemptCount: integer('attempt_count').notNull().default(0),
+  lastError: text('last_error'),
+  startedAt: time('started_at').notNull().defaultNow(),
+  completedAt: time('completed_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  unique().on(t.tenantId, t.idempotencyKey),
+  unique().on(t.tenantId, t.id),
+  foreignKey({ columns: [t.tenantId, t.appId, t.ruleId, t.ruleVersion], foreignColumns: [automationRuleVersions.tenantId, automationRuleVersions.appId, automationRuleVersions.ruleId, automationRuleVersions.version] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.eventId], foreignColumns: [outbox.tenantId, outbox.appId, outbox.eventId] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
+  check('automation_run_status', sql`${t.status} IN ('QUEUED','RUNNING','SUCCEEDED','FAILED','SKIPPED_CONDITION','SKIPPED_STALE','SKIPPED_UNAUTHORIZED','BLOCKED_CYCLE','POTENTIAL_CYCLE','CHAIN_DEPTH_EXCEEDED','ACTIONS_NOT_IMPLEMENTED')`),
+  index('automation_runs_history_idx').on(t.tenantId, t.appId, t.ruleId, t.startedAt.desc()),
+]);
+
+export const automationRunActions = pgTable('automation_run_actions', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  runId: uuid('run_id').notNull(),
+  actionId: uuid('action_id').notNull(),
+  position: integer().notNull(),
+  status: text().notNull(),
+  attemptCount: integer('attempt_count').notNull().default(0),
+  idempotencyKey: text('idempotency_key').notNull(),
+  resultRef: text('result_ref'),
+  errorCode: text('error_code'),
+  startedAt: time('started_at'),
+  completedAt: time('completed_at'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.runId, t.actionId] }),
+  unique().on(t.tenantId, t.idempotencyKey),
+  foreignKey({ columns: [t.tenantId, t.appId, t.runId], foreignColumns: [automationRuns.tenantId, automationRuns.appId, automationRuns.id] }),
+  check('automation_action_status', sql`${t.status} IN ('PENDING','SUCCEEDED','FAILED','NOT_EXECUTED')`),
+]);
+
+export const automationSchedules = pgTable('automation_schedules', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  ruleId: uuid('rule_id').notNull(),
+  ruleVersion: integer('rule_version').notNull(),
+  recordId: uuid('record_id').notNull(),
+  scheduleKey: text('schedule_key').notNull(),
+  dueAt: time('due_at').notNull(),
+  status: text().notNull().default('PENDING'),
+  invalidatedAt: time('invalidated_at'),
+  invalidationReason: text('invalidation_reason'),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  unique().on(t.tenantId, t.ruleId, t.ruleVersion, t.recordId, t.scheduleKey),
+  foreignKey({ columns: [t.tenantId, t.appId, t.ruleId, t.ruleVersion], foreignColumns: [automationRuleVersions.tenantId, automationRuleVersions.appId, automationRuleVersions.ruleId, automationRuleVersions.version] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
+]);
+
+export const automationWebhookDeliveries = pgTable('automation_webhook_deliveries', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  runId: uuid('run_id').notNull(),
+  actionId: uuid('action_id').notNull(),
+  deliveryId: uuid('delivery_id').notNull().defaultRandom(),
+  endpointId: uuid('endpoint_id'),
+  requestSummary: jsonb('request_summary').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  signatureVersion: text('signature_version'),
+  attempts: integer().notNull().default(0),
+  nextAttemptAt: time('next_attempt_at'),
+  responseStatus: integer('response_status'),
+  status: text().notNull().default('PENDING'),
+  errorType: text('error_type'),
+  createdAt: time('created_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  unique().on(t.tenantId, t.deliveryId),
+  foreignKey({ columns: [t.tenantId, t.appId, t.runId, t.actionId], foreignColumns: [automationRunActions.tenantId, automationRunActions.appId, automationRunActions.runId, automationRunActions.actionId] }),
+  check('automation_webhook_status', sql`${t.status} IN ('PENDING','SUCCEEDED','RETRY_SCHEDULED','DELIVERY_UNCERTAIN','PERMANENT_FAILED','MANUAL_REVIEW_REQUIRED')`),
+]);
+
+export const automationAuditEvents = pgTable('automation_audit_events', {
+  tenantId: tenantId(),
+  id: uuid().notNull().defaultRandom(),
+  appId: uuid('app_id').notNull(),
+  ruleId: uuid('rule_id').notNull(),
+  ruleVersion: integer('rule_version'),
+  actorId: uuid('actor_id').notNull(),
+  action: text().notNull(),
+  details: jsonb().$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  occurredAt: time('occurred_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.ruleId], foreignColumns: [automationRules.tenantId, automationRules.appId, automationRules.id] }),
+  foreignKey({ columns: [t.tenantId, t.actorId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+  index('automation_audit_rule_idx').on(t.tenantId, t.ruleId, t.occurredAt.desc()),
 ]);
 
 export const notifications = pgTable('notifications', {

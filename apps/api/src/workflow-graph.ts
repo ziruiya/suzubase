@@ -8,7 +8,8 @@ const selectState = {
   initial: workflowStates.initial, terminal: workflowStates.terminal, assignees: workflowStates.assignees,
 };
 const selectAction = {
-  id: workflowActions.id, name: workflowActions.name, fromStateId: workflowActions.fromStateId,
+  id: workflowActions.id, name: workflowActions.name, eventType: workflowActions.eventType,
+  fromStateId: workflowActions.fromStateId,
   toStateId: workflowActions.toStateId, conditions: workflowActions.conditions, assignees: workflowActions.assignees,
 };
 

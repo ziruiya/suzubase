@@ -7,6 +7,7 @@ import { ExportService } from './export';
 import { ImportExecutionService, ImportFinalizer, ImportOrchestrator, ImportService } from './import';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
+import { AutomationService } from './automation';
 
 function configuredInteger(name: string, fallback: number) {
   const value = Number(process.env[name] ?? fallback);
@@ -46,6 +47,14 @@ async function main() {
           }
         } catch (error) {
           console.error('Notification worker failed', { tenantId: context.tenantId, error });
+          if (once) process.exitCode = 1;
+        }
+        try {
+          const schema = new AppSchemaService(new AuthorizationService());
+          const automation = await new AutomationService(schema, new AuthorizationService()).processOutbox(context);
+          if (automation.events || automation.createdRuns) console.info('Automation outbox', { tenantId: context.tenantId, ...automation });
+        } catch (error) {
+          console.error('Automation worker failed', { tenantId: context.tenantId, error });
           if (once) process.exitCode = 1;
         }
         try {

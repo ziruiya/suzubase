@@ -246,6 +246,41 @@
       "when": 1795286000000,
       "tag": "0034_gate2_system_notifications",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1795395967000,
+      "tag": "0035_p3a_automation",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1795395968000,
+      "tag": "0036_p3a_schema_binding",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1795396417000,
+      "tag": "0037_workflow_event_kinds",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1795396483000,
+      "tag": "0038_p3a_source_schema_fk",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1795396504000,
+      "tag": "0039_automation_rule_archive",
+      "breakpoints": true
     }
   ]
 }

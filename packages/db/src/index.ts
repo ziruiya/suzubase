@@ -7,6 +7,8 @@ import type { ApiTokenAction } from '@suzubase/shared-types';
 export { and, eq, inArray, or, isNull, lte, gt, sql } from 'drizzle-orm';
 export {
   apiTokens, apps, appCounters, autoNumberCounters, issuedAutoNumbers, appVersions, csvJobs, deploymentInstance, exportJobs, importJobs, migrationAuditLog, migrationTokens, permissionAudit, fields, fileReferences, files, outbox, recordCreateKeys, recordEvents, recordSearchValues, recordUniqueValues, records, recordReferences, recordTableRows, runtimeIndexes, type SourceIdMapRow,
+  automationRules, automationRuleVersions, automationGrants, automationRuns, automationRunActions, automationSchedules,
+  automationWebhookDeliveries, automationAuditEvents, type AutomationRuleConfig, type AutomationConditionOperator,
   notifications, recordComments, commentMentions,
   workflowDefinitions, workflowStates, workflowActions, recordWorkflowState, workflowAssignments, workflowEvents,
   groupMembers, loginCredentials, memberGroups, organizations, tenantMembers, tenants, users,

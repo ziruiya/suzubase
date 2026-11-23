@@ -151,7 +151,8 @@ export class WorkflowRuntimeService {
       const record = serializeRecord(loaded.record);
       const assignees = await resolveAssignees(tx, context.tenantId, record, action.assignees,
         runtime!.assignees.filter(({ disabled }) => !disabled).map(({ id }) => id));
-      return this.persist(tx, context, loaded, input.revision, target, target.terminal ? [] : assignees, 'workflow-action', action.id);
+      return this.persist(tx, context, loaded, input.revision, target, target.terminal ? [] : assignees,
+        'workflow-action', action.id, undefined, action.eventType);
     });
   }
 
@@ -215,6 +216,7 @@ export class WorkflowRuntimeService {
 
   private async persist(tx: TenantTransaction, context: TenantContext, loaded: Awaited<ReturnType<WorkflowRuntimeService['load']>>,
     revision: number, target: z.infer<typeof stateSummary>, ids: string[], kind: 'workflow-action' | 'workflow-reassigned' | 'WORKFLOW_REPAIR', actionId?: string, reason?: string,
+    eventType: 'transitioned' | 'rejected' = 'transitioned',
   ) {
     const { scope, workflow } = loaded;
     const [updated] = await tx.update(records).set({
@@ -228,7 +230,7 @@ export class WorkflowRuntimeService {
     const eventId = await writeRecordEvent(tx, context, record, kind, []);
     await tx.insert(workflowEvents).values({
       tenantId: scope.tenantId, appId: scope.appId, eventId, workflowId: workflow!.workflowId,
-      actionId, reason, fromStateId: workflow!.stateId, toStateId: target.id, assigneeIds: ids,
+      actionId, reason, eventType, fromStateId: workflow!.stateId, toStateId: target.id, assigneeIds: ids,
     });
     if (kind === 'workflow-action') await this.notifications.recordEvent(tx, context, record, eventId, {
       source: 'api', trigger: 'workflow-action', schemaVersion: loaded.app.publishedSchemaVersion,
