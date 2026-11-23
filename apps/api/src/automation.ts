@@ -1082,7 +1082,17 @@ export class AutomationService {
       for (const { userId } of members) wanted.add(userId);
     }
     if (notify.recipientFieldId) {
-      for (const value of collection(record.data[notify.recipientFieldId])) wanted.add(String(value));
+      // User fields store either a bare user id or a JSON array of ids.
+      const raw = record.data[notify.recipientFieldId];
+      if (raw) {
+        let ids = [raw];
+        try {
+          const parsed: unknown = JSON.parse(raw);
+          if (Array.isArray(parsed)) ids = parsed.map(String);
+          else if (typeof parsed === 'string') ids = [parsed];
+        } catch { /* bare id */ }
+        for (const id of ids) wanted.add(id);
+      }
     }
     if (notify.recipientAssignee) {
       const assignees = await tx.select({ userId: workflowAssignments.userId }).from(workflowAssignments).where(and(
