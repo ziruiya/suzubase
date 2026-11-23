@@ -5,10 +5,10 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiHeader, ApiProduces, ApiTags } from '@nestjs/swagger';
 import {
-  and, appCounters, eq, gt, inArray, isNull, memberGroups, organizations, tenantMembers, recordCreateKeys, recordEvents, recordReferences, recordTableRows, recordUniqueValues, records, sql, TenantContext,
+  and, appCounters, eq, gt, inArray, isNull, memberGroups, organizations, tenantMembers, recordCategories, recordCreateKeys, recordEvents, recordReferences, recordTableRows, recordUniqueValues, records, sql, TenantContext,
   TenantTransaction, users, withTenantTransaction, workflowActions, workflowEvents, workflowStates,
 } from '@suzubase/db';
-import { FieldChange, FieldDefinition, isRecordInput, lookupTargets, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse, TableRow } from '@suzubase/shared-types';
+import { categorySubtreeIds, FieldChange, FieldDefinition, isRecordInput, lookupTargets, multiOptionFieldTypes, RecordAction, RecordData, RecordResponse, TableRow } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { assignAutoNumber, numberScope } from './auto-number';
 import { AppSchemaService } from './app-schema';
@@ -18,6 +18,7 @@ import { NotificationPlanner } from './notification-planner';
 import { RecordQueryService } from './record-query';
 import { fieldChanges, serializeRecord, writeRecordEvent, type EventCausation } from './record-events';
 import { FileService, fileIds } from './files';
+import { assertCategoryAssignments, categoryIdsInput, recordCategoryIds, replaceRecordCategories } from './categories';
 import { SearchService, searchInput } from './search';
 import { projectSearchValues } from './search-projection';
 import { prepareTableRows, replaceTableRows, tableRowScope } from './table-rows';
@@ -28,8 +29,10 @@ import { normalizeValue } from './field-values';
 import { identifier, parseInput } from './validation';
 
 const dataInput = z.record(identifier, z.string());
-const createInput = z.strictObject({ data: dataInput });
-const updateInput = z.strictObject({ data: dataInput, revision: z.int().min(1).max(2147483647) });
+const createInput = z.strictObject({ data: dataInput, categoryIds: categoryIdsInput.optional() });
+const updateInput = z.strictObject({
+  data: dataInput, revision: z.int().min(1).max(2147483647), categoryIds: categoryIdsInput.optional(),
+});
 const revisionInput = updateInput.pick({ revision: true });
 const lookupPreviewInput = z.strictObject({ fieldId: identifier, key: z.string().min(1).max(4000) });
 const lookupSearchInput = z.strictObject({
@@ -46,6 +49,7 @@ const batchUpdateInput = z.strictObject({
 type SingleFieldUpdate = z.infer<typeof batchUpdateInput>['items'][number] & { fieldId: string; value: string | null };
 const pageInput = z.strictObject({
   view: identifier.optional(),
+  category: identifier.optional(),
   after: z.string().regex(/^[0-9]{1,19}$/).refine((value) => BigInt(value) <= 9223372036854775807n).optional(),
   limit: z.string().regex(/^[1-9][0-9]{0,2}$/).transform(Number).pipe(z.number().max(100)).optional(),
 });
@@ -155,16 +159,20 @@ export class RecordService {
   async create(context: TenantContext, appId: string, input: z.infer<typeof createInput>, key?: string) {
     return withTenantTransaction(context, async (tx) => {
       const grant = await this.appSchema.writable(tx, context, appId, 'create');
-      return this.persistCreate(tx, context, appId, input.data, grant, 'api', key);
+      return this.persistCreate(tx, context, appId, input.data, grant, 'api', key, undefined, input.categoryIds);
     });
   }
 
   async persistCreate(
     tx: TenantTransaction, context: TenantContext, appId: string, input: RecordData,
     { app, access, fields }: Awaited<ReturnType<AppSchemaService['writable']>>,
-    source: 'api' | 'import', key?: string, causation?: EventCausation,
+    source: 'api' | 'import', key?: string, causation?: EventCausation, categoryIds?: string[],
   ) {
     const schemaVersion = app.publishedSchemaVersion;
+    if (categoryIds !== undefined) {
+      const configuration = (await this.appSchema.getVersion(tx, context, appId, schemaVersion)).categoryConfiguration;
+      assertCategoryAssignments(configuration, categoryIds);
+    }
     this.assertEditable(access, input, fields);
     const identity = { tenantId: context.tenantId, appId };
     const counterScope = and(eq(appCounters.tenantId, context.tenantId), eq(appCounters.appId, appId));
@@ -214,6 +222,13 @@ export class RecordService {
     }).returning();
     const record = serializeRecord(row);
     await replaceTableRows(tx, { ...identity, recordId: record.id }, tables.replacements);
+    if (categoryIds !== undefined) {
+      await replaceRecordCategories(tx, context, appId, record.id, categoryIds);
+      record.categoryIds = categoryIds;
+    } else {
+      const configuration = (await this.appSchema.getVersion(tx, context, appId, schemaVersion)).categoryConfiguration;
+      if (configuration.enabled) record.categoryIds = [];
+    }
     await this.saveLookupReferences(tx, context, record, references);
     await this.reserveUniqueValues(tx, context, record);
     await this.reconcileFiles(tx, context, record);
@@ -280,7 +295,7 @@ export class RecordService {
     tx: TenantTransaction, context: TenantContext, appId: string, recordId: string,
     action: RecordAction = 'view', deleted = false, raw = false,
   ) {
-    const { access } = await this.appSchema.access(tx, context, appId, 'view').catch((error: unknown) => {
+    const { access, app } = await this.appSchema.access(tx, context, appId, 'view').catch((error: unknown) => {
       if (error instanceof NotFoundException) throw new NotFoundException();
       throw error;
     });
@@ -313,8 +328,14 @@ export class RecordService {
         sourceRecordNo: row.sourceRecordNo,
       };
     }
-    return raw || deleted ? record : this.withTableRows(tx, context, record, access);
-  }
+    // P4-T1: categoryIds is an additive response key — present when the
+    // app's categories are enabled or the record carries assignments, so
+    // applications that never use categories keep the legacy shape.
+    const assignedIds = (await recordCategoryIds(tx, context, appId, [record.id])).get(record.id);
+    const categoriesEnabled = (await this.appSchema.getVersion(tx, context, appId, app.publishedSchemaVersion))
+      .categoryConfiguration.enabled;
+    if (categoriesEnabled || assignedIds?.length) record.categoryIds = assignedIds ?? [];
+    return raw || deleted ? record : this.withTableRows(tx, context, record, access);  }
 
   private async readTableRows(tx: TenantTransaction, context: TenantContext, appId: string, recordId: string, ids: string[]) {
     const result = new Map<string, TableRow[]>();
@@ -392,6 +413,11 @@ export class RecordService {
       const before = await this.readTableRows(tx, context, appId, recordId, tableIds);
       const tables = await prepareTableRows(definitions, candidate, before, false, (type, value) =>
         this.validDirectoryValue(tx, context, type, value));
+      const categoryIds = 'data' in input ? (input as z.infer<typeof updateInput>).categoryIds : undefined;
+      if (categoryIds !== undefined) {
+        const configuration = (await this.appSchema.getVersion(tx, context, appId, app.publishedSchemaVersion)).categoryConfiguration;
+        assertCategoryAssignments(configuration, categoryIds);
+      }
       const data = refresh ? { ...current.data } :
         await this.normalizeData(tx, context, appId, current.schemaVersion, candidate, { data: current.data, fields });
       const references = refresh ? [] : await this.resolveLookups(tx, context, definitions, data, current.data);
@@ -409,6 +435,7 @@ export class RecordService {
       if (!row) this.rejectRevision(await this.findRecord(tx, context, appId, recordId));
       const updated = serializeRecord(row);
       await replaceTableRows(tx, { tenantId: context.tenantId, appId, recordId }, tables.replacements);
+      if (categoryIds !== undefined) await replaceRecordCategories(tx, context, appId, recordId, categoryIds);
       await this.saveLookupReferences(tx, context, updated, references);
       await tx.delete(recordUniqueValues).where(this.uniqueValuesScope(context, appId, recordId));
       await this.reserveUniqueValues(tx, context, updated);
@@ -598,9 +625,23 @@ export class RecordService {
     }
   }
 
-  async list(context: TenantContext, appId: string, { after, limit = 50, view }: z.infer<typeof pageInput>) {
+  async list(context: TenantContext, appId: string, { after, limit = 50, view, category }: z.infer<typeof pageInput>) {
     return withTenantTransaction(context, async (tx) => {
       const { where, sort, sortValue, numericSort, descending, data, fields } = await this.query.scope(tx, context, appId, view);
+      // P4-T1: category filtering is descendant-inclusive and deduplicated
+      // (EXISTS over the assignment link table), mirroring kintone.
+      const { app } = await this.appSchema.access(tx, context, appId, 'view');
+      const configuration = (await this.appSchema.getVersion(tx, context, appId, app.publishedSchemaVersion)).categoryConfiguration;
+      let categoryCondition;
+      if (category) {
+        if (!configuration.enabled || !configuration.nodes.some(({ id }) => id === category)) {
+          throw new BadRequestException('Unknown category');
+        }
+        const ids = [...categorySubtreeIds(configuration, category)];
+        categoryCondition = sql`EXISTS (SELECT 1 FROM ${recordCategories} WHERE ${recordCategories.tenantId} = ${records.tenantId}
+          AND ${recordCategories.appId} = ${records.appId} AND ${recordCategories.recordId} = ${records.id}
+          AND ${recordCategories.categoryId} IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)}))`;
+      }
       let afterCondition = after === undefined ? undefined : gt(records.recordNo, BigInt(after));
       if (after !== undefined && sort) {
         const [cursor] = await tx.select({ value: sortValue! }).from(records)
@@ -623,8 +664,15 @@ export class RecordService {
         schemaVersion: records.schemaVersion, revision: records.revision, status: records.status,
         createdAt: records.createdAt, createdBy: records.createdBy, updatedAt: records.updatedAt,
         updatedBy: records.updatedBy, deletedAt: records.deletedAt, deletedBy: records.deletedBy, data,
-      }).from(records).where(and(where, afterCondition)).orderBy(...order).limit(limit + 1);
+      }).from(records).where(and(where, categoryCondition, afterCondition)).orderBy(...order).limit(limit + 1);
       const items = rows.slice(0, limit).map(serializeRecord);
+      if (items.length) {
+        const categoryMap = await recordCategoryIds(tx, context, appId, items.map(({ id }) => id));
+        for (const item of items) {
+          const assignedIds = categoryMap.get(item.id);
+          if (configuration.enabled || assignedIds?.length) item.categoryIds = assignedIds ?? [];
+        }
+      }
       const tables = fields.filter(({ type }) => type === 'table');
       if (items.length && tables.length) {
         const counts = await tx.select({

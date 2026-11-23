@@ -1,4 +1,4 @@
-import { fieldContract, type FormLayout, type RecordResponse } from '@suzubase/shared-types';
+import { categoryPath, fieldContract, type FormLayout, type RecordResponse } from '@suzubase/shared-types';
 import { useEffect, useState, type FormEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 import { api, appPath, download, json, message, type App, type AppSummary, type Field, type Profile, type Session } from './api';
@@ -134,6 +134,7 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
   const [app, setApp] = useState<App>();
   const selectors = useSelectorOptions(app, session);
   const [view, setView] = useState<string>();
+  const [category, setCategory] = useState<string>();
   const [items, setItems] = useState<Item[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [total, setTotal] = useState<string>();
@@ -174,6 +175,7 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
     if (!app) return;
     setBusy(true); setError('');
     const params = new URLSearchParams(view ? { view } : {});
+    if (category) params.set('category', category);
     try {
       if (search) {
         const output = await api<{ items: Item[]; count: string }>(root + '/search?' + new URLSearchParams({
@@ -203,7 +205,7 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
     }
   }
 
-  useEffect(() => { if (screen === 'list' && app) void load(); }, [app, screen, view, search]);
+  useEffect(() => { if (screen === 'list' && app) void load(); }, [app, screen, view, search, category]);
 
   async function open(id: string, where: 'detail' | 'edit' = 'detail') {
     setError(''); setHistory(undefined); setArchive(undefined);
@@ -344,6 +346,12 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
           onChange={(event) => setView(event.target.value || undefined)}>
           {!app.defaultId && <option value="">All records</option>}
           {app.views.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}
+        </select></label>}
+        {app.categories?.enabled && app.categories.nodes.length > 0 && <label>Category <select value={category ?? ''}
+          onChange={(event) => setCategory(event.target.value || undefined)}>
+          <option value="">All categories</option>
+          {app.categories.nodes.map((node) => <option key={node.id} value={node.id}>
+            {categoryPath(app.categories, node.id).join(' / ') || node.name}</option>)}
         </select></label>}
         {currentSearchField && <form className="search-form" onSubmit={(event) => {
           event.preventDefault();

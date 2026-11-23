@@ -11,10 +11,11 @@ import { ViewSettings } from './view-settings';
 import { IndexSettings } from './index-settings';
 import { ExportPanel } from './import-export';
 import { LayoutDesigner } from './form-layout';
+import { CategorySettings } from './category-settings';
 import { api, ApiError, appPath, download, json, message, type App, type Field, type Session } from './api';
 
 type Draft = ViewConfiguration & { version: number | null; status: string | null; fields: Field[]; publishedFields: Field[]; formLayout: FormLayout };
-const tabs = ['Form', 'Views', 'Workflow', 'Automation', 'Notifications', 'Permissions', 'General', 'Import / export', 'Indexes'] as const;
+const tabs = ['Form', 'Views', 'Categories', 'Workflow', 'Automation', 'Notifications', 'Permissions', 'General', 'Import / export', 'Indexes'] as const;
 
 export function Settings({ app, session, narrow, onClose, reload }: {
   app: App; session: Session; narrow: boolean; onClose: () => void; reload: () => Promise<void>;
@@ -146,6 +147,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
     </>}
     {active === 'Views' && <ViewSettings workflowStates={app.workflowStates} configuration={draft ?? app} fields={definitions} path={path}
       session={session} refresh={refreshDraft} />}
+    {active === 'Categories' && <CategorySettings app={app} token={token} />}
     {active === 'Workflow' && <WorkflowSettings app={app} token={token} fields={definitions} />}
     {active === 'Automation' && <AutomationSettings app={app} token={token} />}
     {active === 'Notifications' && <NotificationSettings appId={app.id} token={token} fields={definitions} onSaved={refreshDraft} />}
@@ -168,7 +170,7 @@ export function Settings({ app, session, narrow, onClose, reload }: {
     </form>}
     {active === 'Indexes' && <IndexSettings app={app} session={session} />}
     {active === 'Import / export' && <div className="stack"><CsvSettings app={app} session={session} /><ExportPanel app={app} session={session} /></div>}
-    {(active === 'Form' || active === 'Views' || active === 'Permissions' || active === 'Notifications') && draft?.version && <div className="inline">
+    {(active === 'Form' || active === 'Views' || active === 'Categories' || active === 'Permissions' || active === 'Notifications') && draft?.version && <div className="inline">
       <button className="primary" disabled={busy} onClick={() => void run(async () => {
         setPreflight(undefined);
         try {

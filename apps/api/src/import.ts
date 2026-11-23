@@ -84,11 +84,15 @@ export interface PkgField { fieldId: string; code: string; name: string; type: s
   uniqueValue: boolean; searchMode: string | null; formula: unknown; lookup: any; related: any; table: any;
   layoutElement: unknown; autoNumber: any; options: unknown[] }
 export interface PkgVersion { version: number; aclConfiguration: any; fieldEdits: Record<string, any>;
-  formLayout: any; notificationRules: any[]; viewConfiguration: any; migrationReport: unknown; fields: PkgField[] }
+  formLayout: any; notificationRules: any[]; viewConfiguration: any; migrationReport: unknown; fields: PkgField[];
+  /** P4-T1 additive key; absent in pre-P4 packages. */
+  categories?: { enabled: boolean; nodes: { id: string; parentId: string | null; name: string; sortOrder: number }[] } }
 export interface PkgRecord { id: string; recordNo: string; data: Record<string, string>;
   archivedData: Record<string, string>; schemaVersion: number; revision: number; status: string;
   createdBy: string; createdAt: string; updatedBy: string; updatedAt: string;
   deletedBy: string | null; deletedAt: string | null;
+  /** P4-T1 additive key; absent in pre-P4 packages. */
+  categoryIds?: string[];
   workflow: { workflowId: string; workflowVersion: number; stateId: string; assignees: string[] } | null }
 export interface PkgPackage {
   manifest: PackageManifest;
@@ -653,7 +657,7 @@ export function remapAssignees(sources: any[] | undefined, job: JobRow, fieldMap
 import {
   appCounters, appVersions, autoNumberCounters, automationRules, automationRuleVersions,
   automationWebhookEndpoints, commentMentions, fields as fieldRows, fileReferences, files,
-  recordComments, recordEvents, recordReferences, recordTableRows, recordUniqueValues,
+  recordCategories, recordComments, recordEvents, recordReferences, recordTableRows, recordUniqueValues,
   recordWorkflowState, records, workflowActions, workflowAssignments, workflowDefinitions, workflowEvents,
   workflowStates,
 } from '@suzubase/db';
@@ -921,6 +925,12 @@ export class ImportExecutionService {
     for (const field of pkg.rawFields) {
       for (const child of field.table?.fields ?? []) state.map.assign('tableField', child.fieldId);
     }
+    // P4-T1: category node ids are remapped like every other object type
+    // (source_id_map object type 'category'); the same source node keeps
+    // one target id across all schema versions in the package.
+    for (const version of pkg.versions) {
+      for (const node of version.categories?.nodes ?? []) state.map.assign('category', node.id);
+    }
     for (const definition of pkg.workflows) {
       state.map.assign('workflow', definition.id);
       for (const wfState of definition.states) state.map.assign('workflowState', wfState.id);
@@ -971,6 +981,13 @@ export class ImportExecutionService {
         fieldEdits: fieldEdits as any, formLayout: this.remapLayout(version.formLayout, state.map) ?? [],
         notificationRules: this.remapNotificationRules(version.notificationRules, job, state),
         viewConfiguration: this.remapViews(version.viewConfiguration, state.map) ?? { views: [], defaultId: null },
+        categoryConfiguration: version.categories ? {
+          enabled: version.categories.enabled,
+          nodes: version.categories.nodes.map((node) => ({
+            id: state.map.get('category', node.id)!, name: node.name, sortOrder: node.sortOrder,
+            parentId: node.parentId ? state.map.get('category', node.parentId)! : null,
+          })),
+        } : undefined,
         migrationReport: version.migrationReport as any,
       });
     }
@@ -1173,6 +1190,16 @@ export class ImportExecutionService {
           rowOrder: tableRow.rowOrder, data: rowData,
         });
         state.map.set('tableRow', tableRow.rowId, targetRowId);
+      }
+      // P4-T1: record category assignments (additive records.json key;
+      // source node ids resolve through the same id map as the tree).
+      for (const sourceCategoryId of source.categoryIds ?? []) {
+        const targetCategoryId = state.map.get('category', sourceCategoryId);
+        if (targetCategoryId) {
+          await tx.insert(recordCategories).values({
+            ...identity, recordId: targetId, categoryId: targetCategoryId,
+          }).onConflictDoNothing();
+        }
       }
       // Attachment references + reference counts (files become ATTACHED).
       for (const field of targetFields) {

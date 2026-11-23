@@ -7,7 +7,7 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
   and, apiTokens, apps, appVersions, commentMentions, eq, exportJobs, fields as fieldRows, files, groupMembers, inArray,
-  memberGroups, organizations, recordComments, recordEvents, recordReferences, recordTableRows, recordWorkflowState,
+  memberGroups, organizations, recordCategories, recordComments, recordEvents, recordReferences, recordTableRows, recordWorkflowState,
   appCounters, autoNumberCounters, automationGrants, automationRules, automationRuleVersions,
   automationWebhookEndpoints, records, sql, tenantMembers, users, workflowAssignments, workflowDefinitions, workflowEvents,
   deploymentInstance, withTenantTransaction, type TenantContext, type TenantTransaction,
@@ -205,6 +205,10 @@ export class ExportService {
         version: row.version, aclConfiguration: row.aclConfiguration, fieldEdits: row.fieldEdits,
         formLayout: row.formLayout, notificationRules: row.notificationRules,
         viewConfiguration: row.viewConfiguration, migrationReport: row.migrationReport,
+        // P4-T1 (pending merge version decision): the category tree is an
+        // additive key inside the existing schema.json versions section;
+        // pre-P4 importers ignore the unknown key.
+        categories: row.categoryConfiguration,
         fields: await this.schema.getFields(tx, context, appId, row.version),
       });
     }
@@ -236,6 +240,14 @@ export class ExportService {
       eq(workflowAssignments.tenantId, tenantId), eq(workflowAssignments.appId, appId),
       eq(workflowAssignments.active, true))) : [];
     const stateByRecord = new Map(workflowStates.map((row) => [row.recordId, row]));
+    // P4-T1: category assignments travel inside records.json as an additive
+    // per-record key (source node ids; the tree itself is in schema.json).
+    const categoryRows = recordIds.length ? await tx.select().from(recordCategories).where(and(
+      eq(recordCategories.tenantId, tenantId), eq(recordCategories.appId, appId))) : [];
+    const categoriesByRecord = new Map<string, string[]>();
+    for (const row of categoryRows) {
+      categoriesByRecord.set(row.recordId, [...(categoriesByRecord.get(row.recordId) ?? []), row.categoryId]);
+    }
     const assigneesByRecord = new Map<string, string[]>();
     for (const row of assignmentRows) {
       assigneesByRecord.set(row.recordId, [...(assigneesByRecord.get(row.recordId) ?? []), row.userId]);
@@ -251,6 +263,7 @@ export class ExportService {
         schemaVersion: row.schemaVersion, revision: row.revision, status: row.status,
         createdBy: row.createdBy, createdAt: row.createdAt, updatedBy: row.updatedBy, updatedAt: row.updatedAt,
         deletedBy: row.deletedBy, deletedAt: row.deletedAt,
+        categoryIds: categoriesByRecord.get(row.id) ?? [],
         workflow: workflow ? {
           workflowId: workflow.workflowId, workflowVersion: workflow.workflowVersion,
           stateId: workflow.stateId, assignees: assigneesByRecord.get(row.id) ?? [],

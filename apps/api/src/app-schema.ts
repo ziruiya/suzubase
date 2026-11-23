@@ -7,7 +7,7 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, appCounters, appVersions, eq, records, fields, isNull, lte, memberGroups, organizations, recordReferences, recordUniqueValues, sql, tenantMembers, users, TenantContext, TenantTransaction, withTenantTransaction,
 } from '@suzubase/db';
-import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, lookupTargets, optionFieldTypes, type FieldDefinition, type FormLayout, SavedView, tableFieldTypes, tableRowLimit, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
+import { AclConfiguration, AppAction, autoNumberHelp, fieldContract, fieldTypes, isRecordInput, layoutKinds, lookupTargets, optionFieldTypes, type CategoryConfiguration, type FieldDefinition, type FormLayout, SavedView, tableFieldTypes, tableRowLimit, textSearchModes, ViewConfiguration } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { AuthorizationService, formulaReferences, RecordAccess } from './authorization';
 import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
@@ -23,6 +23,7 @@ import { projectSearchValues } from './search-projection';
 import { normalizeReferencePresentation, referencePresentation } from './reference-config';
 import { copyWorkflow, publishedWorkflowStates } from './workflow-graph';
 import { conditions, viewInput } from './view-input';
+import { categoryConfigurationInput, categoryRemovalProblems, validateCategoryTree } from './categories';
 import { identifier, parseInput, postgresErrorCode } from './validation';
 
 const codePattern = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -286,6 +287,21 @@ export class AppSchemaService {
           ...(row.groupFieldId && { groupFieldId: fieldMapping.get(row.groupFieldId)! }),
         }));
         await tx.update(appVersions).set({ viewConfiguration, formLayout }).where(this.versionScope(context, copy.id, 1));
+        // P4-T1: the category tree is copied with fresh node ids (records
+        // are not copied, so no assignment remapping is needed).
+        const sourceCategories = (await this.getVersion(tx, context, appId, source.publishedSchemaVersion)).categoryConfiguration;
+        if (sourceCategories.nodes.length) {
+          const categoryMapping = new Map(sourceCategories.nodes.map(({ id }) => [id, randomUUID()]));
+          await tx.update(appVersions).set({
+            categoryConfiguration: {
+              enabled: sourceCategories.enabled,
+              nodes: sourceCategories.nodes.map((node) => ({
+                ...node, id: categoryMapping.get(node.id)!,
+                parentId: node.parentId ? categoryMapping.get(node.parentId)! : null,
+              })),
+            },
+          }).where(this.versionScope(context, copy.id, 1));
+        }
         await copyWorkflow(tx, { tenantId: context.tenantId, appId }, identity, fieldMapping);
         return copy;
       });
@@ -322,6 +338,7 @@ export class AppSchemaService {
         titleFieldId: app.titleFieldId && this.authorization.fieldDecision(access, app.titleFieldId, 'view').allowed
           ? app.titleFieldId : null,
         formLayout: this.visibleLayout(await this.layout(tx, context, appId, app.publishedSchemaVersion), definitions),
+        categories: (await this.getVersion(tx, context, appId, app.publishedSchemaVersion)).categoryConfiguration,
         archivedAt: app.archivedAt, localDrafts: app.localDrafts, can,
         commentsEnabled: app.commentsEnabled,
         workflowStates: await publishedWorkflowStates(tx, { tenantId: context.tenantId, appId }),
@@ -429,8 +446,8 @@ export class AppSchemaService {
     const appId = app.id;
     const version = app.draftSchemaVersion ?? app.publishedSchemaVersion + 1;
     if (app.draftSchemaVersion === null) {
-      const { aclConfiguration, viewConfiguration, fieldEdits, formLayout, notificationRules } = await this.getVersion(tx, context, appId, app.publishedSchemaVersion);
-      await tx.insert(appVersions).values({ tenantId: context.tenantId, appId, version, aclConfiguration, viewConfiguration, fieldEdits, formLayout, notificationRules });
+      const { aclConfiguration, viewConfiguration, fieldEdits, formLayout, notificationRules, categoryConfiguration } = await this.getVersion(tx, context, appId, app.publishedSchemaVersion);
+      await tx.insert(appVersions).values({ tenantId: context.tenantId, appId, version, aclConfiguration, viewConfiguration, fieldEdits, formLayout, notificationRules, categoryConfiguration });
     }
     await tx.update(apps).set({ draftSchemaVersion: version, draftStatus: 'editing' })
       .where(and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId)));
@@ -515,6 +532,7 @@ export class AppSchemaService {
         publishedFields: await this.getFields(tx, context, appId, app.publishedSchemaVersion),
         fields: version === null ? [] : await this.getFields(tx, context, appId, version),
         formLayout: (await this.getVersion(tx, context, appId, version ?? app.publishedSchemaVersion)).formLayout,
+        categories: (await this.getVersion(tx, context, appId, version ?? app.publishedSchemaVersion)).categoryConfiguration,
         ...await this.getViews(tx, context, appId, version ?? app.publishedSchemaVersion),
       };
     });
@@ -635,6 +653,8 @@ export class AppSchemaService {
       const workflow = await inspectWorkflowChanges(tx, { tenantId: context.tenantId, appId }, currentFields, draftFields,
         app.workflowEnabled, migration?.workflowAssignees === 'administrator-pool', { auth: this.authorization, access: view?.access });
       dependencyProblems.push(...workflow.problems);
+      dependencyProblems.push(...await categoryRemovalProblems(tx, context, appId,
+        previous.categoryConfiguration, draft.categoryConfiguration));
       if (!validLayout(draft.formLayout, draftFields)) {
         dependencyProblems.push({ fieldId: '', dependency: 'layout', reason: 'Update invalid layout references' });
       }
@@ -662,8 +682,8 @@ export class AppSchemaService {
       };
       const disclosedIssues = await disclose(issues);
       const disclosedRepairs = await disclose(repaired);
-      const changes = JSON.stringify([draftFields, draft.formLayout, draft.viewConfiguration, draft.aclConfiguration, draft.notificationRules]) !==
-        JSON.stringify([currentFields, previous.formLayout, previous.viewConfiguration, previous.aclConfiguration, previous.notificationRules]);
+      const changes = JSON.stringify([draftFields, draft.formLayout, draft.viewConfiguration, draft.aclConfiguration, draft.notificationRules, draft.categoryConfiguration]) !==
+        JSON.stringify([currentFields, previous.formLayout, previous.viewConfiguration, previous.aclConfiguration, previous.notificationRules, previous.categoryConfiguration]);
       const scope = and(eq(apps.tenantId, context.tenantId), eq(apps.id, appId));
       const needsMigration = destructive && plan.length > 0 && !migration;
       if (version !== app.publishedSchemaVersion + 1 || !changes || issues.length || dependencyProblems.length || needsMigration) {
@@ -744,6 +764,36 @@ export class AppSchemaService {
       .where(this.versionScope(context, appId, version));
     if (!snapshot) throw new NotFoundException();
     return snapshot.configuration;
+  }
+
+  async getCategories(tx: TenantTransaction, context: TenantContext, appId: string, version: number) {
+    const [snapshot] = await tx.select({ configuration: appVersions.categoryConfiguration }).from(appVersions)
+      .where(this.versionScope(context, appId, version));
+    if (!snapshot) throw new NotFoundException();
+    return snapshot.configuration;
+  }
+
+  /**
+   * P4-T1: read or replace the DRAFT category tree. Replacement validates
+   * the tree structurally and refuses to drop a node that still has
+   * records (GAIA_CD07 mirror); publish re-checks the same rule.
+   */
+  async editCategories(context: TenantContext, appId: string,
+    input?: z.infer<typeof categoryConfigurationInput>) {
+    return withTenantTransaction(context, async (tx) => {
+      const app = await this.managedApp(tx, context, appId);
+      if (!input) {
+        return this.getCategories(tx, context, appId, app.draftSchemaVersion ?? app.publishedSchemaVersion);
+      }
+      const configuration = validateCategoryTree(input);
+      const published = await this.getCategories(tx, context, appId, app.publishedSchemaVersion);
+      const problems = await categoryRemovalProblems(tx, context, appId, published, configuration);
+      if (problems.length) throw new BadRequestException(problems);
+      const version = await this.beginDraft(tx, context, app);
+      await tx.update(appVersions).set({ categoryConfiguration: configuration })
+        .where(this.versionScope(context, appId, version));
+      return configuration;
+    });
   }
 
   async editView(
@@ -1027,6 +1077,19 @@ export class AppSchemaController {
   @AllowApiToken('manage')
   saveAcl(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
     return this.schemas.editAcl(context, parseInput(identifier, id), parseInput(aclInput, body));
+  }
+
+  @Get(':appId/draft/categories')
+  @AllowApiToken('manage')
+  categories(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string) {
+    return this.schemas.editCategories(context, parseInput(identifier, id));
+  }
+
+  @Put(':appId/draft/categories')
+  @AllowApiToken('manage')
+  saveCategories(@AuthenticatedTenant() context: TenantContext, @Param('appId') id: string, @Body() body: unknown) {
+    return this.schemas.editCategories(context, parseInput(identifier, id),
+      parseInput(categoryConfigurationInput, body));
   }
 
   @Post(':appId/permissions/preview')

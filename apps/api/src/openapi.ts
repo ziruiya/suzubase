@@ -17,6 +17,7 @@ import { formulaInput } from './formula';
 import { importHttp, importHttp2, importHttp3 } from './import';
 import { identifier } from './validation';
 import { automationHttp } from './automation';
+import { categoryHttp } from './categories';
 
 const id = identifier;
 const text = z.string();
@@ -73,13 +74,14 @@ const publishConflict = z.looseObject({
 const publishedApp = appSummary.omit({ deletedAt: true }).extend({
   icon: text.nullable(), themeColor: text.nullable(), titleFieldId: nullableId, localDrafts: flag, schemaVersion: integer,
   commentsEnabled: flag, workflowStates: z.array(z.object({ code: text, name: text })),
-  fields: z.array(formField), formLayout: appHttp.formLayoutInput,
+  fields: z.array(formField), formLayout: appHttp.formLayoutInput, categories: categoryHttp.reply,
   can: z.object({ edit: flag, delete: flag, create: flag, manage: flag, export: flag }),
   ...viewConfiguration.shape,
 });
 const draft = z.object({
   version: integer.nullable(), status: draftStatus, autoNumberHelp: text,
-  fields: z.array(field), publishedFields: z.array(field), formLayout: appHttp.formLayoutInput, ...viewConfiguration.shape,
+  fields: z.array(field), publishedFields: z.array(field), formLayout: appHttp.formLayoutInput,
+  categories: categoryHttp.reply, ...viewConfiguration.shape,
 });
 const choice = z.object({ id, name: text });
 const selectors = z.object({ user: z.array(choice.extend({ disabled: flag })), organization: z.array(choice), group: z.array(choice) });
@@ -87,6 +89,7 @@ const data = z.record(text, text).describe('Values keyed by field UUID. Numeric 
 const record = z.object({
   id, appId: id, recordNo, data, schemaVersion: integer, revision: integer, status: text,
   createdBy: id, createdAt: timestamp, updatedBy: id, updatedAt: timestamp,
+  categoryIds: z.array(id).optional(),
 });
 const revisionConflict = z.looseObject({ code: z.literal('REVISION_CONFLICT'), message: text, current: record });
 const recordForm = z.object({
@@ -240,6 +243,7 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [views + '/default']: { put: { body: appHttp.defaultViewInput, reply: versionedViews } },
   [views + '/{viewId}']: { put: { body: appHttp.viewInput, reply: versionedViews }, delete: { reply: versionedViews } },
   [applications + '/draft/acl']: { get: { reply: acl }, put: { body: appHttp.aclInput, reply: acl } },
+  [applications + '/draft/categories']: { get: { reply: categoryHttp.reply }, put: { body: categoryHttp.categoryConfigurationInput, reply: categoryHttp.reply } },
   [applications + '/permissions/preview']: { post: { body: appHttp.previewInput, reply: preview,
     description: 'Evaluate a published record, a bounded set of matching records, or application permissions. Preview calls are audited.' } },
   [applications + '/notification-rules']: {

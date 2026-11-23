@@ -139,6 +139,57 @@ export const layoutWidths = [3, 4, 6, 8, 9, 12] as const;
 export type LayoutCell = { fieldId: string; width: (typeof layoutWidths)[number] };
 export type FormLayout = { id: string; groupFieldId?: string; cells: LayoutCell[] }[];
 
+/**
+ * P4-T1 categories (kintone カテゴリ mirror): an app-level tree, NOT a field.
+ * Nodes carry an immutable internal id and a stable parent id; names may
+ * repeat under the same parent (kintone allows same-level duplicates), so
+ * identity is the id alone and a path is display/source-reconciliation only.
+ * Renaming a node never changes record assignment (assignments store ids).
+ */
+export interface CategoryNode {
+  id: string;
+  parentId: string | null;
+  name: string;
+  sortOrder: number;
+}
+
+export interface CategoryConfiguration {
+  enabled: boolean;
+  nodes: CategoryNode[];
+}
+
+export const emptyCategoryConfiguration: CategoryConfiguration = { enabled: false, nodes: [] };
+export const categoryNodeLimit = 1000;
+export const categoryDepthLimit = 5;
+
+/** The node itself plus every descendant id (parent filtering is descendant-inclusive). */
+export function categorySubtreeIds(configuration: CategoryConfiguration, nodeId: string): Set<string> {
+  const children = new Map<string, string[]>();
+  for (const node of configuration.nodes) {
+    if (node.parentId) children.set(node.parentId, [...(children.get(node.parentId) ?? []), node.id]);
+  }
+  const result = new Set<string>([nodeId]);
+  const queue = [nodeId];
+  while (queue.length) {
+    for (const child of children.get(queue.pop()!) ?? []) {
+      if (!result.has(child)) { result.add(child); queue.push(child); }
+    }
+  }
+  return result;
+}
+
+/** Display path of a node, root first, e.g. ['関東', '東京']. Display only, never an identity key. */
+export function categoryPath(configuration: CategoryConfiguration, nodeId: string): string[] {
+  const byId = new Map(configuration.nodes.map((node) => [node.id, node]));
+  const path: string[] = [];
+  let current = byId.get(nodeId);
+  while (current) {
+    path.unshift(current.name);
+    current = current.parentId ? byId.get(current.parentId) : undefined;
+  }
+  return path;
+}
+
 export const indexPurposes = ['filter', 'sort', 'search'] as const;
 export type IndexPurpose = (typeof indexPurposes)[number];
 export const boundedSortTypes: ReadonlySet<FieldType> = new Set([

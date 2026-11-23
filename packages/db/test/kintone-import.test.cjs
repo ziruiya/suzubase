@@ -38,7 +38,9 @@ test('P2-M3 kintone source safety and field mapping are explicit', async () => {
   assert.equal(acceptedCalc.status, 'DATA_ONLY');
   assert.equal(acceptedCalc.sourceConfig.expression, 'SUM(qty)');
   assert.match(acceptedCalc.reason, /Administrator accepted/);
-  assert.equal(mapKintoneField({ code: 'category', type: 'CATEGORY' }).status, 'UNSUPPORTED');
+  assert.equal(mapKintoneField({ code: 'category', type: 'CATEGORY' }).status, 'UNRESOLVED');
+  assert.match(mapKintoneField({ code: 'category', type: 'CATEGORY' }).reason, /UNRESOLVED_CATEGORY_IDENTITY/);
+  assert.equal(mapKintoneField({ code: 'category', type: 'CATEGORY' }).upgradeRequired, false);
   assert.equal(mapKintoneField({ code: 'owner', type: 'USER_SELECT' }).status, 'UNRESOLVED');
   assert.equal(mapKintoneField({ code: 'title', type: 'SINGLE_LINE_TEXT' }).status, 'EQUIVALENT');
   assert.equal(mapKintoneField({ code: 'mystery', type: 'NEW_TYPE' }).status, 'UNSUPPORTED');
