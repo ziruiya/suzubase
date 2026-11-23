@@ -12,7 +12,7 @@ import { AppSchemaService } from './app-schema';
 import { AuthorizationService, type RecordAccess } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
 import { NotificationPlanner } from './notification-planner';
-import { serializeRecord, writeRecordEvent } from './record-events';
+import { serializeRecord, writeRecordEvent, type EventCausation } from './record-events';
 import { assignmentScope, resolveAssignees, setAssignees, workStateScope } from './workflow-data';
 import { identifier, parseInput } from './validation';
 
@@ -156,6 +156,53 @@ export class WorkflowRuntimeService {
     });
   }
 
+  // P3-B A-4: automation may execute only actions whose definition opted in
+  // (automation_allowed). The delegated context is the grant approver; the
+  // transition is attributed actor_type=AUTOMATION with rule/run ids and is
+  // never a human approval. Business-rule failures throw coded errors.
+  async executeAutomation(tx: TenantTransaction, context: TenantContext, appId: string, recordId: string,
+    actionId: string, causation: EventCausation, attribution: { ruleId: string; runId: string }) {
+    const fail = (code: string, message: string): never => {
+      const error = new Error(message) as Error & { code?: string };
+      error.code = code;
+      throw error;
+    };
+    const loaded = await this.load(tx, context, appId, recordId, true);
+    if (!loaded.workflow) fail('WORKFLOW_NOT_PRESENT', 'Record has no workflow state');
+    if (!loaded.canEdit) fail('WORKFLOW_EDIT_FORBIDDEN', 'Automation actor cannot edit this record');
+    const { workflowId, stateId } = loaded.workflow!;
+    const stateScope = and(eq(workflowStates.tenantId, context.tenantId), eq(workflowStates.appId, appId),
+      eq(workflowStates.workflowId, workflowId));
+    const [transition] = await tx.select({ action: workflowActions, target: stateColumns }).from(workflowActions)
+      .innerJoin(workflowStates, and(stateScope, eq(workflowStates.id, workflowActions.toStateId)))
+      .where(and(eq(workflowActions.tenantId, context.tenantId), eq(workflowActions.appId, appId),
+        eq(workflowActions.workflowId, workflowId), eq(workflowActions.id, actionId)));
+    if (!transition) fail('WORKFLOW_ACTION_NOT_FOUND', 'Workflow action is not part of the record workflow');
+    const { action, target } = transition!;
+    if (!action.automationAllowed) fail('WORKFLOW_ACTION_NOT_AUTOMATION_ALLOWED', 'Workflow action is not enabled for automation');
+    if (action.fromStateId !== stateId) fail('WORKFLOW_STATE_MISMATCH', 'Record is not in the action source state');
+    const { access } = loaded;
+    if (action.conditions.some(({ fieldId }) => !access.types.has(fieldId) ||
+      !this.authorization.fieldDecision(access, fieldId, 'view').allowed)) {
+      fail('WORKFLOW_CONDITION_FIELD_UNREADABLE', 'Automation actor cannot read a condition field');
+    }
+    const record = serializeRecord(loaded.record);
+    if (action.conditions.length) {
+      const [result] = await tx.select({
+        met: sql<boolean>`COALESCE(${and(...action.conditions.map((condition) => workCondition(this.authorization, access, condition)))}, false)`,
+      }).from(records).where(and(eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, recordId),
+        eq(records.revision, record.revision)));
+      if (!result?.met) fail('WORKFLOW_CONDITIONS_UNMET', 'Workflow action conditions are not met');
+    }
+    const currentAssignees = await tx.select({ userId: workflowAssignments.userId }).from(workflowAssignments)
+      .where(and(assignmentScope(loaded.scope), eq(workflowAssignments.active, true)));
+    const assignees = await resolveAssignees(tx, context.tenantId, record, action.assignees,
+      currentAssignees.map(({ userId }) => userId));
+    return this.persist(tx, context, loaded, record.revision, target, target.terminal ? [] : assignees,
+      'workflow-action', action.id, undefined, action.eventType, causation,
+      { actorType: 'AUTOMATION', ...attribution });
+  }
+
   reassign(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof reassignInput>) {
     return withTenantTransaction(context, async (tx) => {
       const { loaded, runtime } = await this.available(tx, context, appId, recordId, true);
@@ -216,7 +263,8 @@ export class WorkflowRuntimeService {
 
   private async persist(tx: TenantTransaction, context: TenantContext, loaded: Awaited<ReturnType<WorkflowRuntimeService['load']>>,
     revision: number, target: z.infer<typeof stateSummary>, ids: string[], kind: 'workflow-action' | 'workflow-reassigned' | 'WORKFLOW_REPAIR', actionId?: string, reason?: string,
-    eventType: 'transitioned' | 'rejected' = 'transitioned',
+    eventType: 'transitioned' | 'rejected' = 'transitioned', causation?: EventCausation,
+    attribution?: { actorType: 'AUTOMATION'; ruleId: string; runId: string },
   ) {
     const { scope, workflow } = loaded;
     const [updated] = await tx.update(records).set({
@@ -227,10 +275,11 @@ export class WorkflowRuntimeService {
     await tx.update(recordWorkflowState).set({ stateId: target.id, revision: updated.revision, attentionReason: null }).where(workStateScope(scope));
     await setAssignees(tx, scope, ids, kind);
     const record = serializeRecord(updated);
-    const eventId = await writeRecordEvent(tx, context, record, kind, []);
+    const eventId = await writeRecordEvent(tx, context, record, kind, [], 'api', undefined, causation);
     await tx.insert(workflowEvents).values({
       tenantId: scope.tenantId, appId: scope.appId, eventId, workflowId: workflow!.workflowId,
       actionId, reason, eventType, fromStateId: workflow!.stateId, toStateId: target.id, assigneeIds: ids,
+      actorType: attribution?.actorType ?? 'USER', ruleId: attribution?.ruleId, runId: attribution?.runId,
     });
     if (kind === 'workflow-action') await this.notifications.recordEvent(tx, context, record, eventId, {
       source: 'api', trigger: 'workflow-action', schemaVersion: loaded.app.publishedSchemaVersion,

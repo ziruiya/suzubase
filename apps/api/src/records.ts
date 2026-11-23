@@ -16,7 +16,7 @@ import { AuthorizationService, formulaReferences, RecordAccess } from './authori
 import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
 import { NotificationPlanner } from './notification-planner';
 import { RecordQueryService } from './record-query';
-import { fieldChanges, serializeRecord, writeRecordEvent } from './record-events';
+import { fieldChanges, serializeRecord, writeRecordEvent, type EventCausation } from './record-events';
 import { FileService, fileIds } from './files';
 import { SearchService, searchInput } from './search';
 import { projectSearchValues } from './search-projection';
@@ -162,7 +162,7 @@ export class RecordService {
   async persistCreate(
     tx: TenantTransaction, context: TenantContext, appId: string, input: RecordData,
     { app, access, fields }: Awaited<ReturnType<AppSchemaService['writable']>>,
-    source: 'api' | 'import', key?: string,
+    source: 'api' | 'import', key?: string, causation?: EventCausation,
   ) {
     const schemaVersion = app.publishedSchemaVersion;
     this.assertEditable(access, input, fields);
@@ -218,7 +218,7 @@ export class RecordService {
     await this.reserveUniqueValues(tx, context, record);
     await this.reconcileFiles(tx, context, record);
     await projectSearchValues(tx, context, record, fields);
-    const eventId = await writeRecordEvent(tx, context, record, 'created', [...fieldChanges({}, data), ...tables.changes], source);
+    const eventId = await writeRecordEvent(tx, context, record, 'created', [...fieldChanges({}, data), ...tables.changes], source, undefined, causation);
     if (initial) await attachInitialWorkflow(tx, context.tenantId, record, initial, eventId);
     await this.notifications.recordEvent(tx, context, record, eventId, { source, trigger: 'created', schemaVersion,
       stateCode: initial?.state.code });
@@ -352,7 +352,15 @@ export class RecordService {
   }
 
   async update(context: TenantContext, appId: string, recordId: string, input: z.infer<typeof updateInput> | SingleFieldUpdate | { revision: number; lookupFieldId: string; confirmation: string }) {
-    return withTenantTransaction(context, async (tx) => {
+    return withTenantTransaction(context, (tx) => this.persistUpdate(tx, context, appId, recordId, input));
+  }
+
+  // P3-B: transaction-scoped update core shared by the HTTP path and the
+  // automation engine, which supplies the delegated grant-approver context
+  // plus the causation quintuple for the emitted record event.
+  async persistUpdate(tx: TenantTransaction, context: TenantContext, appId: string, recordId: string,
+    input: z.infer<typeof updateInput> | SingleFieldUpdate | { revision: number; lookupFieldId: string; confirmation: string },
+    causation?: EventCausation) {
       const { app, access, fields } = await this.appSchema.writable(tx, context, appId, 'edit');
       const current = await this.findRecord(tx, context, appId, recordId, 'edit', false, true);
       if (current.revision !== input.revision) this.rejectRevision(this.visibleRecord(access, current));
@@ -407,12 +415,11 @@ export class RecordService {
       await this.reconcileFiles(tx, context, updated);
       await projectSearchValues(tx, context, updated, definitions);
       const eventId = await writeRecordEvent(tx, context, updated, refresh ? 'lookup-refetched' : 'updated',
-        [...fieldChanges(current.data, data), ...tables.changes]);
+        [...fieldChanges(current.data, data), ...tables.changes], 'api', undefined, causation);
       await this.notifications.recordEvent(tx, context, updated, eventId, {
         source: 'api', trigger: 'updated', schemaVersion: app.publishedSchemaVersion,
       });
       return this.findRecord(tx, context, appId, recordId);
-    });
   }
 
   private copyLookupValues(field: FieldDefinition, source: RecordData, data: RecordData) {
