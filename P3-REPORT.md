@@ -191,12 +191,13 @@ Hosted CI history on this branch, stated exactly:
 
 ---
 
-# P3-C Scheduled Execution - In Progress
+# P3-C Scheduled Execution - Complete
 
 Branch: `p3-c-automation-schedules` (from P3-B `0dc4140`). Not merged to main; not deployed.
 This section covers admission conditions C-0 and, in the second block,
-C-1 / C-2 / C-3. The P3-C scheduling features themselves (T-3 fixed cadence /
-date-relative plans) are not started yet. One C-3 pruning item was already
+C-1 / C-2 / C-3, then the P3-C scheduling features themselves: T-3 fixed
+cadence (C-4) and date-relative plans (C-5), plus the P3-C fix batch
+(B1 / C1 / C2) that closes the stage. One C-3 pruning item was already
 landed with C-0 (the `pruneRunHistory` NOT IN → NOT EXISTS change, which is
 directly tied to the pruning path fixed there).
 
@@ -660,7 +661,15 @@ safety net, exercised only by the migration text itself.
    identity forbids a second row, and the earlier execution remains
    proven by its run / action rows and notifications. A date change
    before execution simply moves due_at on the PENDING row (V-02 gate
-   asserts the old due_at never fires).
+   asserts the old due_at never fires). **Fix-batch amendment (B1):**
+   as originally shipped, the reopened plan run idempotency key did
+   not include the source date, so the consumer adopted the previous
+   date run and the new reminder was silently swallowed. The run
+   idempotency key and trigger identity now embed the plan stored
+   `source_date`: a different source date is a new logical execution
+   with its own run and notification, while replaying the same source
+   date keeps the same identity and still adopts the existing run
+   (crash recovery unchanged). See the fix-batch section below.
 5. **DST-gap wall times** for date-relative plans resolve to the
    pseudo-instant (pre-transition offset), reusing the cadence
    conversion helpers in `automation-schedule.ts`; the reminder still
@@ -813,3 +822,161 @@ With C-5, the P3-C stage is complete: T-3 fixed cadence (C-4) and
 date-relative (C-5) both run on the shared worker loop and the shared
 action engine. P3-D (Webhook / M1 compatibility / overall acceptance)
 is untouched, as ordered.
+
+## P3-C fix batch (B1 / C1 / C2): reopened-plan run identity, grace boundary gates, 100k scale smoke
+
+### Deviations and unresolved items (read first)
+
+- None unresolved. No product commitment changed in this batch: B1 is a
+  defect fix inside the C-5 decision-4 contract (a reopened terminal plan
+  is a new logical plan for the new source date), C1 only adds a test
+  injection option whose default is the existing constant, and C2 is a
+  measurement, not a behaviour change.
+- Disclosure on C2 evidence: the first end-to-end smoke run completed
+  the full backfill (100 batches, 496.5s) and then failed on a bug in
+  the smoke script itself (`max(id)` over a uuid column, which Postgres
+  rejects), before any consumption. The script was fixed
+  (`ORDER BY id DESC LIMIT 1`) and the whole smoke was rerun from a
+  fresh tenant to the PASS recorded below; the first run's population
+  was left in the verification database and is not counted anywhere.
+
+### B1 -- terminal plan reopened by a date change silently swallowed the new reminder (blocking defect, fixed)
+
+- **Defect:** after a date-relative plan reached a terminal state
+  (SUCCEEDED / LATE / FAILED), changing the record's source date reset
+  the plan row to PENDING for the new date (C-5 decision 4). But the
+  run idempotency key built by `processDateRelativePlan` --
+  `<app>:date-relative:<rule>:<version>:<scheduleKey>:<record>` -- did
+  not contain the source date, so at the new due date the existing-run
+  lookup hit the OLD run, the consumer "adopted" its outcome, and no
+  new run, action or notification was ever created for the new date.
+- **Reproduction first (red):** new gate "B1 regression -- a terminal
+  plan reopened by a date change executes a NEW run and notifies
+  again" failed exactly as predicted before the fix:
+  `AssertionError: B1: the new source date must produce a second run,
+  not adopt the old one -- 1 !== 2` (runs stayed 1; the plan was
+  finalized SUCCEEDED from the old run with zero new notifications).
+  The companion gate (same-source-date replay) already passed,
+  pinning the adoption behaviour that had to be preserved.
+- **Fix:** the run idempotency key and the run `triggerIdentity` now
+  embed the plan row's stored `source_date`:
+  `<app>:date-relative:<rule>:<version>:<scheduleKey>:<record>:<sourceDate>`
+  and `date-relative:<scheduleKey>:<sourceDate>`. `source_date` was
+  chosen over `dueAt` because it is the plan's stored generation input
+  -- the same value the execution-time staleness check already compares
+  the live record against -- whereas `dueAt` is a derived rendering of
+  it (source date + offset + wall time); keying on the input keeps the
+  identity stable and meaningful for both `field` and `createdAt`
+  sources. The S-02 gate's trigger-identity assertion was updated to
+  the new shape.
+- **Regression evidence (green):** both directions are gated in
+  `packages/db/test/p3-c-date-relative.test.cjs` --
+  (1) execute -> move date 2026-12-13 to 2026-12-20 -> new due date
+  executes a SECOND, distinct run whose idempotency key carries
+  `2026-12-20`, with a real second notification (per-run notification
+  counts 1 and 1, none duplicated); (2) same-source-date replay
+  (plan row rewound to its pre-finalize state, simulating a worker
+  that created the run but died before finalizing) still adopts the
+  existing run: run total unchanged, notification not duplicated,
+  plan finalized SUCCEEDED from the adopted outcome.
+
+### C1 -- 15-minute on-time grace boundary gates (injection-driven)
+
+- `processDateRelativeSchedules` now accepts `onTimeGraceMs`, the same
+  injection contract `processSchedules` already had; the default is
+  still `AUTOMATION_SCHEDULE_ON_TIME_GRACE_MS` (15 minutes), so
+  product behaviour is unchanged. The value is threaded into
+  `processDateRelativePlan`'s LATE classification.
+- Four boundary assertions, all with the grace injected explicitly
+  (15 minutes) and time injected via `now`:
+  - fixed cadence, slot consumed 14 minutes late -> executes on time
+    (slot COMPLETED, 1 run);
+  - fixed cadence, slot consumed 16 minutes late -> missed
+    (slot SKIPPED_MISSED under the default skip policy, 0 runs);
+  - date-relative, plan consumed 14 minutes late -> SUCCEEDED
+    (not counted late);
+  - date-relative, plan consumed 16 minutes late -> LATE
+    (executes, counted late, inside the 24h window).
+  Gates: "C1 grace boundary" tests in `p3-c-schedules.test.cjs` and
+  `p3-c-date-relative.test.cjs`.
+
+### C2 -- 100,000-record scale smoke (measured, standalone script)
+
+- Script: `packages/db/test/p3-c-scale-smoke.cjs` (deliberately NOT
+  matched by the `pnpm test` glob, so it stays out of the regular CI
+  suite). Run on the verification stack with:
+  `source <test-stack env> && node packages/db/test/p3-c-scale-smoke.cjs`
+- Fixture: one app, 100,000 stock records bulk-inserted directly into
+  `records` in 10 chunks of 10,000 (single `INSERT ... SELECT
+  generate_series` per chunk), each record also receiving its
+  `created` row in `record_events` in the same statement -- the same
+  complete stored shape and the same approach as the 2,000-record
+  backfill gate fixture. All records carry wish_date 2027-03-15, so
+  the -3d 09:00 Asia/Tokyo rule owes exactly 100,000 plans due
+  2027-03-12T00:00:00Z. Backfill ran with `now` long before any due
+  date (never executes); consumption ran at due + 5 minutes; both
+  phases used the product-default batch limit of 1,000.
+- Measured results (second, complete run; PASS):
+
+  | Measure | Expected | Actual |
+  | --- | --- | --- |
+  | Stock records | 100,000 | 100,000 (load 6.8s) |
+  | Generated plans | 100,000 | 100,000 |
+  | Duplicate plan groups (rule_version, record, schedule_key) | 0 | 0 |
+  | Backfill batches (cap 1,000) | 100 | 100 |
+  | Backfill time | -- | 487.6s |
+  | Consumption batches (cap 1,000) | 100 | 100 |
+  | Consumption time | -- | 3,284.9s |
+  | Executed plans | 100,000 | 100,000 (all finalized SUCCEEDED) |
+  | Runs | 100,000 | 100,000 |
+  | Duplicate run groups (idempotency key) | 0 | 0 |
+  | Notifications (one per run) | 100,000 | 100,000 |
+  | Backfill checkpoint | COMPLETED, processed 100,000, cursor = max record id | matches |
+
+  Total wall time 3,780.9s. The consumption rate (~30 plans/s) is the
+  per-plan claim + execution transaction cost on this stack; no errors,
+  no duplicates and no lost plans at this scale.
+
+### Evidence (this batch)
+
+- Verification stack: Postgres 16 (`suzubase_fresh46`) on
+  127.0.0.1:55436, API on 127.0.0.1:3102, `TEST_API_URL` +
+  `SUZUBASE_SYSTEM_NOTIFICATION_SECRET` injected (same口径 as
+  C-0..C-5).
+- Full suite: **138/138 pass** (134 C-5 baseline + 2 B1 gates + 2 C1
+  gates), no reruns. The C2 smoke is a standalone script and does not
+  add to the suite count.
+- `pnpm -r --workspace-concurrency=1 build` clean;
+  `pnpm -r --workspace-concurrency=1 typecheck` clean.
+- Hosted CI: see the stage summary below.
+
+### Commits (this batch)
+
+- `a4c4a7f` B1 reproduction tests (red) + same-date replay adoption guard
+- `9134d63` B1 fix: source date in date-relative run idempotency key
+  and trigger identity; S-02 identity assertion updated
+- `3d6b5e6` C1: `onTimeGraceMs` injection for
+  `processDateRelativeSchedules` + four grace-boundary gates
+- `e0af05a` C2: 100k scale smoke script
+- (this report commit)
+
+## P3-C stage summary
+
+P3-C is complete. Delivered on this branch, in order: the admission
+conditions C-0 (system actor for automation audit), C-1 (manual
+notification dedup hardening), C-2 (status-value disposition) and C-3
+(small items); the T-3 scheduling features -- C-4 fixed cadence
+(persistent cadence plans, stable slot keys, atomic claiming, missed
+policies, DST/month-end semantics, crash recovery, backlog alerting)
+and C-5 date-relative scheduling (per-record plans, checkpointed
+backfill, 24h late window with LATE/MISSED classification, aggregated
+MISSED alerting); and this fix batch, which closed the one blocking
+defect found in review (B1: reopened terminal plans now execute a new
+run per source date), pinned the 15-minute on-time grace boundary with
+injected tests on both scheduling kinds (C1), and proved the
+date-relative pipeline end-to-end at 100,000 records with zero
+duplicate plans or runs (C2). Final state: full suite 138/138 on the
+verification stack, workspace build and typecheck clean, hosted CI
+green on the pushed branch. Not merged to main; not deployed. P3-D
+(Webhook / M1 compatibility / overall acceptance) remains untouched,
+as ordered.
