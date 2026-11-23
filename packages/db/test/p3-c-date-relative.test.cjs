@@ -852,3 +852,55 @@ test('P3-C date-relative: B1 regression -- replay with the SAME source date adop
     assert.equal(plans[0].status, 'SUCCEEDED', 'adoption finalizes the plan from the old run outcome');
   } finally { await db.end(); }
 });
+
+test('P3-C date-relative: C1 grace boundary -- due consumed 14 minutes late is SUCCEEDED, 16 minutes late is LATE (injected grace)', async () => {
+  configureRuntime();
+  const owner = await provision({ isAdmin: true });
+  const token = await login(owner);
+  const app = await createApp(token, 'p3c-dr-c1-grace');
+  const base = `/apps/${app.id}`;
+  const wish = await addField(token, app.id, 'wish_date', 'date');
+  await publish(token, app.id);
+  const config = {
+    schemaVersion: 1,
+    trigger: { eventType: 'schedule.dateRelative', dateRelative: minus3At9Tokyo(wish.fieldId) },
+    conditions: emptyConditions,
+    actions: [{ actionId: randomUUID(), type: 'NOTIFY', notify: { recipientUserIds: [owner.userId], title: 'Reminder', body: 'due soon' } }],
+  };
+  const saved = await expectRequest(201, `${base}/automation/rules`, { token, method: 'POST', body: { name: 'C1 grace', config } });
+  await expectRequest(201, `${base}/automation/rules/${saved.rule.id}/grants`, {
+    token, method: 'POST', body: {
+      version: saved.version.version, sourceAppId: app.id, readableFieldIds: [wish.fieldId],
+      targetAppIds: [], writableFieldIds: [], allowedOperations: ['NOTIFY'],
+    },
+  });
+  await expectRequest(201, `${base}/automation/rules/${saved.rule.id}/publish`, { token, method: 'POST', body: { version: saved.version.version } });
+  await expectRequest(201, `${base}/automation/rules/${saved.rule.id}/enable`, { token, method: 'POST', body: { enabled: true } });
+  const onTimeRecord = await addRecord(token, base, { [wish.fieldId]: '2027-02-01' });
+  const lateRecord = await addRecord(token, base, { [wish.fieldId]: '2027-02-01' });
+  const engine = buildEngine();
+  const context = maintenanceContext(owner.tenantId);
+  await engine.processOutbox(context);
+  const db = await adminClient();
+  try {
+    // Drain the backfill first so its plan sync cannot reconcile the
+    // constructed due_at values below back to the computed ones.
+    await engine.processDateRelativeSchedules(context, { now: new Date('2027-01-01T00:00:00Z') });
+    const now = new Date('2027-01-15T12:00:00Z');
+    // Constructed plan rows: due 14 minutes ago (inside the injected
+    // 15-minute on-time grace) and 16 minutes ago (outside it), both
+    // far inside the 24h late window.
+    await db.query(`UPDATE automation_schedules SET due_at=$3 WHERE tenant_id=$1 AND rule_id=$2 AND record_id=$4`,
+      [owner.tenantId, saved.rule.id, new Date(now.getTime() - 14 * 60_000).toISOString(), onTimeRecord.id]);
+    await db.query(`UPDATE automation_schedules SET due_at=$3 WHERE tenant_id=$1 AND rule_id=$2 AND record_id=$4`,
+      [owner.tenantId, saved.rule.id, new Date(now.getTime() - 16 * 60_000).toISOString(), lateRecord.id]);
+    const result = await engine.processDateRelativeSchedules(context, { now, onTimeGraceMs: 15 * 60_000 });
+    assert.equal(result.executed, 2, 'both plans execute inside the 24h late window');
+    assert.equal(result.late, 1, 'C1: only the 16-minute plan counts as late');
+    const plans = await planRows(db, owner.tenantId, saved.rule.id);
+    const byRecord = new Map(plans.map((plan) => [plan.record_id, plan]));
+    assert.equal(byRecord.get(onTimeRecord.id).status, 'SUCCEEDED', 'C1: 14 minutes late executes as on-time SUCCEEDED');
+    assert.equal(byRecord.get(lateRecord.id).status, 'LATE', 'C1: 16 minutes late executes as LATE');
+    assert.equal((await runRows(db, owner.tenantId, saved.rule.id)).length, 2);
+  } finally { await db.end(); }
+});

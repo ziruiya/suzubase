@@ -1873,13 +1873,14 @@ export class AutomationService {
 
   async processDateRelativeSchedules(context: TenantContext, options: {
     now?: Date; batchLimit?: number; claimLeaseMs?: number;
-    lateWindowMs?: number; missedAlertThreshold?: number;
+    lateWindowMs?: number; missedAlertThreshold?: number; onTimeGraceMs?: number;
   } = {}) {
     const now = options.now ?? new Date();
     const batchLimit = options.batchLimit ?? AUTOMATION_SCHEDULE_BATCH_LIMIT;
     const leaseMs = options.claimLeaseMs ?? AUTOMATION_SCHEDULE_CLAIM_LEASE_MS;
     const lateWindowMs = options.lateWindowMs ?? AUTOMATION_DATE_RELATIVE_LATE_WINDOW_MS;
     const missedAlertThreshold = options.missedAlertThreshold ?? AUTOMATION_DATE_RELATIVE_MISSED_ALERT_THRESHOLD;
+    const graceMs = options.onTimeGraceMs ?? AUTOMATION_SCHEDULE_ON_TIME_GRACE_MS;
     const totals = {
       backfilledRecords: 0, backfillJobsCompleted: 0, claimed: 0,
       executed: 0, late: 0, missed: 0, invalidated: 0, cancelled: 0, failed: 0,
@@ -1910,7 +1911,7 @@ export class AutomationService {
     });
     let missedSample: typeof automationSchedules.$inferSelect | null = null;
     for (const planId of dueIds) {
-      const outcome = await this.processDateRelativePlan(context, planId, { now, leaseMs, lateWindowMs });
+      const outcome = await this.processDateRelativePlan(context, planId, { now, leaseMs, lateWindowMs, graceMs });
       if (!outcome) continue;
       totals.claimed++;
       if (outcome.executed) totals.executed++;
@@ -2028,9 +2029,9 @@ export class AutomationService {
   // idempotency key (which embeds the plan identity) makes resumption
   // duplicate-safe.
   private async processDateRelativePlan(context: TenantContext, planId: string, options: {
-    now: Date; leaseMs: number; lateWindowMs: number;
+    now: Date; leaseMs: number; lateWindowMs: number; graceMs: number;
   }) {
-    const { now, leaseMs, lateWindowMs } = options;
+    const { now, leaseMs, lateWindowMs, graceMs } = options;
     const claimToken = randomUUID();
     const claimed = await withTenantTransaction(context, async (tx) => {
       const result = await tx.execute(sql`
@@ -2100,7 +2101,7 @@ export class AutomationService {
         await finalize('CANCELLED', { invalidated: true, reason: 'conditions-not-met' });
         return { plan, cancelled: true };
       }
-      const late = lateMs > AUTOMATION_SCHEDULE_ON_TIME_GRACE_MS;
+      const late = lateMs > graceMs;
       // B1: the run identity embeds the plan source date. A terminal
       // plan reopened by a date change is a NEW logical execution
       // for the new date and must not adopt the old date run;

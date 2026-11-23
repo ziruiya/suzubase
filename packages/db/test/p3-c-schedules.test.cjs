@@ -464,3 +464,47 @@ test('P3-C cadence: lifecycle -- disable and grant revoke invalidate the plan; b
     assert.equal((await runRows(db, owner.tenantId, rule.id)).length, 0);
   } finally { await db.end(); }
 });
+
+test('P3-C cadence: C1 grace boundary -- slot consumed 14 minutes late executes on time, 16 minutes late is missed (injected grace)', async () => {
+  configureRuntime();
+  const { nextSlotAfter } = scheduleModule();
+  const graceMs = 15 * 60_000;
+  // 14 minutes late: inside the on-time grace, the slot executes.
+  {
+    const { owner, token, base, statusField, rule } = await createScheduleRule({ schedule: dailyTokyo, appCode: 'p3c-sch-c1-14' });
+    await addRecord(token, base, statusField, 'open');
+    const slot = nextSlotAfter(dailyTokyo, new Date('2026-06-01T00:00:00Z'));
+    const db = await adminClient();
+    try {
+      await setPlanDue(db, owner.tenantId, rule.id, slot);
+      const engine = buildEngine();
+      const result = await engine.processSchedules(maintenanceContext(owner.tenantId), {
+        now: new Date(slot.utc.getTime() + 14 * 60_000), onTimeGraceMs: graceMs,
+      });
+      assert.equal(result.runsCreated, 1, 'C1: 14 minutes late is still on time and executes');
+      const slots = await slotRows(db, owner.tenantId, rule.id);
+      assert.equal(slots.length, 1);
+      assert.equal(slots[0].status, 'COMPLETED');
+      assert.equal((await runRows(db, owner.tenantId, rule.id)).length, 1);
+    } finally { await db.end(); }
+  }
+  // 16 minutes late: beyond the grace, the slot is missed (skip policy).
+  {
+    const { owner, token, base, statusField, rule } = await createScheduleRule({ schedule: dailyTokyo, appCode: 'p3c-sch-c1-16' });
+    await addRecord(token, base, statusField, 'open');
+    const slot = nextSlotAfter(dailyTokyo, new Date('2026-06-01T00:00:00Z'));
+    const db = await adminClient();
+    try {
+      await setPlanDue(db, owner.tenantId, rule.id, slot);
+      const engine = buildEngine();
+      const result = await engine.processSchedules(maintenanceContext(owner.tenantId), {
+        now: new Date(slot.utc.getTime() + 16 * 60_000), onTimeGraceMs: graceMs,
+      });
+      assert.equal(result.runsCreated, 0, 'C1: 16 minutes late is missed and never executes');
+      const slots = await slotRows(db, owner.tenantId, rule.id);
+      assert.equal(slots.length, 1);
+      assert.equal(slots[0].status, 'SKIPPED_MISSED');
+      assert.equal((await runRows(db, owner.tenantId, rule.id)).length, 0);
+    } finally { await db.end(); }
+  }
+});
