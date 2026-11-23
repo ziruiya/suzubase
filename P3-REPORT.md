@@ -462,3 +462,158 @@ safety net, exercised only by the migration text itself.
   disclosure, UI status filter + resume/FAILED hints, P3-B report
   dedup
 - (this report commit)
+
+## C-4 Fixed cadence scheduling (T-3 upper half): plans, slot keys, claiming, missed policy, DST/month-end, recovery, backlog
+
+### Deviations and decisions (read first)
+
+1. **Missed-slot boundary (builder-chosen operational definition, flagged
+   for review):** the brief says missed periods are skipped by default
+   and only a controlled catch-up may run the most recent one, but does
+   not define when a due slot becomes "missed" for a worker that polls
+   every 60 seconds. This block defines it as
+   `AUTOMATION_SCHEDULE_ON_TIME_GRACE_MS` = 15 minutes: a slot first
+   processed within 15 minutes of its scheduled instant is on time and
+   executes under both policies; a slot first seen later is missed.
+   Default `skip` then never executes missed slots (plan advances to
+   the next valid period); `catch_up_latest` executes exactly the most
+   recent missed slot, marked as catch-up. All gate tests below are
+   written against this definition.
+2. **New plan tables instead of bending `automation_schedules`:**
+   migration 0045 adds `automation_cadence_plans` (one row per rule
+   version) and `automation_cadence_slots` (one row per period). The
+   P3-A `automation_schedules` table is per-record (`record_id` NOT
+   NULL) and remains the date-relative wave's table, untouched; the
+   brief's §3.1 persisted fields (timezone / cadence / local_time /
+   next_due_at / last_completed_slot / missed_run_policy) live on the
+   cadence plan row.
+3. **Timezone conversion uses the platform IANA database via Intl**
+   (Node ICU) — no new dependency and no hand-written offset tables.
+   DST gap/fold resolution enumerates the UTC candidates whose zone
+   rendering equals the requested wall time: zero candidates = gap,
+   two = fold (first wins).
+4. **Scope boundary kept:** date-relative scheduling (T-3 lower half)
+   is not implemented here; no email, no generic job platform, no
+   Redis/queue. The worker's existing maintenance loop drives
+   `processSchedules` once per pass per tenant.
+
+### Implementation
+
+- **Trigger configuration:** `trigger.eventType = 'schedule.fixed'` with
+  `trigger.schedule { cadence, localTime, timezone, weekdays?,
+  monthDay?, missedRunPolicy? }`. The write-path Zod schema rejects
+  illegal cadence forms, `HH:MM` violations, non-IANA timezones,
+  duplicate/missing weekdays and missing/out-of-range month days;
+  `validateVersion` re-checks the same rules at preflight/publish with
+  `SCHEDULE_*` blocking findings, so a stored version cannot bypass
+  validation through any path.
+- **Plan generation & lifecycle:** publish creates the new version's
+  plan and invalidates the superseded version's; enable refreshes /
+  revives the current version's plan; disable invalidates it
+  (`rule-disabled`); grant revoke invalidates that version's plan
+  (`grant-revoked`); archive invalidates all; re-granting an enabled
+  rule's current version revives it. The worker also lazily ensures
+  plans for enabled schedule rules with an active grant. Unique
+  `(tenant, rule, rule_version)` per plan.
+- **Slot keys & next-due:** slot key = `<cadence>:<scheduled local
+  date>` in the rule's IANA timezone; `next_due_at` is stored in UTC.
+  Monthly day 31 clamps to the month's last day. A DST-gap slot keeps a
+  pseudo-instant so it becomes due, is recorded
+  `SKIPPED_NONEXISTENT_TIME` on the slot row, and the plan moves on; a
+  DST-fold slot pins the first occurrence only.
+- **Claiming:** one conditional `UPDATE ... SET claim_token, claimed_at
+  WHERE status='ACTIVE' AND next_due_at <= now AND (claim free OR
+  lease expired)` per plan — concurrent workers race on the row and
+  exactly one wins (5-minute claim lease,
+  `AUTOMATION_SCHEDULE_CLAIM_LEASE_MS`).
+- **Execution:** due slots are classified (nonexistent / missed /
+  on-time) under the missed policy; surviving slots get a CLAIMED slot
+  row with a fresh `batch_id`. Candidate records are scanned in stable
+  id order, filtered by the rule's two condition groups, and each
+  matching record gets one run through the SAME engine as event runs
+  (`executeActions`, grant revalidation via `grantCoversExecution`,
+  approver-delegated context), sharing the slot's `batch_id`, with
+  `trigger_identity = schedule:<slot key>` (`:catchup` suffix for
+  catch-up runs) and run idempotency key
+  `<app>:schedule:<rule>:<version>:<slot key>:<record>`.
+- **Batching & recovery:** at most 1,000 candidates per pass
+  (`AUTOMATION_SCHEDULE_BATCH_LIMIT`); the slot checkpoint (cursor
+  record id + processed count) is persisted in the same transaction as
+  each record's run. A slot left CLAIMED by a dead worker is resumed
+  after its lease from the checkpoint; run idempotency keys make
+  resumption duplicate-safe, and a due-pass that finds a slot already
+  CLAIMED leaves the plan untouched (in-flight guard).
+- **Backlog & alerting:** due ACTIVE plans are counted every pass;
+  `GET /apps/:appId/automation/summary` now also returns
+  `scheduleBacklog` and `scheduleInFlight`. Above
+  `AUTOMATION_SCHEDULE_BACKLOG_ALERT_THRESHOLD` (100), tenant admins
+  get one SYSTEM notification (`AUTOMATION_SCHEDULE_BACKLOG`, daily
+  dedup key, C-0 SYSTEM actor口径 via the audit row
+  `SCHEDULE_BACKLOG_ALERT`, throttled to one audit row per 24h).
+
+### Gate evidence (all in `packages/db/test/p3-c-schedules.test.cjs`, 10 tests)
+
+- Default skip across ≥2 missed periods: 4 due slots all
+  `SKIPPED_MISSED`, 0 runs, plan advanced past recovery time; the next
+  live cycle then executes exactly once.
+- Controlled catch-up: same downtime with `catch_up_latest` produces
+  exactly 1 run batch for the most recent missed slot
+  (`is_catchup = true`, trigger identity ends `:catchup`); the 3 older
+  slots stay `SKIPPED_MISSED`.
+- Month-end: monthly day-31 rule resolves February 2026 to
+  `monthly:2026-02-28`, fires once, next slot `monthly:2026-03-31`.
+- DST (America/New_York): 2026-03-08 02:30 slot recorded
+  `SKIPPED_NONEXISTENT_TIME` with 0 runs and the plan advanced to
+  2026-03-09; 2026-11-01 01:30 fold has 2 UTC candidates, executes at
+  the first, and a scan at the second occurrence creates nothing.
+- Slot-key anti-duplication: a duplicate scan of the same period
+  creates no second batch (also asserted inside the on-time and
+  month-end tests).
+- Concurrent claiming: two parallel `processSchedules` passes over the
+  same due plan create exactly one run per record and one COMPLETED
+  slot.
+- Crash recovery + 1,000-limit continuation (batch limit injected as 2
+  against 5 records): first pass stops at checkpoint 2 with the slot
+  CLAIMED; recovery resumes, completes at processed_count 5, all 5
+  runs share the original batch, zero duplicate runs. Production batch
+  constant remains 1,000.
+- Lifecycle & backlog: summary exposes `scheduleBacklog`; a forced
+  threshold produces the SYSTEM admin notification + audit row;
+  disable → plan INVALIDATED (`rule-disabled`) and the due slot never
+  fires; re-enable revives; grant revoke → INVALIDATED
+  (`grant-revoked`) and no runs.
+- Config validation: 8 illegal schedule shapes rejected with 400 at
+  the API; a tampered draft version's timezone is blocked at preflight
+  with `SCHEDULE_TIMEZONE_INVALID`.
+
+### Evidence (this block)
+
+- Verification stack: Postgres 16 on 127.0.0.1:55436, API on
+  127.0.0.1:3101, `TEST_API_URL` + `SUZUBASE_SYSTEM_NOTIFICATION_SECRET`
+  injected (same口径 as C-0/C-1–C-3).
+- Build clean; `pnpm -r typecheck` clean (4 packages).
+- Migrations: 0045 applied incrementally on the verification stack
+  (46 total) and from zero on a fresh database (46 applied;
+  automation subset p3-a + p3-b actions + p3-c system actor +
+  p3-c admission + p3-c schedules + migration = 24/24 pass there).
+  `migration.test.cjs`'s hard-coded table list gained the two new
+  tables (the list is maintained per migration, as with 0040).
+- Full suite: **123/123 pass** (113 C-1–C-3 baseline + 10 new
+  `p3-c-schedules` tests), no reruns needed. First full run was 122/123
+  with only the migration table-list assertion failing; fixed and the
+  unchanged rerun is 123/123.
+- Audit tool: fresh database — all checks PASS. Long-lived
+  verification database — check 1 passed first try this block; check
+  3c still flags exactly the same 2 pre-change legacy notifications
+  disclosed under C-1.2 (count unchanged by this block; schedule
+  notifications carry the C-1 payload linkage and reconcile on the
+  fresh database).
+
+### Commits (this block)
+
+- `72a2827` P3-C cadence code + tests: migration 0045, cadence plan /
+  slot tables, schedule trigger schema + preflight validation, plan
+  lifecycle hooks, `processSchedules` (claim / missed policy / batched
+  execution / resume / backlog alert), worker wiring, summary backlog
+  fields, 10 gate tests
+- (migration table-list fix + this report commit)
