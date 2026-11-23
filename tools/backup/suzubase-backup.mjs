@@ -27,8 +27,17 @@
 //   ADMIN_DATABASE_URL         admin connection for pg_dump / pg_restore
 //   ATTACHMENT_DIRECTORY       attachment root on this host (direct mode)
 //   SUZUBASE_CONFIG_FILES      comma-separated config files to include
-//   SUZUBASE_APP_VERSION       application version stamped into the manifest
-//                              (default: read from the API /health deployment, else "unknown")
+//   SUZUBASE_APP_VERSION       semantic application version stamped into the
+//                              manifest (e.g. "1.1.0"). A non-semver value is
+//                              NEVER used as appVersion: deployments have
+//                              stamped git short SHAs here, which made every
+//                              set fail the restore version gate. A non-semver
+//                              value is recorded as buildCommit instead.
+//                              Default: the repository root package.json
+//                              "version" (kept in sync with PROGRAM_VERSION in
+//                              apps/api/src/import.ts), else "unknown".
+//   SUZUBASE_BUILD_COMMIT      build commit recorded in the manifest as
+//                              metadata only; never used as appVersion.
 //   SUZUBASE_HEALTH_URL        health endpoint checked after restore
 //   SUZUBASE_PG_DUMP_CMD / SUZUBASE_PG_RESTORE_CMD / SUZUBASE_PGSQL_CMD
 //                              command templates for containerised deployments,
@@ -57,6 +66,29 @@ const SUPPORTED_APP_MAJORS = ['1'];
 const backupDir = resolve(process.env.SUZUBASE_BACKUP_DIR ?? './backups');
 const retention = Number(process.env.SUZUBASE_BACKUP_RETENTION ?? 7);
 const logFile = resolve(process.env.SUZUBASE_BACKUP_LOG ?? join(backupDir, 'backup.log'));
+
+const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+
+// Resolve the version facts stamped into a new backup set's manifest.
+// appVersion must stay a semantic version: the restore gate reads its major.
+// A non-semver SUZUBASE_APP_VERSION (e.g. a git short SHA such as "3528953")
+// is build metadata and is diverted to buildCommit.
+function deploymentVersion() {
+  const envVersion = process.env.SUZUBASE_APP_VERSION?.trim();
+  let appVersion = null;
+  let buildCommit = process.env.SUZUBASE_BUILD_COMMIT?.trim() || null;
+  if (envVersion) {
+    if (SEMVER_PATTERN.test(envVersion)) appVersion = envVersion;
+    else if (!buildCommit) buildCommit = envVersion;
+  }
+  if (!appVersion) {
+    try {
+      const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+      if (pkg.version && SEMVER_PATTERN.test(String(pkg.version))) appVersion = String(pkg.version);
+    } catch { /* no readable package.json: fall through to "unknown" */ }
+  }
+  return { appVersion: appVersion ?? 'unknown', buildCommit };
+}
 
 function log(line) {
   const stamped = `[${new Date().toISOString()}] ${line}`;
@@ -306,11 +338,13 @@ async function create(label) {
       if (existsSync(configFile)) cpSync(configFile, join(setDir, 'config', basename(configFile)));
     }
     const facts = await databaseFacts();
+    const versionFacts = deploymentVersion();
     const manifest = {
       format: BACKUP_FORMAT, name, createdAt: new Date().toISOString(),
       sensitiveData: true,
       notice: 'This backup set contains complete business data. Store and transfer it as sensitive data.',
-      appVersion: process.env.SUZUBASE_APP_VERSION ?? 'unknown',
+      appVersion: versionFacts.appVersion,
+      ...(versionFacts.buildCommit ? { buildCommit: versionFacts.buildCommit } : {}),
       databaseMigrations: facts.migrations,
       files: await buildManifest(setDir),
     };
