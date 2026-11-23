@@ -221,7 +221,7 @@ test('P3-C date-relative: S-02 form -- wish_date minus 3 days at 09:00 tenant ti
     const runs = await runRows(db, owner.tenantId, rule.id);
     assert.equal(runs.length, 1);
     assert.equal(runs[0].status, 'SUCCEEDED');
-    assert.equal(runs[0].trigger_identity, `date-relative:${plan.schedule_key}`);
+    assert.equal(runs[0].trigger_identity, `date-relative:${plan.schedule_key}:2026-12-13`, 'B1: trigger identity carries the source date');
     assert.equal(runs[0].record_id, record.id);
     const after = await planRows(db, owner.tenantId, rule.id);
     assert.equal(after[0].status, 'SUCCEEDED');

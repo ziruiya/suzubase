@@ -2101,7 +2101,13 @@ export class AutomationService {
         return { plan, cancelled: true };
       }
       const late = lateMs > AUTOMATION_SCHEDULE_ON_TIME_GRACE_MS;
-      const identity = `${plan.appId}:date-relative:${plan.ruleId}:${plan.ruleVersion}:${plan.scheduleKey}:${plan.recordId}`;
+      // B1: the run identity embeds the plan source date. A terminal
+      // plan reopened by a date change is a NEW logical execution
+      // for the new date and must not adopt the old date run;
+      // replaying the SAME source date keeps the same identity,
+      // so crash recovery still adopts the existing run and
+      // never executes or notifies twice.
+      const identity = `${plan.appId}:date-relative:${plan.ruleId}:${plan.ruleVersion}:${plan.scheduleKey}:${plan.recordId}:${plan.sourceDate}`;
       const [existingRun] = await tx.select({ id: automationRuns.id, status: automationRuns.status })
         .from(automationRuns).where(and(eq(automationRuns.tenantId, context.tenantId),
           eq(automationRuns.idempotencyKey, identity)));
@@ -2117,7 +2123,7 @@ export class AutomationService {
       const [run] = await tx.insert(automationRuns).values({
         id: runId, tenantId: context.tenantId, appId: plan.appId, ruleId: plan.ruleId,
         ruleVersion: plan.ruleVersion, eventId: null,
-        triggerIdentity: `date-relative:${plan.scheduleKey}`,
+        triggerIdentity: `date-relative:${plan.scheduleKey}:${plan.sourceDate}`,
         idempotencyKey: identity, recordId: plan.recordId, batchId,
         rootCausationId: batchId, parentRunId: null, causationDepth: 1,
         originRuleId: plan.ruleId, originActionId: null, status: 'RUNNING',
