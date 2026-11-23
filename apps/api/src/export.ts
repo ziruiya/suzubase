@@ -205,9 +205,11 @@ export class ExportService {
         version: row.version, aclConfiguration: row.aclConfiguration, fieldEdits: row.fieldEdits,
         formLayout: row.formLayout, notificationRules: row.notificationRules,
         viewConfiguration: row.viewConfiguration, migrationReport: row.migrationReport,
-        // P4-T1 (pending merge version decision): the category tree is an
-        // additive key inside the existing schema.json versions section;
-        // pre-P4 importers ignore the unknown key.
+        // P4-T1: the category tree is an additive key inside the existing
+        // schema.json versions section. Pre-P4 importers would ignore the
+        // unknown key, which is exactly why the P4 merge raised
+        // MINIMUM_PROGRAM_VERSION to 1.1.0: they reject P4 packages
+        // explicitly at the preflight gate instead of dropping this data.
         categories: row.categoryConfiguration,
         fields: await this.schema.getFields(tx, context, appId, row.version),
       });

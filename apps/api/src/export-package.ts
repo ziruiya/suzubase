@@ -44,7 +44,19 @@ import { strToU8, unzipSync, zipSync } from 'fflate';
  *    below is shown on the export confirmation surface and in reports.
  */
 export const PACKAGE_FORMAT_VERSION = '1.0';
-export const MINIMUM_PROGRAM_VERSION = '1.0.0';
+/**
+ * Minimum program version written into every exported package.
+ * Raised 1.0.0 -> 1.1.0 at the P4 merge finalization (brief-p4 §2): P4
+ * packages can carry category trees/assignments (schema.json/records.json
+ * additive keys) and subtable attachment references, which pre-P4
+ * importers would silently drop or misread. The format itself is
+ * unchanged (still '1.0', same files, additive keys only), so the floor
+ * is the lever: pre-P4 deployments (PROGRAM_VERSION 1.0.0) reject new
+ * packages explicitly at the import preflight gate instead of importing
+ * them partially. Packages exported before P4 carry '1.0.0' and stay
+ * importable here (additive compatibility).
+ */
+export const MINIMUM_PROGRAM_VERSION = '1.1.0';
 export const SENSITIVE_DATA_NOTICE =
   'This package contains complete business data (records, comments and history). Store and transfer it as sensitive data. Checksums prove the package was not modified; they are not a confidentiality measure.';
 
