@@ -274,3 +274,130 @@ Hosted CI history on this branch, stated exactly:
 - Every commit from the checkpoint (`b56db33`) through `f96d660` failed at the post-suite audit step (check 3b) — root cause in the C5 note above, fixed by the audit rescoping commit.
 - `d1fb64f` (audit rescoping): hosted CI **success**.
 - `3868b4f` (this report): first hosted run failed the audit step again, this time on check 1 (history-vs-revision sample: 1 problem record). Root cause identified and reproduced locally (2 of 10 local audit runs): the M3 staged-import test population creates records with no `record_events` (its tenants hold import jobs and zero record events), a pre-existing P2-era artifact unrelated to P3-B; the audit's random 20-record sample hits one intermittently (~10%). The failed job was re-run unchanged: **success**. This flake is disclosed rather than fixed here because the import path is outside P3-B scope; it is flagged for the M3 follow-up batch.
+
+---
+
+# P3-C Scheduled Execution - In Progress
+
+Branch: `p3-c-automation-schedules` (from P3-B `0dc4140`). Not merged to main; not deployed.
+This section currently covers only admission condition C-0. The P3-C scheduling
+features themselves (T-3 fixed cadence / date-relative plans) are not started yet,
+and C-1 / C-2 / C-3 are untouched except the single pruning item noted under C-0
+(the `pruneRunHistory` NOT IN → NOT EXISTS change, which belongs to C-3 but is
+directly tied to the pruning path fixed here).
+
+## C-0 System actor for automation audit (GPT P3-B review condition 1)
+
+### Problem (as admitted)
+
+The production worker drives `processOutbox` and `pruneRunHistory` with
+`maintenanceTenants()` contexts whose `userId` is the nil UUID — not a
+`tenant_members` row. The RATE_LIMITED / BACKLOG_LIMITED audit inserts used that
+value as `automation_audit_events.actor_id`, which has a composite FK to
+`tenant_members`. In production, the first rate/backlog trigger would violate
+the FK, roll back the whole outbox transaction, and the same events would fail
+again every 60 seconds. The P3-B guardrail suite only ever used a real owner
+context, so this path was unproven. `pruneRunHistory` never wrote its
+RUN_HISTORY_PRUNED audit row for the same reason (P3-B report deviation 3).
+
+### Reproduction first (red), then fix (green)
+
+New suite `packages/db/test/p3-c-system-actor.test.cjs` (committed separately,
+before the fix, as `ef4b902`) drives both functions with a frozen
+`{ tenantId, userId: '00000000-0000-0000-0000-000000000000' }` context — the exact
+`maintenanceTenants()` shape. On the P3-B base it failed exactly as predicted:
+
+- `processOutbox` (rate-limit leg) rejected with
+  `insert or update on table "automation_audit_events" violates foreign key
+  constraint "automation_audit_events_tenant_id_actor_id_fkey"` on the
+  RATE_LIMITED insert with the nil-UUID actor.
+- `pruneRunHistory` pruned 0 runs (expected 1): the `NOT IN` exclusion returned
+  UNKNOWN for every run because the fixture includes a problem chain whose
+  `last_run_id` is NULL.
+
+After the fix both tests pass, including assertions that the guardrail events
+stay unprocessed, that problem-chain-referenced runs survive pruning, that
+pruned action rows are deleted, and that pre-existing audit events survive.
+
+### Chosen solution: (a) nullable actor_id + dedicated actor_type
+
+Migration `0043_p3c_system_actor.sql`:
+
+- `automation_audit_events.actor_id` drops NOT NULL (the composite FK to
+  `tenant_members` stays and still applies whenever an actor is present).
+- New column `actor_type text NOT NULL DEFAULT 'USER'` with
+  CHECK `IN ('USER','SYSTEM')` and a consistency CHECK:
+  `USER` rows must carry a non-null member actor; `SYSTEM` rows must carry
+  `actor_id IS NULL`. Existing rows default to `USER` and already satisfy it.
+- Drizzle schema (`packages/db/src/schema.ts`) mirrors both checks.
+
+Code (`apps/api/src/automation.ts`): `auditActor(context)` maps the nil-UUID
+maintenance identity to `{ actorId: null, actorType: 'SYSTEM' }` and every
+other context to its real member id with `'USER'`. RATE_LIMITED and
+BACKLOG_LIMITED inserts use it. All other audit writes (rule/grant/publish/
+enable/retry/manual/chain-resume) keep the real member actor unchanged.
+
+Why (a): it is the smallest change that keeps the signal inside the existing
+audit table and transaction — the rate/backlog evidence remains atomically
+bound to the outbox pass that produced it, with rule, version, event and limit
+details intact. The audit query API already modelled `actorId` as nullable,
+and the audit-integrity tool does not key any check on the automation audit
+actor, so the blast radius is one column pair on one table.
+
+Why not (b) a dedicated system member per tenant: it would fabricate a
+`tenant_members` row that is not a person — it would surface in member lists,
+admin/recipient resolution and counts, could be assigned or notified, and
+needs provisioning/backfill for every existing and future tenant plus guards
+against login/disable/deletion. It also makes system actions read as if a
+member performed them, weakening exactly the distinction the audit exists to
+keep.
+
+Why not (c) moving the signals out of the outbox transaction: decoupling the
+signal write from event consumption means the guardrail can fire (and be
+retried every 60 s) with no durable evidence when the separate write fails,
+or evidence can be written for a pass that later rolls back. It also creates
+a second write path to keep consistent, for a problem that is purely about
+actor representation, not about transaction boundaries.
+
+### Audit-integrity impact
+
+- No audit row is lost or weakened: RATE_LIMITED / BACKLOG_LIMITED rows are
+  still written per candidate rule with the same details payload
+  (rootCausationId, eventId, limit / pendingCount).
+- Traceability changes form, not content: "who" for a system action is now
+  explicitly `actor_type='SYSTEM'` + `actor_id NULL` instead of a member id;
+  member actions are unchanged and still FK-bound to a real member.
+- RUN_HISTORY_PRUNED (already present in the audit action CHECK since 0041)
+  is now actually written: one row per (app, rule, version) group per pruning
+  pass, `details = { prunedCount, retentionDays: 90 }`, with the caller's
+  audit actor (SYSTEM under the worker). The P3-B retention test was updated
+  accordingly: pre-existing audit events are never pruned; exactly the prune
+  row is added (under an owner context it carries that owner as USER actor).
+- Append-only protections on the audit table are untouched.
+
+### Included C-3 pruning item
+
+`pruneRunHistory`'s problem-chain exclusion changed from `NOT IN (SELECT
+last_run_id ...)` to `NOT EXISTS` correlated on `last_run_id = run.id`, so a
+chain row with `last_run_id NULL` no longer silently disables all pruning.
+Covered by the NULL-chain leg of the new C-0 prune test.
+
+### Evidence
+
+- Verification stack: dedicated Postgres 16 container on 127.0.0.1:55436 and
+  API on 127.0.0.1:3101 in the `suzubase-build-p3b` clone, with
+  `TEST_API_URL` and `SUZUBASE_SYSTEM_NOTIFICATION_SECRET` injected.
+- Build: `pnpm -r --workspace-concurrency=1 build` clean; typecheck clean.
+- Migrations from zero: covered by the in-suite migration test (journal now
+  44 entries, 0043 included); 0043 also applied incrementally on the
+  verification stack (44 applied in total).
+- Full suite: **110/110 pass** (108 P3-B baseline + 2 new C-0 tests), no
+  reruns needed. Post-suite `audit-integrity --sample 20`: all 6 checks PASS,
+  0 failures (the known check-1 M3 flake did not occur in this run).
+
+### Commits
+
+- `ef4b902` P3-C C-0 reproduction tests (red on P3-B base)
+- `5006ca4` P3-C C-0 fix (option a): migration 0043, schema, engine, P3-B
+  retention-test update
+- (this report commit)
