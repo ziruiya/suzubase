@@ -183,7 +183,11 @@ The checkpoint was audited before any new feature work was layered on it. Findin
 
 ## Hosted CI
 
-Hosted CI failed at the post-suite audit step for every branch commit from the checkpoint onward (root cause: C5 note above). The rescoped audit passes locally against the post-suite database; the final branch HEAD's hosted run is reported with this delivery.
+Hosted CI history on this branch, stated exactly:
+
+- Every commit from the checkpoint (`b56db33`) through `f96d660` failed at the post-suite audit step (check 3b) — root cause in the C5 note above, fixed by the audit rescoping commit.
+- `d1fb64f` (audit rescoping): hosted CI **success**.
+- `3868b4f` (this report): first hosted run failed the audit step again, this time on check 1 (history-vs-revision sample: 1 problem record). Root cause identified and reproduced locally (2 of 10 local audit runs): the M3 staged-import test population creates records with no `record_events` (its tenants hold import jobs and zero record events), a pre-existing P2-era artifact unrelated to P3-B; the audit's random 20-record sample hits one intermittently (~10%). The failed job was re-run unchanged: **success**. This flake is disclosed rather than fixed here because the import path is outside P3-B scope; it is flagged for the M3 follow-up batch.
 
 ---
 
@@ -265,4 +269,8 @@ The checkpoint was audited before any new feature work was layered on it. Findin
 
 ## Hosted CI
 
-Hosted CI failed at the post-suite audit step for every branch commit from the checkpoint onward (root cause: C5 note above). The rescoped audit passes locally against the post-suite database; the final branch HEAD's hosted run is reported with this delivery.
+Hosted CI history on this branch, stated exactly:
+
+- Every commit from the checkpoint (`b56db33`) through `f96d660` failed at the post-suite audit step (check 3b) — root cause in the C5 note above, fixed by the audit rescoping commit.
+- `d1fb64f` (audit rescoping): hosted CI **success**.
+- `3868b4f` (this report): first hosted run failed the audit step again, this time on check 1 (history-vs-revision sample: 1 problem record). Root cause identified and reproduced locally (2 of 10 local audit runs): the M3 staged-import test population creates records with no `record_events` (its tenants hold import jobs and zero record events), a pre-existing P2-era artifact unrelated to P3-B; the audit's random 20-record sample hits one intermittently (~10%). The failed job was re-run unchanged: **success**. This flake is disclosed rather than fixed here because the import path is outside P3-B scope; it is flagged for the M3 follow-up batch.
