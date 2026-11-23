@@ -8,6 +8,11 @@ import { ImportExecutionService, ImportFinalizer, ImportOrchestrator, ImportServ
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
 import { AutomationService } from './automation';
+import { NotificationPlanner } from './notification-planner';
+import { RecordQueryService } from './record-query';
+import { FileService } from './files';
+import { RecordService } from './records';
+import { WorkflowRuntimeService } from './workflow-runtime';
 
 function configuredInteger(name: string, fallback: number) {
   const value = Number(process.env[name] ?? fallback);
@@ -50,9 +55,17 @@ async function main() {
           if (once) process.exitCode = 1;
         }
         try {
-          const schema = new AppSchemaService(new AuthorizationService());
-          const automation = await new AutomationService(schema, new AuthorizationService()).processOutbox(context);
-          if (automation.events || automation.createdRuns) console.info('Automation outbox', { tenantId: context.tenantId, ...automation });
+          const authorization = new AuthorizationService();
+          const schema = new AppSchemaService(authorization);
+          const planner = new NotificationPlanner(schema, authorization);
+          const automation = new AutomationService(schema, authorization,
+            new RecordService(schema, authorization, new RecordQueryService(schema, authorization),
+              new FileService(schema, authorization), planner),
+            new WorkflowRuntimeService(schema, authorization, planner));
+          const processed = await automation.processOutbox(context);
+          if (processed.events || processed.createdRuns) console.info('Automation outbox', { tenantId: context.tenantId, ...processed });
+          const pruned = await automation.pruneRunHistory(context);
+          if (pruned.pruned) console.info('Automation run history pruned', { tenantId: context.tenantId, ...pruned });
         } catch (error) {
           console.error('Automation worker failed', { tenantId: context.tenantId, error });
           if (once) process.exitCode = 1;

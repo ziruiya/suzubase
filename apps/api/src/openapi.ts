@@ -296,6 +296,24 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   [applications + '/automation/rules/{ruleId}']: {
     delete: { reply: z.looseObject({ archived: z.literal(true) }), conflict: errorSchema },
   },
+  [applications + '/automation/runs']: {
+    get: { reply: automationHttp.runPage },
+  },
+  [applications + '/automation/runs/{runId}']: {
+    get: { reply: automationHttp.runDetail },
+  },
+  [applications + '/automation/runs/{runId}/retry']: {
+    post: { reply: z.looseObject({ runId: id, status: z.string() }), conflict: errorSchema },
+  },
+  [applications + '/automation/rules/{ruleId}/manual-runs']: {
+    post: { body: automationHttp.manualRunInput, reply: automationHttp.runDetail, conflict: errorSchema },
+  },
+  [applications + '/automation/audit']: {
+    get: { reply: automationHttp.auditPage },
+  },
+  [applications + '/automation/summary']: {
+    get: { reply: automationHttp.summary },
+  },
   [applications + '/publish']: { post: { body: appHttp.publishInput, optionalBody: true,
     reply: app.extend({ migrationReport: migrationReport.optional(), skippedDependencies: z.array(text), resolvedDependencies: z.array(z.looseObject({ fieldId: text, dependency: text, reason: text })) }), conflict: publishConflict } },
   [records]: { get: { query: recordHttp.pageInput, reply: page(record) }, post: { body: recordHttp.createInput, reply: record, conflict: errorSchema } },

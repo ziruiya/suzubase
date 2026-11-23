@@ -1,19 +1,23 @@
 import {
-  BadRequestException, Body, ConflictException, Controller, Delete, Get, Injectable, NotFoundException, Param, Post, Put, UseGuards,
+  BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Injectable, NotFoundException, Param, Post, Put, Query, UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
   and, apps, automationAuditEvents, automationGrants, automationRuleVersions, automationRunActions, automationRuns,
-  automationRules, automationProblemChains, eq, isNull, notifications, outbox, records, sql, tenantMembers, TenantContext, TenantTransaction, withTenantTransaction,
+  automationRules, automationProblemChains, eq, groupMembers, inArray, isNull, notifications, outbox, records, sql, tenantMembers, TenantContext, TenantTransaction, withTenantTransaction, workflowAssignments,
   type AutomationRuleConfig,
 } from '@suzubase/db';
-import { fieldContract, multiOptionFieldTypes, type FieldDefinition } from '@suzubase/shared-types';
+import { fieldContract, multiOptionFieldTypes, type FieldDefinition, type RecordData, type RecordResponse } from '@suzubase/shared-types';
 import Decimal from 'decimal.js';
 import { z } from 'zod';
 import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
 import { normalizeValue } from './field-values';
+import { serializeRecord } from './record-events';
+import { RecordService } from './records';
+import { WorkflowRuntimeService } from './workflow-runtime';
+import { randomUUID } from 'node:crypto';
 import { identifier, parseInput } from './validation';
 
 const eventTypes = ['record.created', 'record.updated', 'record.deleted', 'workflow.transitioned', 'workflow.rejected'] as const;
@@ -48,6 +52,7 @@ const config = z.strictObject({
     newValue: z.unknown().optional(),
     fromStateId: identifier.optional(),
     toStateId: identifier.optional(),
+    allowManual: z.boolean().optional(),
   }),
   conditions: z.strictObject({
     eventSnapshot: conditionGroup,
@@ -58,6 +63,27 @@ const config = z.strictObject({
     type: z.enum(['NOTIFY', 'UPDATE_FIELDS', 'CREATE_RECORD', 'ADVANCE_WORKFLOW', 'WEBHOOK']),
     targetAppId: identifier.optional(),
     targetFieldIds: z.array(identifier).max(100).optional(),
+    notify: z.strictObject({
+      recipientUserIds: z.array(identifier).max(100).optional(),
+      recipientGroupIds: z.array(identifier).max(50).optional(),
+      recipientFieldId: identifier.optional(),
+      recipientAssignee: z.boolean().optional(),
+      title: z.string().max(200).optional(),
+      body: z.string().max(2000).optional(),
+    }).optional(),
+    updates: z.array(z.strictObject({
+      fieldId: identifier,
+      mode: z.enum(['set', 'increment', 'decrement', 'clear', 'copy']),
+      value: z.unknown().optional(),
+      sourceFieldId: identifier.optional(),
+    })).max(100).optional(),
+    mappings: z.array(z.strictObject({
+      targetFieldId: identifier,
+      mode: z.enum(['constant', 'source']),
+      value: z.unknown().optional(),
+      sourceFieldId: identifier.optional(),
+    })).max(100).optional(),
+    workflowActionId: identifier.optional(),
   })).max(50).refine((actions) => new Set(actions.map(({ actionId }) => actionId)).size === actions.length),
 }).superRefine((value, ctx) => {
   const { trigger } = value;
@@ -69,6 +95,55 @@ const config = z.strictObject({
   }
   if (trigger.eventType.startsWith('workflow.') && !trigger.toStateId) {
     ctx.addIssue({ code: 'custom', message: 'Workflow triggers require a target state' });
+  }
+  const sameIds = (left: string[], right: string[]) =>
+    left.length === right.length && left.every((id) => right.includes(id));
+  for (const action of value.actions) {
+    if (action.type === 'NOTIFY') {
+      const notify = action.notify;
+      if (!notify || !(notify.recipientUserIds?.length || notify.recipientGroupIds?.length ||
+        notify.recipientFieldId || notify.recipientAssignee)) {
+        ctx.addIssue({ code: 'custom', message: 'NOTIFY actions require at least one recipient source' });
+      }
+    }
+    if (action.type === 'UPDATE_FIELDS') {
+      if (!action.updates?.length) ctx.addIssue({ code: 'custom', message: 'UPDATE_FIELDS actions require updates' });
+      for (const update of action.updates ?? []) {
+        if (update.mode === 'copy' && !update.sourceFieldId) {
+          ctx.addIssue({ code: 'custom', message: 'copy updates require a source field' });
+        }
+        if (update.mode !== 'copy' && update.sourceFieldId) {
+          ctx.addIssue({ code: 'custom', message: 'Only copy updates take a source field' });
+        }
+        if (['set', 'increment', 'decrement'].includes(update.mode) && !('value' in update)) {
+          ctx.addIssue({ code: 'custom', message: update.mode + ' updates require a value' });
+        }
+        if (update.mode === 'clear' && 'value' in update) {
+          ctx.addIssue({ code: 'custom', message: 'clear updates take no value' });
+        }
+      }
+      if (action.targetFieldIds && !sameIds(action.targetFieldIds, (action.updates ?? []).map(({ fieldId }) => fieldId))) {
+        ctx.addIssue({ code: 'custom', message: 'UPDATE_FIELDS targetFieldIds must equal the updated fields' });
+      }
+    }
+    if (action.type === 'CREATE_RECORD') {
+      if (!action.targetAppId) ctx.addIssue({ code: 'custom', message: 'CREATE_RECORD actions require a target application' });
+      if (!action.mappings?.length) ctx.addIssue({ code: 'custom', message: 'CREATE_RECORD actions require mappings' });
+      for (const mapping of action.mappings ?? []) {
+        if (mapping.mode === 'source' && !mapping.sourceFieldId) {
+          ctx.addIssue({ code: 'custom', message: 'source mappings require a source field' });
+        }
+        if (mapping.mode === 'constant' && !('value' in mapping)) {
+          ctx.addIssue({ code: 'custom', message: 'constant mappings require a value' });
+        }
+      }
+      if (action.targetFieldIds && !sameIds(action.targetFieldIds, (action.mappings ?? []).map(({ targetFieldId }) => targetFieldId))) {
+        ctx.addIssue({ code: 'custom', message: 'CREATE_RECORD targetFieldIds must equal the mapped fields' });
+      }
+    }
+    if (action.type === 'ADVANCE_WORKFLOW' && !action.workflowActionId) {
+      ctx.addIssue({ code: 'custom', message: 'ADVANCE_WORKFLOW actions require a workflow action' });
+    }
   }
 });
 const createRuleInput = z.strictObject({ name: z.string().trim().min(1).max(120), config });
@@ -83,6 +158,10 @@ const grantInput = z.strictObject({
 });
 const versionInput = z.strictObject({ version: z.number().int().positive() });
 const enableInput = z.strictObject({ enabled: z.boolean() });
+const manualRunInput = z.strictObject({
+  recordId: identifier,
+  idempotencyKey: z.string().trim().min(1).max(120).optional(),
+});
 
 export const automationHttp = {
   createRuleInput,
@@ -93,6 +172,24 @@ export const automationHttp = {
   rule: z.looseObject({ id: identifier, name: z.string(), enabled: z.boolean(), archivedAt: z.string().nullable().optional() }),
   version: z.looseObject({ ruleId: identifier, version: z.number().int(), status: z.string(), trigger: z.unknown(), conditions: z.unknown(), actions: z.unknown() }),
   grant: z.looseObject({ id: identifier, ruleId: identifier, ruleVersion: z.number().int(), revokedAt: z.string().nullable().optional() }),
+  manualRunInput,
+  run: z.looseObject({
+    id: identifier, ruleId: identifier, ruleVersion: z.number().int(), status: z.string(),
+    recordId: identifier, eventId: identifier.nullable().optional(), lastError: z.string().nullable().optional(),
+  }),
+  runAction: z.looseObject({
+    actionId: identifier, actionType: z.string(), status: z.string(),
+    errorCode: z.string().nullable().optional(), resultRef: z.string().nullable().optional(),
+    attemptCount: z.number().int().optional(),
+  }),
+  runDetail: z.looseObject({ run: z.unknown(), actions: z.array(z.unknown()) }),
+  runPage: z.looseObject({ items: z.array(z.unknown()), total: z.number().int() }),
+  auditEvent: z.looseObject({
+    id: identifier, action: z.string(), ruleId: identifier.nullable().optional(),
+    actorId: identifier.nullable().optional(), details: z.unknown().optional(),
+  }),
+  auditPage: z.looseObject({ items: z.array(z.unknown()), total: z.number().int() }),
+  summary: z.looseObject({ rules: z.array(z.unknown()), backlog: z.number().int(), unprocessedEvents: z.number().int() }),
   result: z.looseObject({}),
 };
 
@@ -199,7 +296,46 @@ function fieldsFor(configValue: AutomationRuleConfig) {
   for (const stage of [configValue.conditions.eventSnapshot, configValue.conditions.currentState]) {
     for (const group of stage.groups) for (const item of group.conditions) ids.add(item.fieldId);
   }
+  for (const action of configValue.actions) {
+    if (action.notify?.recipientFieldId) ids.add(action.notify.recipientFieldId);
+    for (const text of [action.notify?.title, action.notify?.body]) {
+      for (const match of text?.matchAll(/\{\{([A-Za-z0-9_-]+)\}\}/g) ?? []) ids.add(match[1]);
+    }
+    for (const update of action.updates ?? []) if (update.sourceFieldId) ids.add(update.sourceFieldId);
+    for (const mapping of action.mappings ?? []) if (mapping.sourceFieldId) ids.add(mapping.sourceFieldId);
+  }
   return ids;
+}
+
+function renderTemplate(template: string, data: Record<string, unknown>, readable: ReadonlySet<string>) {
+  return template.replace(/\{\{([A-Za-z0-9_-]+)\}\}/g, (_match, fieldId: string) => {
+    if (!readable.has(fieldId)) return '';
+    const value = data[fieldId];
+    if (value === undefined || value === null) return '';
+    if (Array.isArray(value)) return value.join(', ');
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+  });
+}
+
+function templateFieldIds(text: string | undefined) {
+  return [...(text?.matchAll(/\{\{([A-Za-z0-9_-]+)\}\}/g) ?? [])].map((match) => match[1]);
+}
+
+function codedError(code: string, message: string) {
+  const error = new Error(message) as Error & { code?: string };
+  error.code = code;
+  return error;
+}
+
+function actionErrorCode(error: unknown, type: string) {
+  const coded = (error as { code?: unknown } | null)?.code;
+  if (typeof coded === 'string') return coded;
+  if (error instanceof ConflictException) return 'REVISION_CONFLICT';
+  if (error instanceof ForbiddenException) return 'ACTION_FORBIDDEN';
+  if (error instanceof NotFoundException) return 'ACTION_NOT_FOUND';
+  if (error instanceof BadRequestException) return 'ACTION_INPUT_INVALID';
+  return `${type}_EXECUTION_FAILED`;
 }
 
 function supportedCondition(item: Condition, field: FieldDefinition) {
@@ -252,7 +388,8 @@ function cycleFindings(rules: { appId: string; config: AutomationRuleConfig }[])
 
 @Injectable()
 export class AutomationService {
-  constructor(private readonly schema: AppSchemaService, private readonly authorization: AuthorizationService) {}
+  constructor(private readonly schema: AppSchemaService, private readonly authorization: AuthorizationService,
+    private readonly recordWrites: RecordService, private readonly workflowRuntime: WorkflowRuntimeService) {}
 
   list(context: TenantContext, appId: string) {
     return withTenantTransaction(context, async (tx) => {
@@ -545,6 +682,39 @@ export class AutomationService {
       const boundFields = await this.schema.getFields(tx, context, appId, version.sourceSchemaVersion);
       const boundTypes = new Map(boundFields.map(({ fieldId, type }) => [fieldId, type]));
       const fieldVersionValid = configured.every((id) => boundTypes.get(id) === fieldById.get(id)?.type);
+      const record = serializeRecord(row);
+      const readableIds = new Set(configured);
+      const actionPlans: Record<string, unknown>[] = [];
+      for (const action of cfg.actions) {
+        if (action.type === 'NOTIFY') {
+          actionPlans.push({ actionId: action.actionId, type: action.type,
+            recipients: await this.resolveNotifyRecipients(tx, context.tenantId, appId, record, action.notify ?? {}),
+            title: renderTemplate(action.notify?.title ?? '', record.data, readableIds),
+            body: renderTemplate(action.notify?.body ?? '', record.data, readableIds) });
+        } else if (action.type === 'UPDATE_FIELDS') {
+          actionPlans.push({ actionId: action.actionId, type: action.type,
+            updates: (action.updates ?? []).map((update) => {
+              try {
+                const plan = this.planFieldUpdate(fields, record, update);
+                return { fieldId: update.fieldId, mode: update.mode,
+                  from: record.data[update.fieldId] ?? null, to: plan.value ?? null, changed: plan.changed };
+              } catch (error) {
+                return { fieldId: update.fieldId, mode: update.mode,
+                  error: error instanceof Error ? error.message : String(error) };
+              }
+            }) });
+        } else if (action.type === 'CREATE_RECORD') {
+          actionPlans.push({ actionId: action.actionId, type: action.type, targetAppId: action.targetAppId,
+            data: this.planCreateData(record, action) });
+        } else if (action.type === 'ADVANCE_WORKFLOW') {
+          actionPlans.push({ actionId: action.actionId, type: action.type,
+            workflowActionId: action.workflowActionId, currentStatus: row.status ?? null,
+            note: 'Workflow state, automation opt-in and action conditions are re-evaluated at execution time.' });
+        } else {
+          actionPlans.push({ actionId: action.actionId, type: action.type,
+            note: 'Webhook delivery is implemented in P3-D; in P3-B the action fails explicitly.' });
+        }
+      }
       return {
         dryRun: true, sideEffects: false, eventType: cfg.trigger.eventType, recordId: row.id,
         triggerMatches, snapshotMatches, currentMatches, fieldVersionValid, authorized,
@@ -552,6 +722,9 @@ export class AutomationService {
         actions: cfg.actions.map(({ actionId, type, targetAppId, targetFieldIds }) => ({
           actionId, type, targetAppId: targetAppId ?? appId, targetFieldIds: targetFieldIds ?? [], executed: false,
         })),
+        actionPlans,
+        boundaries: 'Dry run resolves recipients and field changes against the current record only; ' +
+          'grants, workflow state and conditions are re-checked at execution time.',
         warning: cfg.trigger.eventType.startsWith('workflow.')
           ? 'Workflow event dry-run requires a persisted workflow event; this record-only preview does not simulate one.' : null,
       };
@@ -788,7 +961,7 @@ export class AutomationService {
               : !grantValid ? 'SKIPPED_UNAUTHORIZED'
                 : !eventSnapshotPass ? 'SKIPPED_CONDITION'
                   : !currentPass ? 'SKIPPED_STALE'
-                    : 'ACTIONS_NOT_IMPLEMENTED';
+                    : 'EXECUTE';
             const [run] = await tx.insert(automationRuns).values({
               tenantId: context.tenantId, appId: event.appId, ruleId: candidate.rule.id,
               ruleVersion: candidate.version.version, eventId: event.eventId,
@@ -796,8 +969,8 @@ export class AutomationService {
               recordId: event.recordId, rootCausationId: event.rootCausationId ?? event.eventId,
               parentRunId: event.parentRunId, causationDepth: event.causationDepth + 1,
               originRuleId: event.originRuleId, originActionId: event.originActionId,
-              status, lastError: status === 'ACTIONS_NOT_IMPLEMENTED' ? 'P3-A records actions but does not execute P3-B side effects' : null,
-              completedAt: sql`clock_timestamp()`,
+              status: status === 'EXECUTE' ? 'RUNNING' : status, lastError: null,
+              completedAt: status === 'EXECUTE' ? null : sql`clock_timestamp()`,
             }).onConflictDoNothing().returning();
             if (!run) continue;
             createdRuns++;
@@ -825,13 +998,28 @@ export class AutomationService {
                 emailState: 'skipped',
               }).onConflictDoNothing();
             }
+            const insertedActions: { actionId: string; idempotencyKey: string }[] = [];
             for (const [position, action] of cfg.actions.entries()) {
-              await tx.insert(automationRunActions).values({
+              const [row] = await tx.insert(automationRunActions).values({
                 tenantId: context.tenantId, appId: event.appId, runId: run.id, actionId: action.actionId,
-                position, status: 'NOT_EXECUTED', idempotencyKey: `${identity}:${action.actionId}`,
-                errorCode: status === 'ACTIONS_NOT_IMPLEMENTED' ? 'P3B_DEFERRED' : status,
-                completedAt: sql`clock_timestamp()`,
-              }).onConflictDoNothing();
+                position, status: status === 'EXECUTE' ? 'PENDING' : 'NOT_EXECUTED',
+                idempotencyKey: `${identity}:${action.actionId}`,
+                errorCode: status === 'EXECUTE' ? null : status,
+                completedAt: status === 'EXECUTE' ? null : sql`clock_timestamp()`,
+              }).onConflictDoNothing().returning();
+              if (row) insertedActions.push({ actionId: row.actionId, idempotencyKey: row.idempotencyKey });
+            }
+            if (status === 'EXECUTE') {
+              await this.executeActions(tx, { tenantId: context.tenantId, userId: grant.approvedBy }, {
+                runId: run.id, appId: event.appId, ruleId: candidate.rule.id,
+                rootCausationId: run.rootCausationId, causationDepth: run.causationDepth,
+                cfg, record: serializeRecord(current!), eventId: event.eventId,
+                actionRows: cfg.actions.flatMap((action) => {
+                  const row = insertedActions.find((entry) => entry.actionId === action.actionId);
+                  return row ? [{ action, row }] : [];
+                }),
+                readableFieldIds: grant.readableFieldIds,
+              });
             }
             if (status === 'CHAIN_DEPTH_EXCEEDED') {
               const admins = await tx.select({ userId: tenantMembers.userId }).from(tenantMembers).where(and(
@@ -851,6 +1039,475 @@ export class AutomationService {
           .where(and(eq(outbox.tenantId, context.tenantId), eq(outbox.appId, event.appId), eq(outbox.eventId, event.eventId)));
       }
       return { events: rows.length, createdRuns };
+    });
+  }
+
+
+  // ---------------------------------------------------------------------
+  // P3-B action execution engine. Actions run sequentially inside the
+  // caller's transaction; each action executes in its own savepoint so a
+  // failing action rolls back only itself (brief §7: non-atomic chain —
+  // earlier successful actions stay committed). The executing identity is
+  // always the grant approver (approver-delegated context, brief F4).
+  // ---------------------------------------------------------------------
+
+  private async grantCoversExecution(tx: TenantTransaction, tenantId: string, appId: string,
+    cfg: AutomationRuleConfig, grant: typeof automationGrants.$inferSelect) {
+    if (grant.revokedAt || grant.sourceAppId !== appId) return false;
+    const relevantIds = fieldsFor(cfg);
+    if (![...relevantIds].every((id) => grant.readableFieldIds.includes(id))) return false;
+    if (!cfg.actions.every((action) => grant.allowedOperations.includes(action.type) &&
+      (!action.targetAppId || grant.targetAppIds.includes(action.targetAppId)) &&
+      (action.targetFieldIds ?? []).every((id) => grant.writableFieldIds.includes(id)))) return false;
+    const grantor = { tenantId, userId: grant.approvedBy };
+    try {
+      const source = await this.schema.access(tx, grantor, appId, 'view');
+      if ([...relevantIds].some((id) => !this.authorization.fieldDecision(source.access, id, 'view').allowed)) return false;
+      for (const action of cfg.actions) if (action.targetAppId) {
+        const target = await this.schema.access(tx, grantor, action.targetAppId, 'edit');
+        if ((action.targetFieldIds ?? []).some((id) => !this.authorization.fieldDecision(target.access, id, 'edit').allowed)) return false;
+      }
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
+  private async resolveNotifyRecipients(tx: TenantTransaction, tenantId: string, appId: string,
+    record: RecordResponse, notify: NonNullable<AutomationRuleConfig['actions'][number]['notify']>) {
+    const wanted = new Set<string>(notify.recipientUserIds ?? []);
+    if (notify.recipientGroupIds?.length) {
+      const members = await tx.select({ userId: groupMembers.userId }).from(groupMembers).where(and(
+        eq(groupMembers.tenantId, tenantId), inArray(groupMembers.groupId, notify.recipientGroupIds)));
+      for (const { userId } of members) wanted.add(userId);
+    }
+    if (notify.recipientFieldId) {
+      for (const value of collection(record.data[notify.recipientFieldId])) wanted.add(String(value));
+    }
+    if (notify.recipientAssignee) {
+      const assignees = await tx.select({ userId: workflowAssignments.userId }).from(workflowAssignments).where(and(
+        eq(workflowAssignments.tenantId, tenantId), eq(workflowAssignments.appId, appId),
+        eq(workflowAssignments.recordId, record.id), eq(workflowAssignments.active, true)));
+      for (const { userId } of assignees) wanted.add(userId);
+    }
+    if (!wanted.size) return [];
+    const active = await tx.select({ userId: tenantMembers.userId }).from(tenantMembers).where(and(
+      eq(tenantMembers.tenantId, tenantId), inArray(tenantMembers.userId, [...wanted]),
+      isNull(tenantMembers.disabledAt)));
+    return active.map(({ userId }) => userId);
+  }
+
+  private planFieldUpdate(fields: FieldDefinition[], record: RecordResponse,
+    update: NonNullable<AutomationRuleConfig['actions'][number]['updates']>[number]) {
+    const field = fields.find((entry) => entry.fieldId === update.fieldId);
+    if (!field) throw codedError('UPDATE_FIELD_NOT_FOUND', 'Update field is not in the record schema: ' + update.fieldId);
+    const currentRaw = Object.hasOwn(record.data, update.fieldId) ? record.data[update.fieldId] : undefined;
+    if (update.mode === 'clear') return { kind: 'value' as const, value: undefined, changed: currentRaw !== undefined };
+    let raw: string | undefined;
+    if (update.mode === 'copy') {
+      raw = update.sourceFieldId ? record.data[update.sourceFieldId] : undefined;
+    } else if (update.mode === 'set') {
+      raw = update.value === undefined || update.value === null ? undefined
+        : typeof update.value === 'string' ? update.value
+          : typeof update.value === 'object' ? JSON.stringify(update.value) : String(update.value);
+    } else {
+      let current: Decimal;
+      try {
+        current = currentRaw === undefined || currentRaw === '' ? new Decimal(0) : new Decimal(currentRaw);
+        const delta = new Decimal(String(update.value));
+        raw = (update.mode === 'increment' ? current.plus(delta) : current.minus(delta)).toString();
+      } catch {
+        throw codedError('INCREMENT_NON_NUMERIC', 'Field value or step is not numeric: ' + update.fieldId);
+      }
+    }
+    if (raw === undefined) return { kind: 'value' as const, value: undefined, changed: currentRaw !== undefined };
+    const normalized = normalizeValue(field.type, raw, field.options);
+    if (normalized === undefined) throw codedError('INVALID_FIELD_VALUE', 'Value is not valid for field ' + update.fieldId);
+    return { kind: 'value' as const, value: normalized, changed: automationUpdateNeeded(currentRaw, normalized) };
+  }
+
+  private planCreateData(record: RecordResponse,
+    action: AutomationRuleConfig['actions'][number]) {
+    const data: Record<string, string> = {};
+    for (const mapping of action.mappings ?? []) {
+      if (mapping.mode === 'constant') {
+        if (mapping.value === undefined) continue;
+        data[mapping.targetFieldId] = typeof mapping.value === 'string' ? mapping.value
+          : typeof mapping.value === 'object' ? JSON.stringify(mapping.value) : String(mapping.value);
+      } else {
+        const value = mapping.sourceFieldId ? record.data[mapping.sourceFieldId] : undefined;
+        if (value !== undefined) data[mapping.targetFieldId] = value;
+      }
+    }
+    return data;
+  }
+
+  private async executeActions(tx: TenantTransaction, delegated: TenantContext, args: {
+    runId: string; appId: string; ruleId: string; rootCausationId: string; causationDepth: number;
+    cfg: AutomationRuleConfig; record: RecordResponse; eventId: string | null;
+    actionRows: { action: AutomationRuleConfig['actions'][number];
+      row: { actionId: string; idempotencyKey: string } }[];
+    readableFieldIds: string[];
+  }) {
+    let record = args.record;
+    const runScope = and(eq(automationRuns.tenantId, delegated.tenantId), eq(automationRuns.id, args.runId));
+    for (const { action, row } of args.actionRows) {
+      const [existing] = await tx.select({ status: automationRunActions.status }).from(automationRunActions)
+        .where(and(eq(automationRunActions.tenantId, delegated.tenantId),
+          eq(automationRunActions.runId, args.runId), eq(automationRunActions.actionId, row.actionId)));
+      if (existing?.status === 'SUCCEEDED') continue;
+      const causation = automationActionCausation({
+        id: args.runId, rootCausationId: args.rootCausationId,
+        causationDepth: args.causationDepth, ruleId: args.ruleId,
+      }, action.actionId);
+      const rowScope = and(eq(automationRunActions.tenantId, delegated.tenantId),
+        eq(automationRunActions.runId, args.runId), eq(automationRunActions.actionId, row.actionId));
+      try {
+        const result = await tx.transaction(async (sp) => this.executeAction(sp as TenantTransaction, delegated, {
+          appId: args.appId, ruleId: args.ruleId, runId: args.runId, action, record,
+          eventId: args.eventId, causation, idempotencyKey: row.idempotencyKey,
+          readableFieldIds: args.readableFieldIds,
+        }));
+        if (result.record) record = result.record;
+        await tx.update(automationRunActions).set({
+          status: 'SUCCEEDED', resultRef: result.resultRef, errorCode: null,
+          attemptCount: sql`${automationRunActions.attemptCount} + 1`, completedAt: sql`clock_timestamp()`,
+        }).where(rowScope);
+      } catch (error) {
+        const code = actionErrorCode(error, action.type);
+        await tx.update(automationRunActions).set({
+          status: 'FAILED', errorCode: code,
+          attemptCount: sql`${automationRunActions.attemptCount} + 1`, completedAt: sql`clock_timestamp()`,
+        }).where(rowScope);
+        await tx.update(automationRuns).set({
+          status: 'FAILED', completedAt: sql`clock_timestamp()`,
+          lastError: `${action.actionId}: ${code}: ${error instanceof Error ? error.message : String(error)}`.slice(0, 1000),
+        }).where(runScope);
+        return { status: 'FAILED' as const, failedActionId: action.actionId, errorCode: code };
+      }
+    }
+    await tx.update(automationRuns).set({
+      status: 'SUCCEEDED', lastError: null, completedAt: sql`clock_timestamp()`,
+    }).where(runScope);
+    return { status: 'SUCCEEDED' as const };
+  }
+
+  private async executeAction(tx: TenantTransaction, delegated: TenantContext, args: {
+    appId: string; ruleId: string; runId: string;
+    action: AutomationRuleConfig['actions'][number]; record: RecordResponse;
+    eventId: string | null; causation: ReturnType<typeof automationActionCausation>;
+    idempotencyKey: string; readableFieldIds: string[];
+  }): Promise<{ resultRef: string; record?: RecordResponse }> {
+    switch (args.action.type) {
+      case 'NOTIFY': return this.executeNotify(tx, delegated, args);
+      case 'UPDATE_FIELDS': return this.executeUpdateFields(tx, delegated, args);
+      case 'CREATE_RECORD': return this.executeCreateRecord(tx, delegated, args);
+      case 'ADVANCE_WORKFLOW': return this.executeAdvanceWorkflow(tx, delegated, args);
+      case 'WEBHOOK': throw codedError('WEBHOOK_NOT_IMPLEMENTED_P3D',
+        'Webhook actions are delivered in P3-D and fail explicitly in P3-B');
+      default: throw codedError('ACTION_TYPE_UNSUPPORTED', 'Unsupported action type: ' + args.action.type);
+    }
+  }
+
+  private async executeNotify(tx: TenantTransaction, delegated: TenantContext, args: {
+    appId: string; ruleId: string;
+    action: AutomationRuleConfig['actions'][number]; record: RecordResponse;
+    eventId: string | null; readableFieldIds: string[];
+  }) {
+    const notify = args.action.notify ?? {};
+    const recipients = await this.resolveNotifyRecipients(tx, delegated.tenantId, args.appId, args.record, notify);
+    const readable = new Set(args.readableFieldIds);
+    const title = renderTemplate(notify.title ?? 'Automation notification', args.record.data, readable);
+    const body = renderTemplate(notify.body ?? '', args.record.data, readable);
+    if (recipients.length) {
+      await tx.insert(notifications).values(recipients.map((userId) => ({
+        tenantId: delegated.tenantId, userId, sourceType: 'RECORD' as const, appId: args.appId,
+        recordId: args.record.id, eventId: args.eventId,
+        ruleKey: `automation:${args.ruleId}:${args.action.actionId}`,
+        title, body, emailState: 'skipped' as const,
+      }))).onConflictDoNothing();
+    }
+    return { resultRef: `notified:${recipients.length}` };
+  }
+
+  private async executeUpdateFields(tx: TenantTransaction, delegated: TenantContext, args: {
+    appId: string; action: AutomationRuleConfig['actions'][number]; record: RecordResponse;
+    causation: ReturnType<typeof automationActionCausation>;
+  }) {
+    const fields = await this.schema.getFields(tx, delegated, args.appId, args.record.schemaVersion);
+    const data: RecordData = {};
+    let changed = false;
+    for (const update of args.action.updates ?? []) {
+      const plan = this.planFieldUpdate(fields, args.record, update);
+      if (plan.changed) changed = true;
+      if (plan.value !== undefined) data[update.fieldId] = plan.value;
+    }
+    if (!changed) return { resultRef: 'no-progress' };
+    const updated = await this.recordWrites.persistUpdate(tx, delegated, args.appId, args.record.id,
+      { revision: args.record.revision, data }, args.causation);
+    return { resultRef: `revision:${updated.revision}`, record: updated };
+  }
+
+  private async executeCreateRecord(tx: TenantTransaction, delegated: TenantContext, args: {
+    action: AutomationRuleConfig['actions'][number]; record: RecordResponse;
+    causation: ReturnType<typeof automationActionCausation>; idempotencyKey: string;
+  }) {
+    const targetAppId = args.action.targetAppId!;
+    const target = await this.schema.writable(tx, delegated, targetAppId, 'create');
+    const byId = new Map(target.fields.map((field) => [field.fieldId, field]));
+    const planned = this.planCreateData(args.record, args.action);
+    const data: RecordData = {};
+    for (const [fieldId, raw] of Object.entries(planned)) {
+      const field = byId.get(fieldId);
+      if (!field) throw codedError('CREATE_TARGET_FIELD_NOT_FOUND', 'Target field is not in the target application: ' + fieldId);
+      const normalized = normalizeValue(field.type, raw, field.options);
+      if (normalized === undefined) throw codedError('INVALID_FIELD_VALUE', 'Value is not valid for field ' + fieldId);
+      data[fieldId] = normalized;
+    }
+    const created = await this.recordWrites.persistCreate(tx, delegated, targetAppId, data, target, 'api',
+      args.idempotencyKey, args.causation);
+    return { resultRef: created.id };
+  }
+
+  private async executeAdvanceWorkflow(tx: TenantTransaction, delegated: TenantContext, args: {
+    appId: string; ruleId: string; runId: string;
+    action: AutomationRuleConfig['actions'][number]; record: RecordResponse;
+    causation: ReturnType<typeof automationActionCausation>;
+  }) {
+    const result = await this.workflowRuntime.executeAutomation(tx, delegated, args.appId, args.record.id,
+      args.action.workflowActionId!, args.causation, { ruleId: args.ruleId, runId: args.runId });
+    return { resultRef: `state:${result.state.code}`,
+      record: { ...args.record, revision: result.revision, status: result.state.code } };
+  }
+
+
+  // ---------------------------------------------------------------------
+  // P3-B run operations: manual trigger (T-4), failed-run retry, run and
+  // audit queries (C4), and the 90-day run-history retention policy.
+  // ---------------------------------------------------------------------
+
+  retryRun(context: TenantContext, appId: string, runId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const [run] = await tx.select().from(automationRuns).where(and(
+        eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.appId, appId), eq(automationRuns.id, runId)));
+      if (!run) throw new NotFoundException('Automation run not found');
+      if (run.status !== 'FAILED') throw new ConflictException('Only failed runs can be retried');
+      const version = await this.readVersion(tx, context, appId, run.ruleId, run.ruleVersion);
+      const cfg = this.configOf(version);
+      const [grant] = await tx.select().from(automationGrants).where(and(
+        eq(automationGrants.tenantId, context.tenantId), eq(automationGrants.ruleId, run.ruleId),
+        eq(automationGrants.ruleVersion, run.ruleVersion)));
+      if (!grant || grant.revokedAt) throw new ConflictException('The automation grant is no longer active');
+      if (!await this.grantCoversExecution(tx, context.tenantId, appId, cfg, grant)) {
+        throw new ConflictException('The automation grant no longer covers this rule version');
+      }
+      const [recordRow] = await tx.select().from(records).where(and(
+        eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, run.recordId),
+        isNull(records.deletedAt)));
+      if (!recordRow) throw new ConflictException('The run record no longer exists');
+      const rows = await tx.select().from(automationRunActions).where(and(
+        eq(automationRunActions.tenantId, context.tenantId), eq(automationRunActions.runId, runId)))
+        .orderBy(automationRunActions.position);
+      await tx.update(automationRuns).set({
+        status: 'RUNNING', attemptCount: sql`${automationRuns.attemptCount} + 1`,
+        lastError: null, completedAt: null,
+      }).where(and(eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.id, runId)));
+      await tx.insert(automationAuditEvents).values({
+        tenantId: context.tenantId, appId, ruleId: run.ruleId, ruleVersion: run.ruleVersion,
+        actorId: context.userId, action: 'RUN_RETRIED', details: { runId },
+      });
+      const outcome = await this.executeActions(tx, { tenantId: context.tenantId, userId: grant.approvedBy }, {
+        runId: run.id, appId, ruleId: run.ruleId, rootCausationId: run.rootCausationId,
+        causationDepth: run.causationDepth, cfg, record: serializeRecord(recordRow),
+        eventId: run.eventId,
+        actionRows: cfg.actions.flatMap((action) => {
+          const row = rows.find((entry) => entry.actionId === action.actionId);
+          return row ? [{ action, row: { actionId: row.actionId, idempotencyKey: row.idempotencyKey } }] : [];
+        }),
+        readableFieldIds: grant.readableFieldIds,
+      });
+      return { runId: run.id, ...outcome };
+    });
+  }
+
+  manualRun(context: TenantContext, appId: string, ruleId: string, input: z.infer<typeof manualRunInput>) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const [rule] = await tx.select().from(automationRules).where(and(
+        eq(automationRules.tenantId, context.tenantId), eq(automationRules.appId, appId),
+        eq(automationRules.id, ruleId), isNull(automationRules.archivedAt)));
+      if (!rule) throw new NotFoundException('Automation rule not found');
+      if (!rule.enabled || !rule.currentVersion) throw new ConflictException('Rule is not enabled');
+      const version = await this.readVersion(tx, context, appId, ruleId, rule.currentVersion);
+      const cfg = this.configOf(version);
+      if (!cfg.trigger.allowManual) throw new BadRequestException('This rule does not allow manual runs');
+      const identity = input.idempotencyKey ? `manual:${input.idempotencyKey}` : `manual:${randomUUID()}`;
+      const [existing] = await tx.select().from(automationRuns).where(and(
+        eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.appId, appId),
+        eq(automationRuns.triggerIdentity, identity)));
+      if (existing) {
+        const rows = await tx.select().from(automationRunActions).where(and(
+          eq(automationRunActions.tenantId, context.tenantId), eq(automationRunActions.runId, existing.id)))
+          .orderBy(automationRunActions.position);
+        return { run: existing, actions: rows, deduplicated: true };
+      }
+      const [grant] = await tx.select().from(automationGrants).where(and(
+        eq(automationGrants.tenantId, context.tenantId), eq(automationGrants.ruleId, ruleId),
+        eq(automationGrants.ruleVersion, rule.currentVersion)));
+      if (!grant || grant.revokedAt) throw new ConflictException('The automation grant is not active');
+      if (!await this.grantCoversExecution(tx, context.tenantId, appId, cfg, grant)) {
+        throw new ConflictException('The automation grant does not cover this rule version');
+      }
+      const [recordRow] = await tx.select().from(records).where(and(
+        eq(records.tenantId, context.tenantId), eq(records.appId, appId), eq(records.id, input.recordId),
+        isNull(records.deletedAt)));
+      if (!recordRow) throw new NotFoundException('Record not found');
+      const runId = randomUUID();
+      const [run] = await tx.insert(automationRuns).values({
+        id: runId, tenantId: context.tenantId, appId, ruleId, ruleVersion: rule.currentVersion,
+        eventId: null, triggerIdentity: identity,
+        idempotencyKey: `${identity}:${ruleId}:${rule.currentVersion}`,
+        recordId: input.recordId, rootCausationId: runId, parentRunId: null, causationDepth: 1,
+        originRuleId: ruleId, originActionId: null, status: 'RUNNING',
+      }).returning();
+      const actionRows: { action: AutomationRuleConfig['actions'][number];
+        row: { actionId: string; idempotencyKey: string } }[] = [];
+      for (const [position, action] of cfg.actions.entries()) {
+        const [row] = await tx.insert(automationRunActions).values({
+          tenantId: context.tenantId, appId, runId, actionId: action.actionId, position,
+          status: 'PENDING', idempotencyKey: `${identity}:${action.actionId}`,
+        }).returning();
+        actionRows.push({ action, row: { actionId: row.actionId, idempotencyKey: row.idempotencyKey } });
+      }
+      await tx.insert(automationAuditEvents).values({
+        tenantId: context.tenantId, appId, ruleId, ruleVersion: rule.currentVersion,
+        actorId: context.userId, action: 'MANUAL_RUN', details: { runId, recordId: input.recordId },
+      });
+      await this.executeActions(tx, { tenantId: context.tenantId, userId: grant.approvedBy }, {
+        runId, appId, ruleId, rootCausationId: runId, causationDepth: 1, cfg,
+        record: serializeRecord(recordRow), eventId: null, actionRows,
+        readableFieldIds: grant.readableFieldIds,
+      });
+      const [finalRun] = await tx.select().from(automationRuns).where(and(
+        eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.id, runId)));
+      const finalActions = await tx.select().from(automationRunActions).where(and(
+        eq(automationRunActions.tenantId, context.tenantId), eq(automationRunActions.runId, runId)))
+        .orderBy(automationRunActions.position);
+      return { run: finalRun, actions: finalActions, deduplicated: false };
+    });
+  }
+
+  listRuns(context: TenantContext, appId: string,
+    query: { ruleId?: string; status?: string; limit: number; offset: number }) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const where = and(eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.appId, appId),
+        query.ruleId ? eq(automationRuns.ruleId, query.ruleId) : undefined,
+        query.status ? eq(automationRuns.status, query.status) : undefined);
+      const items = await tx.select().from(automationRuns).where(where)
+        .orderBy(sql`${automationRuns.startedAt} DESC, ${automationRuns.id} DESC`)
+        .limit(query.limit).offset(query.offset);
+      const [{ total }] = await tx.select({ total: sql<number>`count(*)::int` }).from(automationRuns).where(where);
+      return { items, total };
+    });
+  }
+
+  getRun(context: TenantContext, appId: string, runId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const [run] = await tx.select().from(automationRuns).where(and(
+        eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.appId, appId), eq(automationRuns.id, runId)));
+      if (!run) throw new NotFoundException('Automation run not found');
+      const actions = await tx.select().from(automationRunActions).where(and(
+        eq(automationRunActions.tenantId, context.tenantId), eq(automationRunActions.runId, runId)))
+        .orderBy(automationRunActions.position);
+      return { run, actions };
+    });
+  }
+
+  listAudit(context: TenantContext, appId: string,
+    query: { ruleId?: string; action?: string; limit: number; offset: number }) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const where = and(eq(automationAuditEvents.tenantId, context.tenantId), eq(automationAuditEvents.appId, appId),
+        query.ruleId ? eq(automationAuditEvents.ruleId, query.ruleId) : undefined,
+        query.action ? eq(automationAuditEvents.action, query.action) : undefined);
+      const items = await tx.select().from(automationAuditEvents).where(where)
+        .orderBy(sql`${automationAuditEvents.occurredAt} DESC, ${automationAuditEvents.id} DESC`)
+        .limit(query.limit).offset(query.offset);
+      const [{ total }] = await tx.select({ total: sql<number>`count(*)::int` })
+        .from(automationAuditEvents).where(where);
+      return { items, total };
+    });
+  }
+
+  runSummary(context: TenantContext, appId: string) {
+    return withTenantTransaction(context, async (tx) => {
+      await this.schema.managedApp(tx, context, appId);
+      const rules = await tx.select({
+        id: automationRules.id, name: automationRules.name, enabled: automationRules.enabled,
+      }).from(automationRules).where(and(
+        eq(automationRules.tenantId, context.tenantId), eq(automationRules.appId, appId),
+        isNull(automationRules.archivedAt)));
+      const counts = await tx.select({
+        ruleId: automationRuns.ruleId, status: automationRuns.status, total: sql<number>`count(*)::int`,
+      }).from(automationRuns).where(and(
+        eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.appId, appId)))
+        .groupBy(automationRuns.ruleId, automationRuns.status);
+      const summaries = [];
+      for (const rule of rules) {
+        const byStatus = new Map(counts.filter((entry) => entry.ruleId === rule.id)
+          .map((entry) => [entry.status, entry.total]));
+        const skipped = [...byStatus.entries()]
+          .filter(([status]) => status.startsWith('SKIPPED') || status === 'BLOCKED_CYCLE' ||
+            status === 'CHAIN_PAUSED' || status === 'CHAIN_DEPTH_EXCEEDED')
+          .reduce((sum, [, total]) => sum + total, 0);
+        const [last] = await tx.select({
+          status: automationRuns.status, startedAt: automationRuns.startedAt, lastError: automationRuns.lastError,
+        }).from(automationRuns).where(and(
+          eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.appId, appId),
+          eq(automationRuns.ruleId, rule.id)))
+          .orderBy(sql`${automationRuns.startedAt} DESC, ${automationRuns.id} DESC`).limit(1);
+        summaries.push({
+          ruleId: rule.id, name: rule.name, enabled: rule.enabled,
+          succeeded: byStatus.get('SUCCEEDED') ?? 0, failed: byStatus.get('FAILED') ?? 0, skipped,
+          lastStatus: last?.status ?? null, lastRunAt: last?.startedAt ?? null, lastError: last?.lastError ?? null,
+        });
+      }
+      const [{ backlog }] = await tx.select({ backlog: sql<number>`count(*)::int` }).from(automationRuns)
+        .where(and(eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.appId, appId),
+          inArray(automationRuns.status, ['QUEUED', 'RUNNING'])));
+      const [{ unprocessedEvents }] = await tx.select({ unprocessedEvents: sql<number>`count(*)::int` })
+        .from(outbox).where(and(eq(outbox.tenantId, context.tenantId), eq(outbox.appId, appId),
+          isNull(outbox.automationProcessedAt)));
+      return { rules: summaries, backlog, unprocessedEvents };
+    });
+  }
+
+  // Brief §5.4 / C4: hot run history is retained for 90 days. Terminal runs
+  // older than that are pruned with their action rows, except runs still
+  // referenced by a paused problem chain. Audit events are never pruned.
+  // (No audit row is written for pruning itself: automation_audit_events
+  // requires a tenant-member actor and no system actor exists; the worker
+  // logs the returned counts.)
+  async pruneRunHistory(context: TenantContext) {
+    return withTenantTransaction(context, async (tx) => {
+      const referenced = tx.select({ id: automationProblemChains.lastRunId }).from(automationProblemChains)
+        .where(eq(automationProblemChains.tenantId, context.tenantId));
+      const stale = await tx.select({ id: automationRuns.id }).from(automationRuns).where(and(
+        eq(automationRuns.tenantId, context.tenantId),
+        sql`${automationRuns.completedAt} < clock_timestamp() - interval '90 days'`,
+        sql`${automationRuns.status} NOT IN ('QUEUED','RUNNING')`,
+        sql`${automationRuns.id} NOT IN (${referenced})`,
+      ));
+      if (!stale.length) return { pruned: 0 };
+      const ids = stale.map(({ id }) => id);
+      await tx.delete(automationRunActions).where(and(
+        eq(automationRunActions.tenantId, context.tenantId), inArray(automationRunActions.runId, ids)));
+      await tx.delete(automationRuns).where(and(
+        eq(automationRuns.tenantId, context.tenantId), inArray(automationRuns.id, ids)));
+      return { pruned: ids.length };
     });
   }
 
@@ -899,6 +1556,51 @@ export class AutomationService {
         }
       }
     }
+    for (const action of value.actions) {
+      if (action.type === 'NOTIFY' && action.notify) {
+        const field = action.notify.recipientFieldId ? byId.get(action.notify.recipientFieldId) : undefined;
+        if (action.notify.recipientFieldId && (!field || field.type !== 'user')) {
+          throw new BadRequestException('Notification recipient field must be a user field');
+        }
+        for (const id of [...templateFieldIds(action.notify.title), ...templateFieldIds(action.notify.body)]) {
+          if (!byId.has(id)) throw new BadRequestException('Notification template references an unknown field: ' + id);
+        }
+      }
+      if (action.type === 'UPDATE_FIELDS') {
+        for (const update of action.updates ?? []) {
+          const field = byId.get(update.fieldId);
+          if (!field) throw new BadRequestException('Update references an unknown field: ' + update.fieldId);
+          if (field.autoNumber || ['calculation', 'table'].includes(field.type)) {
+            throw new BadRequestException('Field cannot be updated by automation: ' + update.fieldId);
+          }
+          if (update.mode === 'increment' || update.mode === 'decrement') {
+            if (field.type !== 'number') throw new BadRequestException('Increment/decrement requires a number field: ' + update.fieldId);
+            if (update.value === undefined || update.value === null || Number.isNaN(Number(update.value))) {
+              throw new BadRequestException('Increment/decrement requires a numeric value');
+            }
+          }
+          if (update.mode === 'copy') {
+            const source = byId.get(update.sourceFieldId!);
+            if (!source) throw new BadRequestException('Copy source field is unknown: ' + update.sourceFieldId);
+            if (source.type !== field.type) throw new BadRequestException('Copy source and target field types must match');
+          }
+          if (update.mode === 'set' && update.value !== undefined && update.value !== null) {
+            const raw = typeof update.value === 'string' ? update.value
+              : typeof update.value === 'object' ? JSON.stringify(update.value) : String(update.value);
+            if (normalizeValue(field.type, raw, field.options) === undefined) {
+              throw new BadRequestException('Invalid value for field: ' + update.fieldId);
+            }
+          }
+        }
+      }
+      if (action.type === 'CREATE_RECORD') {
+        for (const mapping of action.mappings ?? []) {
+          if (mapping.mode === 'source' && !byId.has(mapping.sourceFieldId!)) {
+            throw new BadRequestException('Mapping source field is unknown: ' + mapping.sourceFieldId);
+          }
+        }
+      }
+    }
   }
 
   private async validateVersion(tx: TenantTransaction, context: TenantContext, appId: string, version: typeof automationRuleVersions.$inferSelect) {
@@ -919,6 +1621,21 @@ export class AutomationService {
           findings.push({ code: 'TARGET_FIELD_UNAVAILABLE', severity: 'BLOCKING', fieldId: id, targetAppId: action.targetAppId });
         } else if (!this.authorization.fieldDecision(targetAccess, id, 'edit').allowed) {
           findings.push({ code: 'TARGET_FIELD_NOT_WRITABLE', severity: 'BLOCKING', fieldId: id, targetAppId: action.targetAppId });
+        }
+        if (action.type === 'CREATE_RECORD') {
+          for (const mapping of action.mappings ?? []) {
+            if (mapping.mode !== 'constant' || mapping.value === undefined || mapping.value === null) continue;
+            const targetField = targetFields.find((field) => field.fieldId === mapping.targetFieldId);
+            if (!targetField) {
+              findings.push({ code: 'TARGET_FIELD_UNAVAILABLE', severity: 'BLOCKING', fieldId: mapping.targetFieldId, targetAppId: action.targetAppId });
+              continue;
+            }
+            const raw = typeof mapping.value === 'string' ? mapping.value
+              : typeof mapping.value === 'object' ? JSON.stringify(mapping.value) : String(mapping.value);
+            if (normalizeValue(targetField.type, raw, targetField.options) === undefined) {
+              findings.push({ code: 'TARGET_VALUE_INVALID', severity: 'BLOCKING', fieldId: mapping.targetFieldId, targetAppId: action.targetAppId });
+            }
+          }
         }
       } catch {
         findings.push({ code: 'TARGET_APP_UNAVAILABLE', severity: 'BLOCKING', targetAppId: action.targetAppId });
@@ -951,8 +1668,20 @@ export class AutomationService {
   }
 
   private configOf(version: typeof automationRuleVersions.$inferSelect): AutomationRuleConfig {
-    return { schemaVersion: version.schemaVersion, trigger: version.trigger,
+    const cfg = { schemaVersion: version.schemaVersion, trigger: version.trigger,
       conditions: version.conditions, actions: version.actions } as AutomationRuleConfig;
+    // P3-B: the fields an action writes are part of its grant surface. When a
+    // config omits targetFieldIds, derive them from the action parameters so
+    // grant coverage checks can never pass vacuously.
+    for (const action of cfg.actions) {
+      if (action.type === 'UPDATE_FIELDS' && !action.targetFieldIds && action.updates) {
+        action.targetFieldIds = [...new Set(action.updates.map(({ fieldId }) => fieldId))];
+      }
+      if (action.type === 'CREATE_RECORD' && !action.targetFieldIds && action.mappings) {
+        action.targetFieldIds = [...new Set(action.mappings.map(({ targetFieldId }) => targetFieldId))];
+      }
+    }
+    return cfg;
   }
 }
 
@@ -973,6 +1702,54 @@ export class AutomationController {
     @Param('appId') appId: string, @Param('rootCausationId') rootCausationId: string) {
     return this.automation.resumePausedChain(context, parseInput(identifier, appId),
       parseInput(identifier, rootCausationId));
+  }
+
+  @Get('runs')
+  listRuns(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Query('ruleId') ruleId?: string, @Query('status') status?: string,
+    @Query('limit') limit?: string, @Query('offset') offset?: string) {
+    return this.automation.listRuns(context, parseInput(identifier, appId), {
+      ruleId: ruleId ? parseInput(identifier, ruleId) : undefined,
+      status: status || undefined,
+      limit: Math.min(Math.max(Number(limit ?? 50) || 50, 1), 200),
+      offset: Math.max(Number(offset ?? 0) || 0, 0),
+    });
+  }
+
+  @Get('runs/:runId')
+  getRun(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('runId') runId: string) {
+    return this.automation.getRun(context, parseInput(identifier, appId), parseInput(identifier, runId));
+  }
+
+  @Post('runs/:runId/retry')
+  retryRun(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('runId') runId: string) {
+    return this.automation.retryRun(context, parseInput(identifier, appId), parseInput(identifier, runId));
+  }
+
+  @Post('rules/:ruleId/manual-runs')
+  manualRun(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Param('ruleId') ruleId: string, @Body() body: unknown) {
+    return this.automation.manualRun(context, parseInput(identifier, appId), parseInput(identifier, ruleId),
+      parseInput(automationHttp.manualRunInput, body));
+  }
+
+  @Get('audit')
+  listAudit(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+    @Query('ruleId') ruleId?: string, @Query('action') action?: string,
+    @Query('limit') limit?: string, @Query('offset') offset?: string) {
+    return this.automation.listAudit(context, parseInput(identifier, appId), {
+      ruleId: ruleId ? parseInput(identifier, ruleId) : undefined,
+      action: action || undefined,
+      limit: Math.min(Math.max(Number(limit ?? 50) || 50, 1), 200),
+      offset: Math.max(Number(offset ?? 0) || 0, 0),
+    });
+  }
+
+  @Get('summary')
+  runSummary(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string) {
+    return this.automation.runSummary(context, parseInput(identifier, appId));
   }
 
   @Get('rules')
