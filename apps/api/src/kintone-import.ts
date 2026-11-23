@@ -30,6 +30,35 @@ export interface FieldCompatibility {
   upgradeRequired: boolean;
   formula?: KintoneFormulaToken[] | null;
   tableFields?: FieldCompatibility[];
+  /** P4-T3a: ordered target options after value translation (choice fields
+   * whose source values are not safe target identifiers). */
+  resolvedOptions?: { value: string; label: string; disabled: boolean }[];
+  /** P4-T3a: source choice value -> target option identifier. */
+  optionValueMap?: Record<string, string>;
+  /** P4-T3a: verified lookup structure (six-item check) for packaging. */
+  lookupResolution?: KintoneLookupResolution;
+  /** P4-T3a: category disposition decided at extraction time. */
+  categoryResolution?: KintoneCategoryResolution;
+}
+
+export interface KintoneLookupResolution {
+  relatedAppId: string;
+  relatedKeyField: string;
+  copies: { field: string; relatedField: string }[];
+  pickerFields: string[];
+  filterCond: string;
+  sort: { field: string; direction: 'asc' | 'desc' } | null;
+}
+
+export interface KintoneCategoryNode {
+  id: string; parentId: string | null; name: string; sortOrder: number;
+}
+
+export interface KintoneCategoryResolution {
+  mode: 'disabled' | 'tree';
+  nodes?: KintoneCategoryNode[];
+  /** source record id -> source node ids (tree mode only). */
+  assignments?: Record<string, string[]>;
 }
 
 type KintoneFormulaToken = { kind: 'field'; fieldId: string } |
@@ -200,6 +229,228 @@ export function resolveKintoneCategories(
   return { resolved, unresolved };
 }
 
+const SAFE_OPTION_VALUE = /^[a-z0-9][a-z0-9_.-]{0,63}$/i;
+export const KINTONE_CHOICE_TYPES = ['RADIO_BUTTON', 'DROP_DOWN', 'CHECK_BOX', 'MULTI_SELECT'];
+export const KINTONE_IDENTITY_TYPES = [
+  'USER_SELECT', 'ORGANIZATION_SELECT', 'GROUP_SELECT', 'CREATOR', 'MODIFIER', 'STATUS_ASSIGNEE',
+];
+
+/**
+ * P4-T3a choice resolution: kintone option values are free-form labels
+ * (frequently Japanese) that the target cannot use as option identifiers.
+ * When every value is already a safe identifier the field needs no
+ * translation; otherwise ALL values are deterministically re-issued as
+ * `opt_<kintone index>` (indices are unique per field, so this cannot
+ * collide) while labels keep the original text and index order. Record
+ * values are translated through the same map at package build time, so the
+ * migration is lossless: identifier changes are internal, labels and the
+ * selected values' meaning are preserved verbatim.
+ */
+export function resolveChoiceOptions(source: any): {
+  resolvedOptions: { value: string; label: string; disabled: boolean }[];
+  optionValueMap?: Record<string, string>;
+} | null {
+  const raw = source?.options;
+  if (!raw || typeof raw !== 'object') return null;
+  const entries = (Array.isArray(raw)
+    ? raw.map((option: any, index: number) => ({
+      value: String(option.value), label: String(option.label ?? option.value),
+      index: Number.isFinite(Number(option.index)) ? Number(option.index) : index,
+    }))
+    : Object.entries(raw).map(([value, option]: [string, any]) => ({
+      value, label: String(option?.label ?? value),
+      index: Number.isFinite(Number(option?.index)) ? Number(option.index) : 0,
+    }))).sort((a, b) => a.index - b.index);
+  if (!entries.length) return null;
+  if (entries.every(({ value }) => SAFE_OPTION_VALUE.test(value))) {
+    return {
+      resolvedOptions: entries.map(({ value, label }) => ({ value, label, disabled: false })),
+    };
+  }
+  const optionValueMap: Record<string, string> = {};
+  const resolvedOptions = entries.map(({ value, label, index }) => {
+    const mapped = `opt_${index}`;
+    optionValueMap[value] = mapped;
+    return { value: mapped, label, disabled: false };
+  });
+  return { resolvedOptions, optionValueMap };
+}
+
+function identityEntriesOf(value: unknown): { code: string; name: string | null }[] | null {
+  if (value === null || value === undefined) return [];
+  const list = Array.isArray(value) ? value : [value];
+  const entries: { code: string; name: string | null }[] = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object' || typeof (entry as any).code !== 'string' ||
+      !(entry as any).code) return null;
+    entries.push({
+      code: String((entry as any).code),
+      name: typeof (entry as any).name === 'string' ? String((entry as any).name) : null,
+    });
+  }
+  return entries;
+}
+
+/**
+ * P4-T3a extraction-time resolution pass. mapKintoneField is deliberately
+ * conservative without context; once the full record set (and, where
+ * relevant, the related application's fields or an out-of-band category
+ * tree capture) is available, the UNRESOLVED verdicts that have a designed
+ * platform mechanism are resolved with evidence:
+ * - choice fields: deterministic option-identifier translation (labels kept);
+ * - identity fields: every value is enumerable into package directory
+ *   entries with deterministic source ids; the import administrator maps
+ *   them explicitly to target users/groups/organizations (job mappings);
+ * - CATEGORY: disabled-in-source with zero values, or an out-of-band tree
+ *   capture whose names resolve unambiguously per record;
+ * - lookup fields: the six-item structure (relatedApp, relatedKeyField,
+ *   fieldMappings, pickerFields, filterCond, sort) verified item by item
+ *   against the related application's extracted fields.
+ * Anything that cannot be verified stays UNRESOLVED and blocks packaging.
+ */
+export function resolveExtractionCompatibility(
+  compatibility: FieldCompatibility[],
+  context: {
+    records: any[];
+    subtableRows?: KintoneSubtableRow[];
+    relatedApps?: Record<string, { fields: any[] }>;
+    categoryTree?: { nodes: KintoneCategoryNode[] };
+    gateProblems: string[];
+  },
+): void {
+  const localCodes = new Set(compatibility.map((item) => item.sourceFieldCode));
+  const resolveChoice = (item: FieldCompatibility, values: unknown[]): boolean => {
+    if (item.status !== 'UNRESOLVED') return item.status === 'EQUIVALENT';
+    const resolved = resolveChoiceOptions(item.sourceConfig);
+    if (!resolved) return false;
+    item.status = 'EQUIVALENT';
+    item.resolvedOptions = resolved.resolvedOptions;
+    if (resolved.optionValueMap) item.optionValueMap = resolved.optionValueMap;
+    item.reason = 'Choice values are carried with deterministic target option identifiers; ' +
+      'original labels and index order are preserved and record values are translated through the same map';
+    void values;
+    return true;
+  };
+  const resolveIdentity = (item: FieldCompatibility, values: unknown[]): boolean => {
+    if (item.status !== 'UNRESOLVED') return item.status === 'EQUIVALENT';
+    for (const value of values) {
+      if (identityEntriesOf(value) === null) return false;
+    }
+    item.status = 'EQUIVALENT';
+    item.reason = 'Source identities are enumerable into package directory entries with deterministic ' +
+      'source ids; the import administrator maps them explicitly to target directory members (job mappings)';
+    return true;
+  };
+  for (const item of compatibility) {
+    if (item.sourceType === 'SUBTABLE' && item.tableFields) {
+      const rows = (context.subtableRows ?? []).filter((row) => row.sourceTableCode === item.sourceFieldCode);
+      let allResolved = true;
+      for (const child of item.tableFields) {
+        if (child.status === 'EQUIVALENT') continue;
+        const values = rows.map((row) => (row.data?.[child.sourceFieldCode] as any)?.value);
+        if (KINTONE_CHOICE_TYPES.includes(child.sourceType)) {
+          if (!resolveChoice(child, values)) allResolved = false;
+        } else if (KINTONE_IDENTITY_TYPES.includes(child.sourceType)) {
+          if (!resolveIdentity(child, values)) allResolved = false;
+        } else allResolved = false;
+      }
+      if (allResolved && item.tableFields.every((child) => child.status === 'EQUIVALENT')) {
+        item.status = 'EQUIVALENT';
+        item.reason = 'Subtable row schema maps to supported SuzuBase table fields';
+      }
+      continue;
+    }
+    if (item.status !== 'UNRESOLVED') continue;
+    if (KINTONE_CHOICE_TYPES.includes(item.sourceType)) {
+      resolveChoice(item, context.records.map((record) => record[item.sourceFieldCode]?.value));
+      continue;
+    }
+    if (KINTONE_IDENTITY_TYPES.includes(item.sourceType)) {
+      resolveIdentity(item, context.records.map((record) => record[item.sourceFieldCode]?.value));
+      continue;
+    }
+    if (item.sourceType === 'CATEGORY') {
+      const config = item.sourceConfig as any;
+      const recordValues = context.records.map((record) => ({
+        recordId: String(record.$id?.value ?? ''),
+        names: Array.isArray(record[item.sourceFieldCode]?.value)
+          ? record[item.sourceFieldCode].value.map(String) : [],
+      }));
+      if (config?.enabled === false && recordValues.every(({ names }) => names.length === 0)) {
+        item.status = 'EQUIVALENT';
+        item.targetType = null;
+        item.categoryResolution = { mode: 'disabled' };
+        item.reason = 'Category feature is disabled in the source application and no record carries ' +
+          'category values; the target application keeps categories disabled with an empty tree';
+      } else if (context.categoryTree) {
+        const { resolved, unresolved } = resolveKintoneCategories(
+          context.categoryTree.nodes, recordValues);
+        if (unresolved.length) {
+          for (const entry of unresolved) {
+            context.gateProblems.push(
+              `UNRESOLVED_CATEGORY_IDENTITY: record ${entry.recordId} category "${entry.name}" ` +
+              'does not resolve to exactly one captured source node');
+          }
+        } else {
+          item.status = 'EQUIVALENT';
+          item.targetType = null;
+          item.categoryResolution = {
+            mode: 'tree', nodes: context.categoryTree.nodes, assignments: resolved,
+          };
+          item.reason = 'Category tree captured out of band; every record category name resolves to ' +
+            'exactly one source node and assignments are carried by node id';
+        }
+      }
+      continue;
+    }
+    if ((item.sourceConfig as any)?.lookup) {
+      const lookup = (item.sourceConfig as any).lookup;
+      const relatedAppId = String(lookup.relatedApp?.app ?? '');
+      const relatedFields = context.relatedApps?.[relatedAppId]?.fields;
+      if (!relatedFields) continue;
+      const relatedCodes = new Set(relatedFields.map((field: any) => String(field.code ?? '')));
+      const localFieldExists = (code: string) => localCodes.has(code);
+      const sortText = String(lookup.sort ?? '').trim();
+      let sort: KintoneLookupResolution['sort'] = null;
+      let sortValid = true;
+      if (sortText) {
+        const match = sortText.match(/^(.+?)\s+(asc|desc)$/i);
+        if (!match || !relatedCodes.has(match[1])) sortValid = false;
+        else sort = { field: match[1], direction: match[2].toLowerCase() as 'asc' | 'desc' };
+      }
+      const mappings = Array.isArray(lookup.fieldMappings) ? lookup.fieldMappings : [];
+      const pickerFields = Array.isArray(lookup.lookupPickerFields)
+        ? lookup.lookupPickerFields.map(String) : [];
+      const verified = Boolean(relatedAppId) &&
+        relatedCodes.has(String(lookup.relatedKeyField ?? '')) &&
+        mappings.every((mapping: any) => localFieldExists(String(mapping.field ?? '')) &&
+          relatedCodes.has(String(mapping.relatedField ?? ''))) &&
+        pickerFields.every((code: string) => relatedCodes.has(code)) &&
+        String(lookup.filterCond ?? '') === '' && sortValid;
+      if (verified) {
+        item.status = 'EQUIVALENT';
+        item.targetType = 'lookup';
+        item.lookupResolution = {
+          relatedAppId,
+          relatedKeyField: String(lookup.relatedKeyField),
+          copies: mappings.map((mapping: any) => ({
+            field: String(mapping.field), relatedField: String(mapping.relatedField),
+          })),
+          pickerFields,
+          filterCond: '',
+          sort,
+        };
+        item.reason = 'Lookup structure verified item by item against the related application: ' +
+          'relatedApp, relatedKeyField, fieldMappings, pickerFields, filterCond (empty) and sort all resolve';
+      } else if (String(lookup.filterCond ?? '') !== '') {
+        item.reason = 'Lookup filterCond is not empty and cannot be translated mechanically; ' +
+          'completion is pending';
+      }
+      continue;
+    }
+  }
+}
+
 export function mapKintoneField(source: any, options: {
   fields?: any[];
   acceptCalcDataOnly?: boolean;
@@ -319,7 +570,13 @@ export function sha256Buffer(buffer: Uint8Array) {
 
 export function stableSourceUuid(sourceKey: string) {
   const hex = createHash('sha256').update(sourceKey).digest('hex');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  // P4-T3a: the derived identifiers cross API boundaries whose schemas
+  // validate RFC 4122 UUIDs (z.uuid()), so the version (4) and variant
+  // (10xx) nibbles are set explicitly. The derivation stays deterministic;
+  // identifiers minted before this change differ and must not be mixed
+  // into a new package (extractions are always rebuilt fresh).
+  const variant = ((Number.parseInt(hex.slice(16, 17), 16) & 0x3) | 0x8).toString(16);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
 export interface KintoneExtractionResult {
@@ -340,6 +597,12 @@ export interface KintoneExtractionResult {
   subtableStates: KintoneSubtableState[];
   blocking: FieldCompatibility[];
   packageReady: boolean;
+  /** P4-T3a: source items that remain unavailable but are explicitly
+   * tolerated by the caller (e.g. the workflow-definitions endpoint, which
+   * answers 404 for API tokens and is recorded as SOURCE_UNAVAILABLE in the
+   * evidence and the migration report). They never disappear from the
+   * evidence; only the package gate ignores exactly these items. */
+  toleratedUnavailable?: string[];
   sourceMetadata?: {
     layout: unknown;
     settings: unknown;
@@ -382,20 +645,33 @@ function sourceDirectoryUsers(appId: string, comments: any[]) {
   return [...users.values()];
 }
 
-function mappedCommentMentions(appId: string, comment: any) {
-  const body = kintoneValue(comment.content ?? comment.body ?? '');
+export function kintoneCommentText(comment: any): string {
+  // Real kintone comments carry their text in `text`; earlier adapter code
+  // read `content`/`body` (the synthetic fixture shape), which silently
+  // sealed empty comment bodies for every real extraction.
+  return kintoneValue(comment.text ?? comment.content ?? comment.body ?? '');
+}
+
+function mappedCommentMentions(appId: string, comment: any, displayNames?: Map<string, string>) {
+  const body = kintoneCommentText(comment);
   return (comment.mentions ?? []).flatMap((mention: any) => {
     const userId = sourceUserId(appId, mention.user ?? mention);
     if (!userId) return [];
-    const name = String(mention.name ?? mention.user?.name ?? mention.displayName ?? mention.code ?? '');
+    const code = String(mention.code ?? mention.user?.code ?? '');
+    const name = String(mention.name ?? mention.user?.name ?? mention.displayName ??
+      (code ? displayNames?.get(code) : undefined) ?? code ?? '');
     let offset = Number.isInteger(mention.offset) ? mention.offset : -1;
     let length = Number.isInteger(mention.length) ? mention.length : 0;
     if (offset < 0 && name) {
-      const matched = `@${name}`;
-      const foundAt = body.indexOf(matched);
-      if (foundAt >= 0 && body.indexOf(matched, foundAt + matched.length) < 0) {
-        offset = foundAt;
-        length = matched.length;
+      // Kintone renders a mention as the user's display name in the text
+      // (no '@'); try the '@name' form first, then the bare display name.
+      for (const matched of [`@${name}`, name]) {
+        const foundAt = body.indexOf(matched);
+        if (foundAt >= 0 && body.indexOf(matched, foundAt + matched.length) < 0) {
+          offset = foundAt;
+          length = matched.length;
+          break;
+        }
       }
     }
     if (offset < 0 || length <= 0 || offset + length > body.length) return [];
@@ -418,12 +694,22 @@ function sourceEntryCount(value: any): number {
 
 export function buildM1CompatiblePackage(
   extraction: KintoneExtractionResult,
-  options: { sourceInstanceId?: string; sourceTenantId?: string } = {},
+  options: {
+    sourceInstanceId?: string; sourceTenantId?: string;
+    /** P4-T3a: cross-application lookup targets, keyed by SOURCE (kintone)
+     * application id. recordsByKey maps a related record's key-field value
+     * to that record's package id in the related application's package, so
+     * record references can be sealed into this package. */
+    relatedApps?: Record<string, { recordsByKey: Record<string, string> }>;
+  } = {},
 ) {
   if (!extraction.packageReady || !extraction.evidence.frozenWindow) {
     throw new Error('kintone package blocked: frozen snapshot and all source/field/dependency gates are required');
   }
-  if (extraction.evidence.unavailable.length) {
+  const toleratedUnavailable = new Set(extraction.toleratedUnavailable ?? []);
+  const blockingUnavailable = extraction.evidence.unavailable
+    .filter(({ item }) => !toleratedUnavailable.has(item));
+  if (blockingUnavailable.length) {
     throw new Error('kintone package blocked: source unavailable items exist');
   }
   if (extraction.blocking.length || extraction.compatibility.some(({ status }) => status === 'UNRESOLVED')) {
@@ -444,8 +730,99 @@ export function buildM1CompatiblePackage(
     formula?.map((token) => token.kind === 'field'
       ? { ...token, fieldId: fieldId(tableCode ? `${tableCode}:${token.fieldId}` : token.fieldId) }
       : token) ?? null;
-  const fields = extraction.compatibility.map((item) => {
+  // P4-T3a: directory entries are collected from record identity values as
+  // well as from comments, so every identity a record references is present
+  // in the package directory (deterministic source ids; the import
+  // administrator maps them explicitly to target members).
+  const recordDirectoryUsers = new Map<string, any>();
+  const recordDirectoryOrganizations = new Map<string, any>();
+  const recordDirectoryGroups = new Map<string, any>();
+  const directoryIdFor = (sourceType: string, code: string) => sourceType === 'ORGANIZATION_SELECT'
+    ? stableSourceUuid(`kintone:${sourceAppId}:organization:${code}`)
+    : sourceType === 'GROUP_SELECT'
+      ? stableSourceUuid(`kintone:${sourceAppId}:group:${code}`)
+      : stableSourceUuid(`kintone:${sourceAppId}:user:${code}`);
+  const collectIdentity = (sourceType: string, value: unknown) => {
+    for (const entry of identityEntriesOf(value) ?? []) {
+      const id = directoryIdFor(sourceType, entry.code);
+      if (sourceType === 'ORGANIZATION_SELECT') {
+        if (!recordDirectoryOrganizations.has(id)) {
+          recordDirectoryOrganizations.set(id, { id, name: entry.name ?? entry.code, parentId: null });
+        }
+      } else if (sourceType === 'GROUP_SELECT') {
+        if (!recordDirectoryGroups.has(id)) {
+          recordDirectoryGroups.set(id, { id, name: entry.name ?? entry.code, memberUserIds: [] });
+        }
+      } else if (!recordDirectoryUsers.has(id)) {
+        recordDirectoryUsers.set(id, {
+          id, email: '', loginName: entry.code, displayName: entry.name ?? entry.code, disabled: false,
+        });
+      }
+    }
+  };
+  for (const item of extraction.compatibility) {
+    if (KINTONE_IDENTITY_TYPES.includes(item.sourceType)) {
+      for (const record of extraction.records as any[]) {
+        collectIdentity(item.sourceType, record[item.sourceFieldCode]?.value);
+      }
+    }
+    if (item.sourceType === 'SUBTABLE' && item.tableFields) {
+      for (const child of item.tableFields) {
+        if (!KINTONE_IDENTITY_TYPES.includes(child.sourceType)) continue;
+        for (const row of extraction.subtableRows) {
+          if (row.sourceTableCode === item.sourceFieldCode) {
+            collectIdentity(child.sourceType, (row.data?.[child.sourceFieldCode] as any)?.value);
+          }
+        }
+      }
+    }
+  }
+  const translateIdentityValue = (sourceType: string, value: unknown, where: string): string | null => {
+    const entries = identityEntriesOf(value);
+    if (entries === null) {
+      throw new Error(`kintone package blocked: identity value at ${where} is not enumerable`);
+    }
+    if (!entries.length) return null;
+    if (entries.length > 1) {
+      throw new Error(`kintone package blocked: multi-entry identity value at ${where} ` +
+        'cannot be represented in a single-value target field');
+    }
+    return directoryIdFor(sourceType, entries[0].code);
+  };
+  const translateChoiceValue = (item: FieldCompatibility, raw: unknown): string => {
+    const map = item.optionValueMap;
+    if (Array.isArray(raw)) {
+      return JSON.stringify(raw.map((value) => (map?.[String(value)] ?? String(value))));
+    }
+    const text = raw === null || raw === undefined ? '' : String(raw);
+    return map?.[text] ?? text;
+  };
+  const relatedFieldId = (relatedAppId: string, code: string) =>
+    stableSourceUuid(`kintone:${relatedAppId}:field:${code}`);
+  const fields: any[] = [];
+  const relations: any[] = [];
+  let packageCategories: { enabled: boolean; nodes: any[] } | undefined;
+  for (const item of extraction.compatibility) {
     const config = item.sourceConfig as any;
+    if (item.sourceType === 'CATEGORY') {
+      // Categories are application configuration in SuzuBase, not a field.
+      const resolution = item.categoryResolution;
+      if (!resolution) {
+        throw new Error('kintone package blocked: category field has no extraction resolution');
+      }
+      packageCategories = resolution.mode === 'disabled'
+        ? { enabled: false, nodes: [] }
+        : {
+          enabled: true,
+          nodes: (resolution.nodes ?? []).map((node) => ({
+            id: stableSourceUuid(`kintone:${sourceAppId}:category:${node.id}`),
+            parentId: node.parentId
+              ? stableSourceUuid(`kintone:${sourceAppId}:category:${node.parentId}`) : null,
+            name: node.name, sortOrder: node.sortOrder,
+          })),
+        };
+      continue;
+    }
     const tableFields = item.tableFields?.map((child) => {
       const childConfig = child.sourceConfig as any;
       return {
@@ -454,65 +831,190 @@ export function buildM1CompatiblePackage(
         name: String(childConfig.label ?? child.sourceFieldCode),
         type: child.targetType,
         required: Boolean(childConfig.required),
-        uniqueValue: false,
-        options: targetOptions(childConfig.options),
+        uniqueValue: Boolean(childConfig.unique),
+        options: child.resolvedOptions ?? targetOptions(childConfig.options),
         formula: targetFormula(child.formula, item.sourceFieldCode),
       };
     });
     const layoutKind: Record<string, string> = {
       GROUP: 'group', LABEL: 'label', SPACER: 'blank', HR: 'separator',
     };
-    return {
-    fieldId: fieldId(item.sourceFieldCode),
-    code: item.sourceFieldCode,
-    name: String(config.label ?? item.sourceFieldCode),
-    type: item.targetType,
-    required: Boolean(config.required),
-    uniqueValue: false,
-    searchMode: null,
-    formula: targetFormula(item.formula),
-    lookup: null,
-    related: null,
-    table: tableFields?.length ? {
-      fields: tableFields, minRows: 0, maxRows: 100,
-      addRows: true, deleteRows: true, reorderRows: true,
-    } : null,
-    layoutElement: layoutKind[item.sourceType]
-      ? { kind: layoutKind[item.sourceType], text: String(config.label ?? item.sourceFieldCode) } : null,
-    autoNumber: null,
-    options: targetOptions(config.options),
-    kintoneSource: {
-      sourceType: item.sourceType,
-      sourceConfig: item.sourceConfig,
-      compatibility: item.status,
-      reason: item.reason,
-    },
-  }; });
+    const baseField = {
+      required: Boolean(config.required),
+      uniqueValue: Boolean(config.unique),
+      searchMode: null,
+      formula: targetFormula(item.formula),
+      related: null,
+      table: tableFields?.length ? {
+        fields: tableFields, minRows: 0, maxRows: 100,
+        addRows: true, deleteRows: true, reorderRows: true,
+      } : null,
+      layoutElement: layoutKind[item.sourceType]
+        ? { kind: layoutKind[item.sourceType], text: String(config.label ?? item.sourceFieldCode) } : null,
+      autoNumber: null,
+      options: item.resolvedOptions ?? targetOptions(config.options),
+      kintoneSource: {
+        sourceType: item.sourceType,
+        sourceConfig: item.sourceConfig,
+        compatibility: item.status,
+        reason: item.reason,
+      },
+    };
+    if (item.lookupResolution) {
+      // A kintone lookup field stores the key value on the record. The
+      // target lookup field needs an independent local key field, so the
+      // source field becomes a lookup field plus a synthetic `<code>__key`
+      // text field that carries the stored key value verbatim.
+      const resolution = item.lookupResolution;
+      const relatedAppId = stableSourceUuid(`kintone-app:${resolution.relatedAppId}`);
+      const baseType = mapKintoneField({ ...config, lookup: undefined }).targetType;
+      fields.push({
+        ...baseField,
+        fieldId: fieldId(`${item.sourceFieldCode}__key`),
+        code: `${item.sourceFieldCode}__key`,
+        name: `${String(config.label ?? item.sourceFieldCode)} (lookup key)`,
+        type: baseType, required: false, uniqueValue: false,
+        formula: null, table: null, layoutElement: null, options: [],
+        lookup: null,
+        kintoneSource: {
+          sourceType: item.sourceType, sourceConfig: item.sourceConfig,
+          compatibility: item.status,
+          reason: 'Synthetic local key field carrying the kintone lookup key value verbatim',
+        },
+      });
+      const lookupConfig = {
+        appId: relatedAppId,
+        keyFieldId: relatedFieldId(resolution.relatedAppId, resolution.relatedKeyField),
+        localKeyFieldId: fieldId(`${item.sourceFieldCode}__key`),
+        copies: resolution.copies.map((copy) => ({
+          sourceFieldId: relatedFieldId(resolution.relatedAppId, copy.relatedField),
+          targetFieldId: fieldId(copy.field),
+        })),
+        ...(resolution.pickerFields.length
+          ? { displayFieldIds: resolution.pickerFields.map((code) =>
+            relatedFieldId(resolution.relatedAppId, code)) }
+          : {}),
+        ...(resolution.sort
+          ? { sort: {
+            fieldId: relatedFieldId(resolution.relatedAppId, resolution.sort.field),
+            direction: resolution.sort.direction,
+          } }
+          : {}),
+      };
+      fields.push({
+        ...baseField,
+        fieldId: fieldId(item.sourceFieldCode),
+        code: item.sourceFieldCode,
+        name: String(config.label ?? item.sourceFieldCode),
+        type: 'lookup', required: false, uniqueValue: false,
+        formula: null, table: null, layoutElement: null, options: [],
+        lookup: lookupConfig,
+      });
+      relations.push({
+        fieldId: fieldId(item.sourceFieldCode), kind: 'lookup', config: lookupConfig,
+        target: { appId: relatedAppId, appCode: `kintone-${resolution.relatedAppId}` },
+      });
+      continue;
+    }
+    fields.push({
+      ...baseField,
+      fieldId: fieldId(item.sourceFieldCode),
+      code: item.sourceFieldCode,
+      name: String(config.label ?? item.sourceFieldCode),
+      type: item.targetType,
+      lookup: null,
+    });
+  }
+  const categoryItem = extraction.compatibility.find((item) => item.sourceType === 'CATEGORY');
+  const references: {
+    recordId: string; fieldId: string; targetAppId: string;
+    targetAppCode: string; targetRecordId: string;
+  }[] = [];
+  for (const item of extraction.compatibility) {
+    if (!item.lookupResolution) continue;
+    const related = options.relatedApps?.[item.lookupResolution.relatedAppId];
+    if (!related) {
+      throw new Error(`kintone package blocked: lookup ${item.sourceFieldCode} requires the related ` +
+        'application\'s records to seal record references');
+    }
+    for (const record of extraction.records as any[]) {
+      const key = kintoneValue(record[item.sourceFieldCode]);
+      if (!key) continue;
+      const targetRecordId = related.recordsByKey[key];
+      if (!targetRecordId) {
+        throw new Error(`kintone package blocked: lookup key "${key}" in ${item.sourceFieldCode} ` +
+          'has no record in the related application package');
+      }
+      references.push({
+        recordId: stableSourceUuid(`kintone:${sourceAppId}:record:${String(record.$id?.value ?? '')}`),
+        fieldId: fieldId(item.sourceFieldCode),
+        targetAppId: stableSourceUuid(`kintone-app:${item.lookupResolution.relatedAppId}`),
+        targetAppCode: `kintone-${item.lookupResolution.relatedAppId}`,
+        targetRecordId,
+      });
+    }
+  }
   const records = extraction.records.map((record: any) => {
     const sourceId = String(record.$id?.value ?? '');
     const data: Record<string, string> = {};
     for (const item of extraction.compatibility) {
       const source = record[item.sourceFieldCode];
-      if (source !== undefined && item.sourceType !== 'SUBTABLE') {
-        const value = item.sourceType === 'FILE'
-          ? JSON.stringify((source.value ?? []).map((file: any) =>
-            stableSourceUuid(`kintone:${sourceAppId}:file:${file.fileKey}`)))
-          : kintoneValue(source);
-        data[fieldId(item.sourceFieldCode)] = value;
+      if (item.sourceType === 'SUBTABLE' || item.sourceType === 'CATEGORY') continue;
+      if (item.lookupResolution) {
+        // The key value is carried by the synthetic local key field; the
+        // lookup field itself holds no stored value.
+        if (source !== undefined) {
+          data[fieldId(`${item.sourceFieldCode}__key`)] = kintoneValue(source);
+        }
+        continue;
+      }
+      if (source === undefined) continue;
+      if (item.sourceType === 'FILE') {
+        data[fieldId(item.sourceFieldCode)] = JSON.stringify((source.value ?? []).map((file: any) =>
+          stableSourceUuid(`kintone:${sourceAppId}:file:${file.fileKey}`)));
+      } else if (KINTONE_IDENTITY_TYPES.includes(item.sourceType)) {
+        const translated = translateIdentityValue(item.sourceType, source.value,
+          `record ${sourceId} field ${item.sourceFieldCode}`);
+        if (translated !== null) data[fieldId(item.sourceFieldCode)] = translated;
+      } else if (KINTONE_CHOICE_TYPES.includes(item.sourceType)) {
+        data[fieldId(item.sourceFieldCode)] = translateChoiceValue(item, source.value);
+      } else {
+        data[fieldId(item.sourceFieldCode)] = kintoneValue(source);
       }
     }
+    const creatorItem = extraction.compatibility.find((item) => item.sourceType === 'CREATOR');
+    const modifierItem = extraction.compatibility.find((item) => item.sourceType === 'MODIFIER');
+    const createdTimeItem = extraction.compatibility.find((item) => item.sourceType === 'CREATED_TIME');
+    const updatedTimeItem = extraction.compatibility.find((item) => item.sourceType === 'UPDATED_TIME');
+    const createdBy = creatorItem
+      ? translateIdentityValue('CREATOR', record[creatorItem.sourceFieldCode]?.value,
+        `record ${sourceId} creator`)
+      : null;
+    const updatedBy = modifierItem
+      ? translateIdentityValue('MODIFIER', record[modifierItem.sourceFieldCode]?.value,
+        `record ${sourceId} modifier`)
+      : null;
+    const categoryIds = categoryItem?.categoryResolution?.mode === 'tree'
+      ? (categoryItem.categoryResolution.assignments?.[sourceId] ?? []).map((nodeId) =>
+        stableSourceUuid(`kintone:${sourceAppId}:category:${nodeId}`))
+      : [];
     return {
       id: stableSourceUuid(`kintone:${sourceAppId}:record:${sourceId}`),
       recordNo: kintoneValue(record.$id),
       data,
+      categoryIds,
       archivedData: {},
       schemaVersion: 1,
       revision: 1,
       status: 'PUBLISHED',
-      createdBy: stableSourceUuid(`kintone:${sourceAppId}:creator:unknown`),
-      createdAt: extraction.evidence.extractedAt,
-      updatedBy: stableSourceUuid(`kintone:${sourceAppId}:modifier:unknown`),
-      updatedAt: extraction.evidence.extractedAt,
+      createdBy: createdBy ?? stableSourceUuid(`kintone:${sourceAppId}:creator:unknown`),
+      createdAt: createdTimeItem
+        ? (kintoneValue(record[createdTimeItem.sourceFieldCode]) || extraction.evidence.extractedAt)
+        : extraction.evidence.extractedAt,
+      updatedBy: updatedBy ?? stableSourceUuid(`kintone:${sourceAppId}:modifier:unknown`),
+      updatedAt: updatedTimeItem
+        ? (kintoneValue(record[updatedTimeItem.sourceFieldCode]) || extraction.evidence.extractedAt)
+        : extraction.evidence.extractedAt,
       deletedBy: null,
       deletedAt: null,
       workflow: null,
@@ -528,7 +1030,21 @@ export function buildM1CompatiblePackage(
     for (const [sourceCode, value] of Object.entries(row.data)) {
       const child = table.tableFields.find((item) => item.sourceFieldCode === sourceCode);
       if (!child) throw new Error(`kintone package blocked: unknown child field ${row.sourceTableCode}.${sourceCode}`);
-      data[fieldId(`${row.sourceTableCode}:${sourceCode}`)] = kintoneValue(value);
+      const targetFieldId = fieldId(`${row.sourceTableCode}:${sourceCode}`);
+      if (child.sourceType === 'FILE') {
+        // Subtable attachment cells carry the same target file ids as
+        // top-level file fields, so the import can reconcile them.
+        data[targetFieldId] = JSON.stringify(((value as any)?.value ?? []).map((file: any) =>
+          stableSourceUuid(`kintone:${sourceAppId}:file:${file.fileKey}`)));
+      } else if (KINTONE_IDENTITY_TYPES.includes(child.sourceType)) {
+        const translated = translateIdentityValue(child.sourceType, (value as any)?.value,
+          `subtable ${row.sourceTableCode} row ${row.sourceRowId} field ${sourceCode}`);
+        if (translated !== null) data[targetFieldId] = translated;
+      } else if (KINTONE_CHOICE_TYPES.includes(child.sourceType)) {
+        data[targetFieldId] = translateChoiceValue(child, (value as any)?.value);
+      } else {
+        data[targetFieldId] = kintoneValue(value);
+      }
     }
     return {
       recordId: stableSourceUuid(`kintone:${sourceAppId}:record:${row.sourceRecordId}`),
@@ -565,13 +1081,33 @@ export function buildM1CompatiblePackage(
     .map((file) => [`attachments/${stableSourceUuid(`kintone:${sourceAppId}:file:${file.fileKey}`)}/v1/body`, Buffer.from(file.body!)]));
 
   const expected: ObjectCounts = emptyCounts();
-  const directoryUsers = sourceDirectoryUsers(sourceAppId, extraction.comments);
+  const commentDirectoryUsers = sourceDirectoryUsers(sourceAppId, extraction.comments);
+  const directoryUsers = [...commentDirectoryUsers];
+  for (const user of recordDirectoryUsers.values()) {
+    const existing = directoryUsers.find((entry) => entry.id === user.id);
+    if (!existing) {
+      directoryUsers.push(user);
+    } else if (existing.displayName === existing.loginName &&
+      user.displayName && user.displayName !== user.loginName) {
+      // A comment mention carries only the login code, so the comment-derived
+      // entry falls back to the code as its display name; a record identity
+      // value carries the real display name — prefer it.
+      existing.displayName = user.displayName;
+    }
+  }
+  const commentDisplayNames = new Map<string, string>();
+  for (const user of directoryUsers) {
+    if (user.loginName && user.displayName) commentDisplayNames.set(user.loginName, user.displayName);
+  }
+  const directoryOrganizations = [...recordDirectoryOrganizations.values()];
+  const directoryGroups = [...recordDirectoryGroups.values()];
   expected.apps = 1;
   expected.appVersions = 1;
   expected.fieldVersionSnapshots = 1;
   expected.fields = fields.length;
   expected.records = records.length;
   expected.tableRows = tableRows.length;
+  expected.references = references.length;
   expected.attachments = attachmentEntries.length;
   expected.attachmentVersions = attachmentEntries.length;
   expected.comments = extraction.comments.length;
@@ -607,6 +1143,7 @@ export function buildM1CompatiblePackage(
     'data/schema.json': JSON.stringify({
       versions: [{ version: 1, aclConfiguration: { app: [], record: [], field: [] },
         fieldEdits: {}, formLayout: [], notificationRules: [], viewConfiguration: { views: [] },
+        ...(packageCategories ? { categories: packageCategories } : {}),
         migrationReport: compatEvidence, fields }],
       fields,
       rawFields: fields.map((field) => ({ ...field, introducedIn: 1 })),
@@ -615,28 +1152,32 @@ export function buildM1CompatiblePackage(
     'data/workflows.json': JSON.stringify({ definitions: [] }),
     'data/records.json': JSON.stringify({ records }),
     'data/table-rows.json': JSON.stringify({ rows: tableRows }),
-    'data/references.json': JSON.stringify({ references: [] }),
+    'data/references.json': JSON.stringify({ references }),
     'data/attachments.json': JSON.stringify({ files: attachmentMetadata }),
     'data/comments.json': JSON.stringify({ comments: extraction.comments.map((comment: any, index: number) => ({
-      id: stableSourceUuid(`kintone:${sourceAppId}:comment:${String(comment.id ?? index)}`),
+      // Kintone comment ids are unique only within their record (every
+      // record's first comment is id "1"), so the stable key must include
+      // the source record id; keyed by comment id alone, distinct records'
+      // comments collide into a single package comment.
+      id: stableSourceUuid(`kintone:${sourceAppId}:comment:${String(comment.recordId ?? comment.$id?.value ?? '')}:${String(comment.id ?? index)}`),
       recordId: stableSourceUuid(`kintone:${sourceAppId}:record:${String(comment.recordId ?? comment.$id?.value ?? '')}`),
       authorId: stableSourceUuid(`kintone:${sourceAppId}:user:${String(comment.creator?.code ?? comment.user?.code ?? 'unknown')}`),
       createdAt: comment.createdAt ?? extraction.evidence.extractedAt,
       deleted: false,
       deletedAt: null,
-      body: kintoneValue(comment.content ?? comment.body ?? ''),
-      mentions: mappedCommentMentions(sourceAppId, comment),
+      body: kintoneCommentText(comment),
+      mentions: mappedCommentMentions(sourceAppId, comment, commentDisplayNames),
     })) }),
     'data/history.json': JSON.stringify({ recordEvents: [], workflowEvents: [] }),
     'data/config.json': JSON.stringify({
       acl: { app: [], record: [], field: [] },
       notificationRules: [],
-      relations: [],
+      relations,
       apiTokens: [],
       kintoneCompatibility: compatEvidence,
     }),
     'data/directory.json': JSON.stringify({
-      users: directoryUsers, groups: [], organizations: [],
+      users: directoryUsers, groups: directoryGroups, organizations: directoryOrganizations,
     }),
   };
   return sealPackage({
@@ -782,6 +1323,15 @@ export class KintoneSourceAdapter {
     acceptPermissionDowngrade?: boolean;
     checkpoint?: KintoneExtractionCheckpoint;
     onCheckpoint?: (checkpoint: KintoneExtractionCheckpoint) => void | Promise<void>;
+    /** P4-T3a: field metadata of related applications (keyed by kintone
+     * app id) used to verify lookup structures item by item. */
+    relatedApps?: Record<string, { fields: any[] }>;
+    /** P4-T3a: out-of-band category tree capture for this application. */
+    categoryTree?: { nodes: KintoneCategoryNode[] };
+    /** P4-T3a: source items that may remain unavailable without blocking
+     * packaging; they stay in the evidence and must be reported by the
+     * caller (see KintoneExtractionResult.toleratedUnavailable). */
+    tolerateUnavailable?: string[];
   } = {}) {
     if (options.checkpoint && options.checkpoint.appId !== appId) {
       throw new Error('kintone checkpoint belongs to a different source application');
@@ -980,6 +1530,16 @@ export class KintoneSourceAdapter {
     } catch (error) {
       preflight.unavailable.push({ item: 'records', reason: error instanceof Error ? error.message : 'unavailable', evidence: null });
     }
+    // P4-T3a: with the full record set available, resolve the conservative
+    // context-free verdicts that have a designed platform mechanism
+    // (choice identifiers, directory identities, categories, lookups).
+    resolveExtractionCompatibility(compatibility, {
+      records, subtableRows,
+      relatedApps: options.relatedApps,
+      categoryTree: options.categoryTree,
+      gateProblems,
+    });
+    const toleratedUnavailable = [...new Set(options.tolerateUnavailable ?? [])];
     const evidence: SourceEvidence = {
       source: 'kintone', appId, appName: String(app.name ?? ''),
       extractedAt: new Date().toISOString(), settingVersion: null,
@@ -991,9 +1551,9 @@ export class KintoneSourceAdapter {
     };
     const blocking = compatibility.filter(({ status }) => status === 'UNSUPPORTED');
     return { evidence, compatibility, records, comments, attachments, subtableRows, subtableStates, blocking,
-      sourceMetadata, gateProblems, downgrades,
+      sourceMetadata, gateProblems, downgrades, toleratedUnavailable,
       packageReady: blocking.length === 0 &&
-        preflight.unavailable.length === 0 &&
+        preflight.unavailable.every(({ item }) => toleratedUnavailable.includes(item)) &&
         gateProblems.length === 0 &&
         Boolean(frozenWindow) &&
         !compatibility.some(({ status }) => status === 'UNRESOLVED') };
