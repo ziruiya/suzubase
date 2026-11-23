@@ -3,13 +3,13 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
-  and, apps, automationAuditEvents, automationCadencePlans, automationCadenceSlots, automationGrants, automationRuleVersions, automationRunActions, automationRuns,
-  automationRules, automationProblemChains, eq, groupMembers, inArray, isNull, notifications, outbox, records, sql, tenantMembers, TenantContext, TenantTransaction, withTenantTransaction, workflowAssignments,
+  and, apps, automationAuditEvents, automationCadencePlans, automationCadenceSlots, automationDateBackfills, automationGrants, automationRuleVersions, automationRunActions, automationRuns,
+  automationRules, automationProblemChains, automationSchedules, eq, groupMembers, inArray, isNull, notifications, outbox, records, sql, tenantMembers, TenantContext, TenantTransaction, withTenantTransaction, workflowAssignments,
   type AutomationRuleConfig,
 } from '@suzubase/db';
 import {
-  enumerateSlots, isValidLocalTime, isValidTimezone, nextSlotAfter,
-  type FixedScheduleConfig, type ScheduleSlot,
+  dateRelativeDueAt, dateRelativeScheduleKey, enumerateSlots, isIsoDate, isValidLocalTime, isValidTimezone, isoDateInZone, nextSlotAfter,
+  type DateRelativeConfig, type FixedScheduleConfig, type ScheduleSlot,
 } from './automation-schedule';
 import { fieldContract, multiOptionFieldTypes, type FieldDefinition, type RecordData, type RecordResponse } from '@suzubase/shared-types';
 import Decimal from 'decimal.js';
@@ -24,7 +24,7 @@ import { WorkflowRuntimeService } from './workflow-runtime';
 import { randomUUID } from 'node:crypto';
 import { identifier, parseInput } from './validation';
 
-const eventTypes = ['record.created', 'record.updated', 'record.deleted', 'workflow.transitioned', 'workflow.rejected', 'schedule.fixed'] as const;
+const eventTypes = ['record.created', 'record.updated', 'record.deleted', 'workflow.transitioned', 'workflow.rejected', 'schedule.fixed', 'schedule.dateRelative'] as const;
 
 const fixedSchedule = z.strictObject({
   cadence: z.enum(['daily', 'weekly', 'monthly']),
@@ -33,6 +33,13 @@ const fixedSchedule = z.strictObject({
   weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).optional(),
   monthDay: z.number().int().min(1).max(31).optional(),
   missedRunPolicy: z.enum(['skip', 'catch_up_latest']).optional(),
+});
+const dateRelativeSchedule = z.strictObject({
+  source: z.enum(['field', 'createdAt']),
+  fieldId: identifier.optional(),
+  offsetDays: z.number().int().min(-3650).max(3650),
+  localTime: z.string(),
+  timezone: z.string().min(1).max(100),
 });
 export const AUTOMATION_TENANT_RUN_RATE_LIMIT = 100;
 export const AUTOMATION_TENANT_RUN_RATE_WINDOW_MS = 60_000;
@@ -61,6 +68,18 @@ export const AUTOMATION_SCHEDULE_ON_TIME_GRACE_MS = 15 * 60_000;
 // Due-plan backlog above this count alerts tenant admins (SYSTEM
 // notification + audit row, throttled to one alert per day per tenant).
 export const AUTOMATION_SCHEDULE_BACKLOG_ALERT_THRESHOLD = 100;
+
+// P3-C date-relative (T-3 lower half): brief 3.2 late window -- a plan
+// executed within 24 ACTUAL hours of its due_at (UTC) is a late
+// execution (marked LATE); past the window the plan is MISSED and never
+// executes. This is unrelated to the fixed-cadence 15-minute on-time
+// grace above: that one classifies cadence slots, this one is the
+// brief's explicit date-relative contract.
+export const AUTOMATION_DATE_RELATIVE_LATE_WINDOW_MS = 24 * 3_600_000;
+// Aggregated MISSED alerting: at or above this many plans marked MISSED
+// in one pass, tenant admins get ONE summary SYSTEM notification (daily
+// dedup) instead of one message per missed plan.
+export const AUTOMATION_DATE_RELATIVE_MISSED_ALERT_THRESHOLD = 100;
 
 // P3-C C-0 (option a): maintenanceTenants() contexts carry the nil UUID as
 // userId; that identity is not a tenant member, so audit rows written from
@@ -102,6 +121,7 @@ const config = z.strictObject({
     toStateId: identifier.optional(),
     allowManual: z.boolean().optional(),
     schedule: fixedSchedule.optional(),
+    dateRelative: dateRelativeSchedule.optional(),
   }),
   conditions: z.strictObject({
     eventSnapshot: conditionGroup,
@@ -179,6 +199,31 @@ const config = z.strictObject({
     }
   } else if (trigger.schedule) {
     ctx.addIssue({ code: 'custom', message: 'Only fixed-schedule triggers take a schedule configuration' });
+  }
+  if (trigger.eventType === 'schedule.dateRelative') {
+    if (!trigger.dateRelative) {
+      ctx.addIssue({ code: 'custom', message: 'Date-relative triggers require a dateRelative configuration' });
+    } else {
+      const relative = trigger.dateRelative;
+      if (trigger.fieldId || trigger.fromStateId || trigger.toStateId ||
+        'oldValue' in trigger && trigger.oldValue !== undefined || 'newValue' in trigger && trigger.newValue !== undefined) {
+        ctx.addIssue({ code: 'custom', message: 'Date-relative triggers do not take event selectors' });
+      }
+      if (relative.source === 'field' && !relative.fieldId) {
+        ctx.addIssue({ code: 'custom', message: 'Date-relative field source requires a fieldId' });
+      }
+      if (relative.source === 'createdAt' && relative.fieldId) {
+        ctx.addIssue({ code: 'custom', message: 'Date-relative createdAt source takes no fieldId' });
+      }
+      if (!isValidLocalTime(relative.localTime)) {
+        ctx.addIssue({ code: 'custom', message: 'Date-relative localTime must be HH:MM (24-hour)' });
+      }
+      if (!isValidTimezone(relative.timezone)) {
+        ctx.addIssue({ code: 'custom', message: 'Date-relative timezone must be an IANA timezone identifier' });
+      }
+    }
+  } else if (trigger.dateRelative) {
+    ctx.addIssue({ code: 'custom', message: 'Only date-relative triggers take a dateRelative configuration' });
   }
   const sameIds = (left: string[], right: string[]) =>
     left.length === right.length && left.every((id) => right.includes(id));
@@ -377,6 +422,7 @@ function fieldsFor(configValue: AutomationRuleConfig) {
   const ids = new Set<string>();
   const trigger = configValue.trigger;
   if (trigger.fieldId) ids.add(trigger.fieldId);
+  if (trigger.dateRelative?.fieldId) ids.add(trigger.dateRelative.fieldId);
   for (const stage of [configValue.conditions.eventSnapshot, configValue.conditions.currentState]) {
     for (const group of stage.groups) for (const item of group.conditions) ids.add(item.fieldId);
   }
@@ -590,6 +636,9 @@ export class AutomationService {
       if (ruleForPlan?.enabled && ruleForPlan.currentVersion === input.version) {
         const version = await this.readVersion(tx, context, appId, ruleId, input.version);
         await this.refreshCadencePlan(tx, context.tenantId, appId, ruleId, version);
+        // P3-C date-relative: a fresh grant revives planning too -- the
+        // backfill (re)scan regenerates the version's per-record plans.
+        await this.ensureDateBackfill(tx, context.tenantId, appId, ruleId, version);
       }
       return grant;
     });
@@ -605,6 +654,7 @@ export class AutomationService {
       if (!grant) throw new NotFoundException('Active automation grant not found');
       // P3-C cadence: revoking the grant kills that version's plan.
       await this.invalidateCadencePlans(tx, context.tenantId, ruleId, 'grant-revoked', { onlyVersion: grant.ruleVersion });
+      await this.invalidateDateRelativePlans(tx, context.tenantId, ruleId, 'grant-revoked', { onlyVersion: grant.ruleVersion });
       await tx.insert(automationAuditEvents).values({
         tenantId: context.tenantId, appId, ruleId, ruleVersion: grant.ruleVersion,
         actorId: context.userId, action: 'GRANT_REVOKED',
@@ -691,6 +741,10 @@ export class AutomationService {
       // cleared, so nothing can fire until enable).
       await this.invalidateCadencePlans(tx, context.tenantId, ruleId, 'version-superseded', { exceptVersion: input.version });
       await this.refreshCadencePlan(tx, context.tenantId, appId, ruleId, published);
+      // P3-C date-relative: the superseded version's per-record plans die
+      // with it; the new version backfills its own plans from scratch.
+      await this.invalidateDateRelativePlans(tx, context.tenantId, ruleId, 'version-superseded', { exceptVersion: input.version });
+      await this.ensureDateBackfill(tx, context.tenantId, appId, ruleId, published);
       await tx.insert(automationAuditEvents).values({
         tenantId: context.tenantId, appId, ruleId, ruleVersion: input.version,
         actorId: context.userId, action: 'PUBLISHED', details: { warnings: findings },
@@ -725,8 +779,10 @@ export class AutomationService {
       if (input.enabled) {
         const version = await this.readVersion(tx, context, appId, ruleId, rule.currentVersion);
         await this.refreshCadencePlan(tx, context.tenantId, appId, ruleId, version);
+        await this.ensureDateBackfill(tx, context.tenantId, appId, ruleId, version);
       } else {
         await this.invalidateCadencePlans(tx, context.tenantId, ruleId, 'rule-disabled');
+        await this.invalidateDateRelativePlans(tx, context.tenantId, ruleId, 'rule-disabled');
       }
       await tx.insert(automationAuditEvents).values({
         tenantId: context.tenantId, appId, ruleId, ruleVersion: rule.currentVersion,
@@ -745,6 +801,7 @@ export class AutomationService {
         eq(automationRules.id, ruleId), isNull(automationRules.archivedAt))).returning();
       if (!rule) throw new NotFoundException('Active automation rule not found');
       await this.invalidateCadencePlans(tx, context.tenantId, ruleId, 'rule-archived');
+      await this.invalidateDateRelativePlans(tx, context.tenantId, ruleId, 'rule-archived');
       await tx.insert(automationAuditEvents).values({
         tenantId: context.tenantId, appId, ruleId, ruleVersion: rule.currentVersion,
         actorId: context.userId, action: 'RULE_ARCHIVED',
@@ -959,6 +1016,21 @@ export class AutomationService {
           )).where(and(eq(automationRules.tenantId, context.tenantId), eq(automationRules.appId, event.appId),
             eq(automationRules.enabled, true), isNull(automationRules.archivedAt),
             eq(automationRuleVersions.status, 'published')));
+          // P3-C date-relative: record lifecycle events maintain the
+          // per-record plans of every enabled date-relative rule on this
+          // app (create -> generate, date change -> invalidate + regen,
+          // delete -> invalidate). This is plan maintenance only: it
+          // never creates runs, and it is deliberately placed before the
+          // guardrail deferrals below so a rate/backlog pause cannot lose
+          // a plan update (the event itself stays unprocessed and the
+          // sync is idempotent when the pass repeats).
+          if (eventType === 'record.created' || eventType === 'record.updated' || eventType === 'record.deleted') {
+            for (const candidate of candidates) {
+              const candidateCfg = this.configOf(candidate.version);
+              if (candidateCfg.trigger.eventType !== 'schedule.dateRelative' || candidate.grant.revokedAt) continue;
+              await this.syncDateRelativePlanForEvent(tx, context.tenantId, candidate, event);
+            }
+          }
             const rootCausationId = event.rootCausationId ?? event.eventId;
             const [paused] = await tx.select().from(automationProblemChains).where(and(
               eq(automationProblemChains.tenantId, context.tenantId),
@@ -1620,6 +1692,459 @@ export class AutomationService {
       });
     }
     return { runsCreated, done };
+  }
+
+  // ---------------------------------------------------------------------
+  // P3-C date-relative (T-3 lower half): per-record persistent plans in
+  // automation_schedules, maintained by record lifecycle events and by a
+  // checkpointed backfill, consumed by the same worker loop and the same
+  // executeActions engine as every other trigger. Brief 3.2 contract:
+  // date change invalidates + regenerates, delete / disable / revoke /
+  // version change invalidate, execution revalidates the live record,
+  // 24 actual hours of lateness execute as LATE, beyond that MISSED.
+  // ---------------------------------------------------------------------
+
+  private dateRelativeConfigOf(cfg: AutomationRuleConfig): DateRelativeConfig | null {
+    if (cfg.trigger.eventType !== 'schedule.dateRelative' || !cfg.trigger.dateRelative) return null;
+    const relative = cfg.trigger.dateRelative;
+    return {
+      source: relative.source, fieldId: relative.fieldId, offsetDays: relative.offsetDays,
+      localTime: relative.localTime, timezone: relative.timezone,
+    };
+  }
+
+  private sourceDateForRecord(relative: DateRelativeConfig,
+    record: { data: Record<string, unknown>; createdAt: Date | string }): string | null {
+    if (relative.source === 'createdAt') return isoDateInZone(new Date(record.createdAt), relative.timezone);
+    const raw = relative.fieldId ? record.data[relative.fieldId] : undefined;
+    return isIsoDate(raw) ? raw : null;
+  }
+
+  // Regenerate (or invalidate) the single logical plan of one record
+  // under one rule version. Idempotent: re-running the sync for an
+  // unchanged record changes nothing.
+  private async syncDateRelativePlan(tx: TenantTransaction, args: {
+    tenantId: string; appId: string; ruleId: string; ruleVersion: number;
+    cfg: AutomationRuleConfig;
+    record: { id: string; data: Record<string, unknown>; createdAt: Date | string; deletedAt: Date | string | null };
+  }) {
+    const relative = this.dateRelativeConfigOf(args.cfg);
+    if (!relative) return;
+    const key = dateRelativeScheduleKey(relative);
+    const scope = and(eq(automationSchedules.tenantId, args.tenantId),
+      eq(automationSchedules.ruleId, args.ruleId), eq(automationSchedules.ruleVersion, args.ruleVersion),
+      eq(automationSchedules.recordId, args.record.id), eq(automationSchedules.scheduleKey, key));
+    const [existing] = await tx.select().from(automationSchedules).where(scope);
+    const invalidateExisting = async (reason: string) => {
+      if (existing?.status !== 'PENDING') return;
+      await tx.update(automationSchedules).set({
+        status: 'INVALIDATED', invalidatedAt: sql`clock_timestamp()`, invalidationReason: reason,
+        claimToken: null, claimedAt: null,
+      }).where(scope);
+    };
+    if (args.record.deletedAt) {
+      await invalidateExisting('record-deleted');
+      return;
+    }
+    const sourceDate = this.sourceDateForRecord(relative, args.record);
+    if (!sourceDate) {
+      await invalidateExisting('date-cleared');
+      return;
+    }
+    const { dueAt } = dateRelativeDueAt(sourceDate, relative);
+    if (!existing) {
+      await tx.insert(automationSchedules).values({
+        tenantId: args.tenantId, appId: args.appId, ruleId: args.ruleId, ruleVersion: args.ruleVersion,
+        recordId: args.record.id, scheduleKey: key, dueAt: dueAt.toISOString(), status: 'PENDING',
+        sourceDate,
+      }).onConflictDoNothing();
+      return;
+    }
+    if (existing.status === 'PENDING') {
+      if (existing.sourceDate !== sourceDate || new Date(existing.dueAt).getTime() !== dueAt.getTime()) {
+        await tx.update(automationSchedules).set({
+          dueAt: dueAt.toISOString(), sourceDate, claimToken: null, claimedAt: null,
+        }).where(scope);
+      }
+      return;
+    }
+    if (existing.status === 'INVALIDATED') {
+      await tx.update(automationSchedules).set({
+        status: 'PENDING', dueAt: dueAt.toISOString(), sourceDate,
+        invalidatedAt: null, invalidationReason: null, claimToken: null, claimedAt: null, executedAt: null,
+      }).where(scope);
+      return;
+    }
+    // Terminal rows (SUCCEEDED / LATE / MISSED / FAILED / CANCELLED) are
+    // the execution evidence for their source date: they only reopen
+    // when the source date itself moved, which is a new logical plan
+    // wearing the same identity (the run history keeps the old proof).
+    if (existing.sourceDate !== sourceDate) {
+      await tx.update(automationSchedules).set({
+        status: 'PENDING', dueAt: dueAt.toISOString(), sourceDate,
+        invalidatedAt: null, invalidationReason: null, claimToken: null, claimedAt: null, executedAt: null,
+      }).where(scope);
+    }
+  }
+
+  private async syncDateRelativePlanForEvent(tx: TenantTransaction, tenantId: string,
+    candidate: { rule: typeof automationRules.$inferSelect; version: typeof automationRuleVersions.$inferSelect },
+    event: { appId: string; recordId: string }) {
+    const [record] = await tx.select().from(records).where(and(
+      eq(records.tenantId, tenantId), eq(records.appId, event.appId), eq(records.id, event.recordId)));
+    if (!record) {
+      await tx.update(automationSchedules).set({
+        status: 'INVALIDATED', invalidatedAt: sql`clock_timestamp()`, invalidationReason: 'record-deleted',
+        claimToken: null, claimedAt: null,
+      }).where(and(eq(automationSchedules.tenantId, tenantId),
+        eq(automationSchedules.ruleId, candidate.rule.id),
+        eq(automationSchedules.ruleVersion, candidate.version.version),
+        eq(automationSchedules.recordId, event.recordId), eq(automationSchedules.status, 'PENDING')));
+      return;
+    }
+    await this.syncDateRelativePlan(tx, {
+      tenantId, appId: event.appId, ruleId: candidate.rule.id, ruleVersion: candidate.version.version,
+      cfg: this.configOf(candidate.version), record,
+    });
+  }
+
+  private async invalidateDateRelativePlans(tx: TenantTransaction, tenantId: string, ruleId: string,
+    reason: string, scope: { exceptVersion?: number; onlyVersion?: number } = {}) {
+    await tx.update(automationSchedules).set({
+      status: 'INVALIDATED', invalidatedAt: sql`clock_timestamp()`, invalidationReason: reason,
+      claimToken: null, claimedAt: null,
+    }).where(and(
+      eq(automationSchedules.tenantId, tenantId), eq(automationSchedules.ruleId, ruleId),
+      eq(automationSchedules.status, 'PENDING'),
+      scope.onlyVersion !== undefined ? eq(automationSchedules.ruleVersion, scope.onlyVersion) : undefined,
+      scope.exceptVersion !== undefined ? sql`${automationSchedules.ruleVersion} <> ${scope.exceptVersion}` : undefined,
+    ));
+    // Invalidated plans must be regenerated by a fresh scan if the rule
+    // becomes eligible again, so the affected backfill jobs restart from
+    // a null cursor (the worker only processes jobs of eligible rules,
+    // so a reset job for a disabled rule simply waits).
+    await tx.update(automationDateBackfills).set({
+      status: 'RUNNING', cursorRecordId: null, processedCount: 0, updatedAt: sql`clock_timestamp()`,
+    }).where(and(
+      eq(automationDateBackfills.tenantId, tenantId), eq(automationDateBackfills.ruleId, ruleId),
+      scope.onlyVersion !== undefined ? eq(automationDateBackfills.ruleVersion, scope.onlyVersion) : undefined,
+      scope.exceptVersion !== undefined ? sql`${automationDateBackfills.ruleVersion} <> ${scope.exceptVersion}` : undefined,
+    ));
+  }
+
+  private async ensureDateBackfill(tx: TenantTransaction, tenantId: string, appId: string,
+    ruleId: string, version: typeof automationRuleVersions.$inferSelect) {
+    if (!this.dateRelativeConfigOf(this.configOf(version))) return null;
+    const [job] = await tx.insert(automationDateBackfills).values({
+      tenantId, appId, ruleId, ruleVersion: version.version, status: 'RUNNING',
+    }).onConflictDoNothing().returning();
+    if (job) return job;
+    const [existing] = await tx.select().from(automationDateBackfills).where(and(
+      eq(automationDateBackfills.tenantId, tenantId), eq(automationDateBackfills.ruleId, ruleId),
+      eq(automationDateBackfills.ruleVersion, version.version)));
+    return existing ?? null;
+  }
+
+  // Lazily create backfill jobs for enabled date-relative rules with an
+  // active grant (defensive: publish/enable/grant hooks create them
+  // eagerly, mirroring ensureCadencePlans).
+  private async ensureDateBackfills(tx: TenantTransaction, context: TenantContext) {
+    const candidates = await tx.select({ rule: automationRules, version: automationRuleVersions })
+      .from(automationRules).innerJoin(automationRuleVersions, and(
+        eq(automationRuleVersions.tenantId, automationRules.tenantId),
+        eq(automationRuleVersions.appId, automationRules.appId),
+        eq(automationRuleVersions.ruleId, automationRules.id),
+        eq(automationRuleVersions.version, automationRules.currentVersion),
+      )).innerJoin(automationGrants, and(
+        eq(automationGrants.tenantId, automationRules.tenantId),
+        eq(automationGrants.ruleId, automationRules.id),
+        eq(automationGrants.ruleVersion, automationRuleVersions.version),
+        isNull(automationGrants.revokedAt),
+      )).where(and(eq(automationRules.tenantId, context.tenantId),
+        eq(automationRules.enabled, true), isNull(automationRules.archivedAt),
+        eq(automationRuleVersions.status, 'published'),
+        sql`${automationRuleVersions.trigger}->>'eventType' = 'schedule.dateRelative'`));
+    for (const { rule, version } of candidates) {
+      await this.ensureDateBackfill(tx, context.tenantId, rule.appId, rule.id, version);
+    }
+  }
+
+  async processDateRelativeSchedules(context: TenantContext, options: {
+    now?: Date; batchLimit?: number; claimLeaseMs?: number;
+    lateWindowMs?: number; missedAlertThreshold?: number;
+  } = {}) {
+    const now = options.now ?? new Date();
+    const batchLimit = options.batchLimit ?? AUTOMATION_SCHEDULE_BATCH_LIMIT;
+    const leaseMs = options.claimLeaseMs ?? AUTOMATION_SCHEDULE_CLAIM_LEASE_MS;
+    const lateWindowMs = options.lateWindowMs ?? AUTOMATION_DATE_RELATIVE_LATE_WINDOW_MS;
+    const missedAlertThreshold = options.missedAlertThreshold ?? AUTOMATION_DATE_RELATIVE_MISSED_ALERT_THRESHOLD;
+    const totals = {
+      backfilledRecords: 0, backfillJobsCompleted: 0, claimed: 0,
+      executed: 0, late: 0, missed: 0, invalidated: 0, cancelled: 0, failed: 0,
+    };
+
+    // Pass A: stock backfill (checkpointed, resumable, never executes).
+    const jobs = await withTenantTransaction(context, async (tx) => {
+      await this.ensureDateBackfills(tx, context);
+      return tx.select().from(automationDateBackfills).where(and(
+        eq(automationDateBackfills.tenantId, context.tenantId),
+        eq(automationDateBackfills.status, 'RUNNING'),
+      )).orderBy(automationDateBackfills.createdAt, automationDateBackfills.id);
+    });
+    for (const job of jobs) {
+      const outcome = await this.processDateBackfill(context, job, batchLimit);
+      totals.backfilledRecords += outcome.processed;
+      if (outcome.completed) totals.backfillJobsCompleted++;
+    }
+
+    // Pass B: consume due plans.
+    const dueIds = await withTenantTransaction(context, async (tx) => {
+      const rows = await tx.execute(sql`
+        SELECT id FROM automation_schedules
+        WHERE tenant_id = ${context.tenantId} AND status = 'PENDING' AND due_at <= ${now.toISOString()}
+        ORDER BY due_at, id LIMIT ${batchLimit}
+      `);
+      return (rows.rows as { id: string }[]).map(({ id }) => id);
+    });
+    let missedSample: typeof automationSchedules.$inferSelect | null = null;
+    for (const planId of dueIds) {
+      const outcome = await this.processDateRelativePlan(context, planId, { now, leaseMs, lateWindowMs });
+      if (!outcome) continue;
+      totals.claimed++;
+      if (outcome.executed) totals.executed++;
+      if (outcome.late) totals.late++;
+      if (outcome.missed) { totals.missed++; missedSample ??= outcome.plan; }
+      if (outcome.invalidated) totals.invalidated++;
+      if (outcome.cancelled) totals.cancelled++;
+      if (outcome.failed) totals.failed++;
+    }
+
+    // Pass C: aggregated MISSED alert (one summary per tenant per day,
+    // never one message per missed plan).
+    if (totals.missed >= missedAlertThreshold && missedSample) {
+      const sample: typeof automationSchedules.$inferSelect = missedSample;
+      await withTenantTransaction(context, async (tx) => {
+        const recent = await tx.execute(sql`
+          SELECT 1 AS hit FROM automation_audit_events
+          WHERE tenant_id = ${context.tenantId} AND action = 'SCHEDULE_MISSED_ALERT'
+            AND occurred_at >= clock_timestamp() - interval '24 hours' LIMIT 1
+        `);
+        if (recent.rows.length) return;
+        await tx.insert(automationAuditEvents).values({
+          tenantId: context.tenantId, appId: sample.appId, ruleId: sample.ruleId, ruleVersion: sample.ruleVersion,
+          ...auditActor(context), action: 'SCHEDULE_MISSED_ALERT',
+          details: { missedCount: totals.missed, threshold: missedAlertThreshold },
+        });
+        const admins = await tx.select({ userId: tenantMembers.userId }).from(tenantMembers).where(and(
+          eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.isAdmin, true),
+          isNull(tenantMembers.disabledAt)));
+        for (const { userId } of admins) await tx.insert(notifications).values({
+          tenantId: context.tenantId, userId, sourceType: 'SYSTEM',
+          ruleKey: 'AUTOMATION_SCHEDULE_MISSED',
+          title: 'Date-relative reminders were missed',
+          body: `${totals.missed} date-relative reminder plans passed the 24-hour late window and were marked MISSED without executing.`,
+          sourceEventId: sample.id, dedupKey: `automation-schedule-missed:${context.tenantId}:${now.toISOString().slice(0, 10)}`,
+          eventType: 'AUTOMATION_SCHEDULE_MISSED', targetRole: 'TENANT_ADMIN',
+          payload: { missedCount: totals.missed, threshold: missedAlertThreshold }, emailState: 'skipped',
+        }).onConflictDoNothing();
+      });
+    }
+    return totals;
+  }
+
+  // One backfill batch for one rule version: stable id cursor, at most
+  // batchLimit records, checkpoint persisted per record in the same
+  // transaction as that record's plan sync. Backfill only writes plans;
+  // it never executes them (past-due stock is left for the due pass,
+  // which applies the brief's late/MISSED rules instead of bursting).
+  private async processDateBackfill(context: TenantContext,
+    job: typeof automationDateBackfills.$inferSelect, batchLimit: number) {
+    const prepared = await withTenantTransaction(context, async (tx) => {
+      const [rule] = await tx.select().from(automationRules).where(and(
+        eq(automationRules.tenantId, context.tenantId), eq(automationRules.id, job.ruleId)));
+      const version = rule?.currentVersion === job.ruleVersion
+        ? await this.readVersion(tx, context, job.appId, job.ruleId, job.ruleVersion).catch(() => null) : null;
+      const [grant] = version ? await tx.select().from(automationGrants).where(and(
+        eq(automationGrants.tenantId, context.tenantId), eq(automationGrants.ruleId, job.ruleId),
+        eq(automationGrants.ruleVersion, job.ruleVersion), isNull(automationGrants.revokedAt))) : [];
+      const cfg = version ? this.configOf(version) : null;
+      if (!rule?.enabled || rule.archivedAt || !version || version.status !== 'published' || !grant || !cfg ||
+        !this.dateRelativeConfigOf(cfg) ||
+        !await this.grantCoversExecution(tx, context.tenantId, job.appId, cfg, grant)) {
+        await tx.update(automationDateBackfills).set({
+          status: 'COMPLETED', updatedAt: sql`clock_timestamp()`,
+        }).where(and(eq(automationDateBackfills.tenantId, context.tenantId),
+          eq(automationDateBackfills.id, job.id), eq(automationDateBackfills.status, 'RUNNING')));
+        return null;
+      }
+      return { cfg };
+    });
+    if (!prepared) return { processed: 0, completed: true };
+    let cursor = job.cursorRecordId;
+    let processed = job.processedCount;
+    let batchProcessed = 0;
+    const candidates = await withTenantTransaction(context, async (tx) => tx.select().from(records).where(and(
+      eq(records.tenantId, context.tenantId), eq(records.appId, job.appId), isNull(records.deletedAt),
+      cursor ? sql`${records.id} > ${cursor}` : undefined,
+    )).orderBy(records.id).limit(batchLimit));
+    for (const candidate of candidates) {
+      await withTenantTransaction(context, async (tx) => {
+        await this.syncDateRelativePlan(tx, {
+          tenantId: context.tenantId, appId: job.appId, ruleId: job.ruleId, ruleVersion: job.ruleVersion,
+          cfg: prepared.cfg, record: candidate,
+        });
+        processed++;
+        batchProcessed++;
+        cursor = candidate.id;
+        await tx.update(automationDateBackfills).set({
+          cursorRecordId: candidate.id, processedCount: processed, updatedAt: sql`clock_timestamp()`,
+        }).where(and(eq(automationDateBackfills.tenantId, context.tenantId),
+          eq(automationDateBackfills.id, job.id)));
+      });
+    }
+    let completed = candidates.length < batchLimit;
+    if (!completed) {
+      const remaining = await withTenantTransaction(context, async (tx) => tx.select({ id: records.id }).from(records)
+        .where(and(eq(records.tenantId, context.tenantId), eq(records.appId, job.appId),
+          isNull(records.deletedAt), sql`${records.id} > ${cursor}`)).limit(1));
+      completed = remaining.length === 0;
+    }
+    if (completed) {
+      await withTenantTransaction(context, async (tx) => {
+        await tx.update(automationDateBackfills).set({
+          status: 'COMPLETED', updatedAt: sql`clock_timestamp()`,
+        }).where(and(eq(automationDateBackfills.tenantId, context.tenantId),
+          eq(automationDateBackfills.id, job.id), eq(automationDateBackfills.status, 'RUNNING')));
+      });
+    }
+    return { processed: batchProcessed, completed };
+  }
+
+  // Claim and consume one due date-relative plan. The claim is a single
+  // conditional UPDATE (exactly one worker wins); a claimed plan whose
+  // worker died becomes claimable again after the lease, and the run
+  // idempotency key (which embeds the plan identity) makes resumption
+  // duplicate-safe.
+  private async processDateRelativePlan(context: TenantContext, planId: string, options: {
+    now: Date; leaseMs: number; lateWindowMs: number;
+  }) {
+    const { now, leaseMs, lateWindowMs } = options;
+    const claimToken = randomUUID();
+    const claimed = await withTenantTransaction(context, async (tx) => {
+      const result = await tx.execute(sql`
+        UPDATE automation_schedules
+        SET claim_token = ${claimToken}, claimed_at = ${now.toISOString()}
+        WHERE tenant_id = ${context.tenantId} AND id = ${planId} AND status = 'PENDING'
+          AND (claim_token IS NULL OR claimed_at <= ${new Date(now.getTime() - leaseMs).toISOString()})
+        RETURNING id
+      `);
+      return result.rows.length > 0;
+    });
+    if (!claimed) return null;
+    return withTenantTransaction(context, async (tx) => {
+      const [plan] = await tx.select().from(automationSchedules).where(and(
+        eq(automationSchedules.tenantId, context.tenantId), eq(automationSchedules.id, planId)));
+      if (!plan || plan.status !== 'PENDING' || plan.claimToken !== claimToken) return null;
+      const finalize = async (status: string, extra: {
+        invalidated?: boolean; reason?: string; executed?: boolean;
+      } = {}) => {
+        await tx.update(automationSchedules).set({
+          status, claimToken: null, claimedAt: null,
+          executedAt: extra.executed ? sql`clock_timestamp()` : plan.executedAt,
+          invalidatedAt: extra.invalidated ? sql`clock_timestamp()` : plan.invalidatedAt,
+          invalidationReason: extra.reason ?? plan.invalidationReason,
+        }).where(and(eq(automationSchedules.tenantId, context.tenantId),
+          eq(automationSchedules.id, plan.id), eq(automationSchedules.claimToken, claimToken)));
+      };
+      const [rule] = await tx.select().from(automationRules).where(and(
+        eq(automationRules.tenantId, context.tenantId), eq(automationRules.id, plan.ruleId)));
+      const version = rule?.currentVersion === plan.ruleVersion
+        ? await this.readVersion(tx, context, plan.appId, plan.ruleId, plan.ruleVersion).catch(() => null) : null;
+      const [grant] = version ? await tx.select().from(automationGrants).where(and(
+        eq(automationGrants.tenantId, context.tenantId), eq(automationGrants.ruleId, plan.ruleId),
+        eq(automationGrants.ruleVersion, plan.ruleVersion), isNull(automationGrants.revokedAt))) : [];
+      const cfg = version ? this.configOf(version) : null;
+      const relative = cfg ? this.dateRelativeConfigOf(cfg) : null;
+      if (!rule?.enabled || rule.archivedAt || !version || version.status !== 'published' || !cfg || !relative) {
+        await finalize('INVALIDATED', {
+          invalidated: true,
+          reason: !rule?.enabled || rule.archivedAt ? 'rule-disabled' : 'version-superseded',
+        });
+        return { plan, invalidated: true };
+      }
+      if (!grant || !await this.grantCoversExecution(tx, context.tenantId, plan.appId, cfg, grant)) {
+        await finalize('INVALIDATED', { invalidated: true, reason: 'grant-revoked' });
+        return { plan, invalidated: true };
+      }
+      const [record] = await tx.select().from(records).where(and(
+        eq(records.tenantId, context.tenantId), eq(records.appId, plan.appId), eq(records.id, plan.recordId)));
+      if (!record || record.deletedAt) {
+        await finalize('INVALIDATED', { invalidated: true, reason: 'record-deleted' });
+        return { plan, invalidated: true };
+      }
+      const lateMs = now.getTime() - new Date(plan.dueAt).getTime();
+      if (lateMs > lateWindowMs) {
+        await finalize('MISSED');
+        return { plan, missed: true };
+      }
+      const currentSource = this.sourceDateForRecord(relative, record);
+      if (currentSource !== plan.sourceDate) {
+        await finalize('INVALIDATED', { invalidated: true, reason: 'date-changed' });
+        return { plan, invalidated: true };
+      }
+      const matches = evaluateGroup(record.data, cfg.conditions.eventSnapshot, []) &&
+        evaluateGroup(record.data, cfg.conditions.currentState, []);
+      if (!matches) {
+        await finalize('CANCELLED', { invalidated: true, reason: 'conditions-not-met' });
+        return { plan, cancelled: true };
+      }
+      const late = lateMs > 0;
+      const identity = `${plan.appId}:date-relative:${plan.ruleId}:${plan.ruleVersion}:${plan.scheduleKey}:${plan.recordId}`;
+      const [existingRun] = await tx.select({ id: automationRuns.id, status: automationRuns.status })
+        .from(automationRuns).where(and(eq(automationRuns.tenantId, context.tenantId),
+          eq(automationRuns.idempotencyKey, identity)));
+      if (existingRun) {
+        // A previous worker created the run but died before finalizing
+        // the plan: adopt the run's outcome, never execute twice.
+        const succeeded = existingRun.status === 'SUCCEEDED';
+        await finalize(succeeded ? (late ? 'LATE' : 'SUCCEEDED') : 'FAILED', { executed: succeeded });
+        return { plan, executed: succeeded, late: succeeded && late, failed: !succeeded };
+      }
+      const runId = randomUUID();
+      const batchId = randomUUID();
+      const [run] = await tx.insert(automationRuns).values({
+        id: runId, tenantId: context.tenantId, appId: plan.appId, ruleId: plan.ruleId,
+        ruleVersion: plan.ruleVersion, eventId: null,
+        triggerIdentity: `date-relative:${plan.scheduleKey}`,
+        idempotencyKey: identity, recordId: plan.recordId, batchId,
+        rootCausationId: batchId, parentRunId: null, causationDepth: 1,
+        originRuleId: plan.ruleId, originActionId: null, status: 'RUNNING',
+      }).onConflictDoNothing().returning();
+      if (!run) {
+        await finalize('FAILED', {});
+        return { plan, failed: true };
+      }
+      const actionRows: { action: AutomationRuleConfig['actions'][number];
+        row: { actionId: string; idempotencyKey: string } }[] = [];
+      for (const [position, action] of cfg.actions.entries()) {
+        const [row] = await tx.insert(automationRunActions).values({
+          tenantId: context.tenantId, appId: plan.appId, runId: run.id, actionId: action.actionId,
+          position, status: 'PENDING', idempotencyKey: `${identity}:${action.actionId}`,
+        }).onConflictDoNothing().returning();
+        if (row) actionRows.push({ action, row: { actionId: row.actionId, idempotencyKey: row.idempotencyKey } });
+      }
+      await this.executeActions(tx, { tenantId: context.tenantId, userId: grant.approvedBy }, {
+        runId: run.id, appId: plan.appId, ruleId: plan.ruleId,
+        rootCausationId: run.rootCausationId, causationDepth: run.causationDepth,
+        cfg, record: serializeRecord(record), eventId: null, actionRows,
+        readableFieldIds: grant.readableFieldIds,
+      });
+      const [finished] = await tx.select({ status: automationRuns.status }).from(automationRuns)
+        .where(and(eq(automationRuns.tenantId, context.tenantId), eq(automationRuns.id, run.id)));
+      const succeeded = finished?.status === 'SUCCEEDED';
+      await finalize(succeeded ? (late ? 'LATE' : 'SUCCEEDED') : 'FAILED', { executed: succeeded });
+      return { plan, executed: succeeded, late: succeeded && late, failed: !succeeded };
+    });
   }
 
   // ---------------------------------------------------------------------
@@ -2311,6 +2836,38 @@ export class AutomationService {
         }
       }
     } else if (cfg.trigger.schedule) {
+      findings.push({ code: 'SCHEDULE_CONFIG_UNEXPECTED', severity: 'BLOCKING' });
+    }
+    // P3-C date-relative: same re-validation discipline as fixed cadence.
+    if (cfg.trigger.eventType === 'schedule.dateRelative') {
+      const relative = cfg.trigger.dateRelative;
+      if (!relative) findings.push({ code: 'SCHEDULE_CONFIG_MISSING', severity: 'BLOCKING' });
+      else {
+        if (relative.source !== 'field' && relative.source !== 'createdAt') {
+          findings.push({ code: 'SCHEDULE_DATE_SOURCE_INVALID', severity: 'BLOCKING' });
+        }
+        if (relative.source === 'field') {
+          const field = definitions.find((entry) => entry.fieldId === relative.fieldId);
+          if (!relative.fieldId) {
+            findings.push({ code: 'SCHEDULE_DATE_FIELD_MISSING', severity: 'BLOCKING' });
+          } else if (field && field.type !== 'date') {
+            findings.push({ code: 'SCHEDULE_DATE_FIELD_TYPE_INVALID', severity: 'BLOCKING', fieldId: relative.fieldId });
+          }
+        }
+        if (relative.source === 'createdAt' && relative.fieldId) {
+          findings.push({ code: 'SCHEDULE_DATE_FIELD_UNEXPECTED', severity: 'BLOCKING' });
+        }
+        if (!Number.isInteger(relative.offsetDays) || relative.offsetDays < -3650 || relative.offsetDays > 3650) {
+          findings.push({ code: 'SCHEDULE_OFFSET_INVALID', severity: 'BLOCKING' });
+        }
+        if (!isValidLocalTime(relative.localTime ?? '')) {
+          findings.push({ code: 'SCHEDULE_LOCAL_TIME_INVALID', severity: 'BLOCKING' });
+        }
+        if (!isValidTimezone(relative.timezone ?? '')) {
+          findings.push({ code: 'SCHEDULE_TIMEZONE_INVALID', severity: 'BLOCKING' });
+        }
+      }
+    } else if (cfg.trigger.dateRelative) {
       findings.push({ code: 'SCHEDULE_CONFIG_UNEXPECTED', severity: 'BLOCKING' });
     }
     const [grant] = await tx.select().from(automationGrants).where(and(

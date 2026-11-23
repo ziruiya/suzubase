@@ -68,6 +68,10 @@ async function main() {
           if (schedules.claimedPlans || schedules.resumedSlots || schedules.runsCreated || schedules.slotsSkipped) {
             console.info('Automation schedules', { tenantId: context.tenantId, ...schedules });
           }
+          const dateRelative = await automation.processDateRelativeSchedules(context);
+          if (dateRelative.backfilledRecords || dateRelative.claimed || dateRelative.missed || dateRelative.invalidated) {
+            console.info('Automation date-relative schedules', { tenantId: context.tenantId, ...dateRelative });
+          }
           const pruned = await automation.pruneRunHistory(context);
           if (pruned.pruned) console.info('Automation run history pruned', { tenantId: context.tenantId, ...pruned });
         } catch (error) {

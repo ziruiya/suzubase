@@ -506,7 +506,7 @@ export type AutomationConditionOperator = 'eq' | 'ne' | 'gt' | 'lt' | 'gte' | 'l
 export type AutomationRuleConfig = {
   schemaVersion: number;
   trigger: {
-    eventType: 'record.created' | 'record.updated' | 'record.deleted' | 'workflow.transitioned' | 'workflow.rejected' | 'schedule.fixed';
+    eventType: 'record.created' | 'record.updated' | 'record.deleted' | 'workflow.transitioned' | 'workflow.rejected' | 'schedule.fixed' | 'schedule.dateRelative';
     fieldId?: string;
     oldValue?: unknown;
     newValue?: unknown;
@@ -520,6 +520,13 @@ export type AutomationRuleConfig = {
       weekdays?: number[];
       monthDay?: number;
       missedRunPolicy?: 'skip' | 'catch_up_latest';
+    };
+    dateRelative?: {
+      source: 'field' | 'createdAt';
+      fieldId?: string;
+      offsetDays: number;
+      localTime: string;
+      timezone: string;
     };
   };
   conditions: {
@@ -673,6 +680,10 @@ export const automationSchedules = pgTable('automation_schedules', {
   status: text().notNull().default('PENDING'),
   invalidatedAt: time('invalidated_at'),
   invalidationReason: text('invalidation_reason'),
+  sourceDate: text('source_date'),
+  claimToken: uuid('claim_token'),
+  claimedAt: time('claimed_at'),
+  executedAt: time('executed_at'),
 }, (t) => [
   primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
   unique().on(t.tenantId, t.ruleId, t.ruleVersion, t.recordId, t.scheduleKey),
@@ -736,6 +747,25 @@ export const automationCadenceSlots = pgTable('automation_cadence_slots', {
   foreignKey({ columns: [t.tenantId, t.appId, t.planId], foreignColumns: [automationCadencePlans.tenantId, automationCadencePlans.appId, automationCadencePlans.id] }),
   foreignKey({ columns: [t.tenantId, t.appId, t.ruleId, t.ruleVersion], foreignColumns: [automationRuleVersions.tenantId, automationRuleVersions.appId, automationRuleVersions.ruleId, automationRuleVersions.version] }),
   check('automation_cadence_slots_status', sql`${t.status} IN ('CLAIMED','COMPLETED','SKIPPED_NONEXISTENT_TIME','SKIPPED_MISSED','FAILED')`),
+]);
+
+export const automationDateBackfills = pgTable('automation_date_backfills', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  id: uuid().notNull().defaultRandom(),
+  ruleId: uuid('rule_id').notNull(),
+  ruleVersion: integer('rule_version').notNull(),
+  status: text().notNull().default('RUNNING'),
+  cursorRecordId: uuid('cursor_record_id'),
+  processedCount: integer('processed_count').notNull().default(0),
+  createdAt: time('created_at').notNull().defaultNow(),
+  updatedAt: time('updated_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.id] }),
+  unique().on(t.tenantId, t.ruleId, t.ruleVersion),
+  foreignKey({ columns: [t.tenantId, t.appId, t.ruleId, t.ruleVersion], foreignColumns: [automationRuleVersions.tenantId, automationRuleVersions.appId, automationRuleVersions.ruleId, automationRuleVersions.version] }),
+  check('automation_date_backfills_status', sql`${t.status} IN ('RUNNING','COMPLETED')`),
+  check('automation_date_backfills_processed_count', sql`${t.processedCount} >= 0`),
 ]);
 
 export const automationProblemChains = pgTable('automation_problem_chains', {

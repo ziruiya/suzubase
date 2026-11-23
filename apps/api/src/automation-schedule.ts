@@ -162,6 +162,60 @@ export function nextSlotAfter(config: FixedScheduleConfig, after: Date): Schedul
   throw new Error('No schedule slot found within 400 days');
 }
 
+// ---------------------------------------------------------------------
+// P3-C date-relative (T-3 lower half): a plan's due instant is a source
+// local date (a record's date-field value, or the record's creation date
+// in the tenant timezone) shifted by a signed day offset, at a fixed
+// local wall-clock time in the rule's IANA timezone.
+// ---------------------------------------------------------------------
+
+export interface DateRelativeConfig {
+  source: 'field' | 'createdAt';
+  fieldId?: string; // required when source === 'field'
+  offsetDays: number; // signed: negative = before the source date
+  localTime: string; // 'HH:MM', 24h
+  timezone: string; // IANA identifier
+}
+
+// Stable plan identity fragment: encodes the trigger elements (source
+// field, offset magnitude AND direction, execution wall time). The same
+// rule version + record + key always denotes the same logical plan.
+export function dateRelativeScheduleKey(config: DateRelativeConfig): string {
+  const source = config.source === 'field' ? `field:${config.fieldId}` : 'createdAt';
+  const offset = config.offsetDays >= 0 ? `+${config.offsetDays}` : `${config.offsetDays}`;
+  return `daterel:${source}:${offset}d:${config.localTime}`;
+}
+
+export function addDaysToIsoDate(sourceIso: string, days: number): string {
+  const [year, month, day] = sourceIso.split('-').map(Number);
+  const shifted = new Date(Date.UTC(year, month - 1, day) + days * DAY_MS);
+  return isoDate(shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, shifted.getUTCDate());
+}
+
+export function isoDateInZone(instant: Date, timezone: string): string {
+  const parts = localDateOf(instant, timezone);
+  return isoDate(parts.year, parts.month, parts.day);
+}
+
+export function isIsoDate(value: unknown): value is string {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+    !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+}
+
+// Resolve "source local date + offset days, at localTime" to a UTC
+// instant. A wall time inside a DST gap resolves to the pseudo-instant
+// (pre-transition offset), matching the cadence gap handling for the
+// instant itself; a fold resolves to the first occurrence.
+export function dateRelativeDueAt(sourceLocalDate: string, config: DateRelativeConfig): { dueAt: Date; localDate: string } {
+  const localDate = addDaysToIsoDate(sourceLocalDate, config.offsetDays);
+  const [year, month, day] = localDate.split('-').map(Number);
+  const [hour, minute] = config.localTime.split(':').map(Number);
+  const candidates = localTimeToUtcCandidates({ year, month, day, hour, minute }, config.timezone);
+  if (candidates.length) return { dueAt: candidates[0], localDate };
+  const pseudo = Date.UTC(year, month - 1, day, hour, minute);
+  return { dueAt: new Date(pseudo - zoneOffsetMs(new Date(pseudo - DAY_MS), config.timezone)), localDate };
+}
+
 // The slot with the given key, recomputed deterministically (used when a
 // persisted plan resumes: the key is the identity, the instant is derived).
 export function slotByKey(config: FixedScheduleConfig, slotKey: string): ScheduleSlot | null {
