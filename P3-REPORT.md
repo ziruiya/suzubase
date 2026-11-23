@@ -102,3 +102,167 @@ Baseline HEAD before P3-A: `82e33d6`
 
 Implementation commit: `6665e5e feat(p3a): add automation rule execution foundation`.
 This report is committed separately after final verification.
+
+---
+
+# P3-B Local Automation Actions - Completion Report
+
+Branch: `p3-b-automation-actions` (from P3-A `dce80f3`). Not merged to main; not deployed.
+
+## Deviations and unresolved semantics (read first)
+
+1. **Migration 0042 relaxes `notifications_record_source_check`.** RECORD notifications previously required `event_id NOT NULL`; T-4 manual runs have no source event, so their A-1 notifications could not be stored. The constraint now requires `app_id` + `record_id` for RECORD rows (SYSTEM branch unchanged). Consequence: manual-run notifications fall outside the `(tenant, app, event, user, rule_key)` unique key (event is NULL); deduplication for them is guaranteed by run-level idempotency (deduplicated manual-run requests return the existing run without executing; retries skip SUCCEEDED actions), not by a notification unique key. This is recorded as a deliberate, bounded deviation.
+2. **Brief-authorized test adaptation (not silent).** When real execution landed, the P3-A and guardrail fixtures gained real action parameters (recipient assignee, create mappings, update operations), and four terminal-state assertions were updated per the brief's replacement rule: runs now end `SUCCEEDED` with `error_code` NULL instead of `ACTIONS_NOT_IMPLEMENTED` / `NOT_EXECUTED` / `P3B_DEFERRED`. P3-A historical runs are not retroactively promoted and are never replayed.
+3. **Retention pruning writes no audit row.** `automation_audit_events.actor_id` is NOT NULL with a tenant-member FK and there is no system actor; the 90-day pruner therefore records counts in the worker log instead of an audit event. Audit events themselves are never deleted by the pruner.
+4. **Worker cadence.** Chain hops propagate on the worker's ~60s cycle (each outbox pass advances the chain); the ping-pong and cross-app chain tests observe this honestly instead of forcing synchronous execution.
+5. **Pre-existing unused statuses.** `RATE_LIMITED` / `BACKLOG_LIMITED` remain in the run-status CHECK but are never assigned by code (the signal is carried by audit events, per the P3-A design); they are reserved for a possible P3-C activation. Unlike the removed `POTENTIAL_CYCLE` dead value, this is intentional and documented here.
+
+## Checkpoint disposition (b56db33 audit)
+
+The checkpoint was audited before any new feature work was layered on it. Findings:
+
+- All red tests were **test-side wiring faults**, not product defects: eight `expectRequest` calls missing `method: 'POST'`, a misused `assert.rejects`, and 200-vs-201 status expectations. Fixed in `c5869a1`.
+- The BLOCKED_CYCLE / repeated-failure / depth legs originally fired events that could never match their rules; they were rewritten to drive genuine matching events with strong assertions (exact status, exact run counts, problem-chain rows).
+- The backlog leg backfills `started_at` to escape the 60-second rate window; the rate limiter counts by `started_at` — that is the product semantic, verified in code.
+- The migration test's expected-table list gained `automation_problem_chains`.
+- **One real product defect found and fixed:** the problem-chain routes did not declare `@Param('appId')` and the service did not scope by application. Routes now take the parameter; listing filters by the last run's app and resume validates app ownership.
+- Migration 0040 verified correct (zero-to-head migration suite green); `rule_versions` status convergence to draft/published is safe; `grant()` / `validateVersion` sourceAppId checks verified present (C6); guardrail behavior (paused-chain skip, rate/backlog audit without marking events processed, problem chain + SYSTEM admin notification on CHAIN_PAUSED / depth) verified in code and by test.
+- Baseline after repair: **101/101 tests green** on the verification stack.
+
+## Scope completion
+
+| Brief item | Status | Evidence |
+| --- | --- | --- |
+| A-1 in-app notification action | Done | `executeNotifyAction`; T1 test (field recipient + template rendering), V-10 dedup asserted |
+| A-2 update own-record fields | Done | set/copy/increment/decrement/clear via `persistUpdate`; T1 test incl. no-progress suppression |
+| A-3 cross-app record creation | Done | `executeCreateAction` with action-row idempotency key in `record_create_keys`; T2 test |
+| A-4 restricted workflow advance | Done | `WorkflowRuntimeService.executeAutomation`; opt-in flag (migration 0041), `actor_type='AUTOMATION'` + rule/run/action attribution on `workflow_events`; T3 test |
+| T-4 manual trigger | Done | `manualRun` with `trigger.allowManual`, idempotency-key dedup; T5 test |
+| Ordered execution, action-level idempotency, fail-stop, retry-failed-only | Done | Savepoint per action; SUCCEEDED actions skipped on retry; T2/T3 tests |
+| Run history detail + C4 query APIs | Done | runs list/detail, audit list, summary endpoints; T5 test |
+| Non-atomic chain risk notice in UI | Done | Automation settings tab states the non-rollback semantics verbatim |
+| WEBHOOK action | Deferred to P3-D by design | Fails explicitly with `WEBHOOK_NOT_IMPLEMENTED_P3D`; asserted in T2 |
+
+## Commit list (dce80f3..HEAD)
+
+- `b56db33` checkpoint (predecessor, audited above)
+- `c5869a1` checkpoint test repair + problem-chain app scoping fix
+- `d73aea5` foundations: migration 0041, action-parameter config types
+- `45f3baf` threading: persistUpdate extraction, causation on writes, workflow attribution + executeAutomation
+- `ad76189` engine: real execution of A-1..A-4, manual runs, retry, C4 APIs, 90-day retention, dry-run action plans; worker wiring
+- `6401076` fixture adaptation per replacement rule; **also contains the P3-B web UI** (automation settings tab: summary, run history/detail, retry, manual run, problem chains) — swept in by the same commit; content verified by full workspace build
+- `ea8691d` user-field recipient parsing accepts bare id and JSON array forms
+- `f96d660` P3-B integration tests (7) + migration 0042
+- (final) audit-integrity 3b rescoping + this report section
+
+## Test evidence
+
+- Full suite on the verification stack: **108/108 pass** (101 pre-P3-B baseline + 7 new `p3-b-actions` tests).
+- Full workspace build / typecheck: clean (`pnpm -r build`, including the web app).
+- Migrations from zero: covered by the in-suite migration tests (43 migrations applied on the verification stack, incl. 0041/0042).
+- Post-suite audit-integrity tool: all 6 checks PASS after the 3b rescoping (see C5 note).
+
+## Gate evidence (six items)
+
+1. **Retry never duplicates a created record** — T2: A-3 action row keeps `attempt_count = 1` across a failed-then-retried run; exactly one record exists in the target app; `record_create_keys` holds the action-row idempotency key.
+2. **Numeric increment/decrement never double-applies** — T1: increment executes once; repeated `processOutbox` passes and the V-10 re-drive leave value and revision unchanged after the first application.
+3. **Failure recovery never replays succeeded actions** — T2/T3: after a later action fails, retry resumes at the first non-SUCCEEDED action; succeeded rows keep `attempt_count = 1`; workflow state advances exactly once.
+4. **Unauthorized execution never writes** — T6: after publish-time grant narrowing, the run ends `SKIPPED_UNAUTHORIZED` and the record is byte-identical (revision unchanged, no value change); revoked grants make retry and manual-run return 409 with zero writes.
+5. **No forged human approval** — T3: a non-opted-in workflow action fails `WORKFLOW_ACTION_NOT_AUTOMATION_ALLOWED` and **zero** workflow transition events exist; successful automation transitions carry `actor_type='AUTOMATION'` with rule/run/action attribution, never a user identity.
+6. **No-progress writes never loop** — T1: an update that changes nothing produces `result_ref = 'no-progress'`, no record event, no revision bump, and therefore no downstream trigger.
+
+## Admission conditions C2-C8
+
+- **C2 (runtime guardrails before real actions)** — Checkpoint implementation audited (rate limit, backlog limit, no-progress suppression, problem-chain isolation with default pause) and exercised by the repaired guardrail suite; the engine was layered on top only after this audit.
+- **C3 (first real action proven by a genuine chain)** — T4 ping-pong: two rules updating each other's records through real record writes and the real outbox; the third hop ends `BLOCKED_CYCLE`; exactly two executions; causation quintuple (root/parent/run/depth/rule) asserted field-by-field on every hop. T4b repeats the proof across applications. No SQL outbox fabrication anywhere in these tests.
+- **C4 (run/audit query APIs + E-6 admin surface + 90-day retention)** — Endpoints for runs (filter + pagination), run detail, audit events, and per-rule summary; the Automation settings tab consumes them; `pruneRunHistory` deletes terminal runs older than 90 days except problem-chain-referenced ones; audit events are never pruned. All asserted in T5.
+- **C5 (L2 idempotency + create uniqueness in the DB)** — Engine-level skip of SUCCEEDED actions plus the `record_create_keys` unique constraint as the database anchor for A-3; asserted in T2. The post-suite audit tool's duplicate check was rescoped to each population's real key (RECORD: event key; SYSTEM: dedup_key) after the checkpoint's guardrail tests exposed that the naive grouping counted distinct SYSTEM deliveries as duplicates — the same failure had failed hosted CI since the checkpoint commit.
+- **C6 (small-fix remainder)** — `grant()` and `validateVersion` verify `sourceAppId` for all trigger types (audited in the checkpoint, covered by suite); run-status CHECK cleanup from migration 0040 verified.
+- **C7 (F4 delegated identity / F8 preflight audit)** — All execution runs under the grant approver's delegated context; no system or forged identity exists in the write path (T3/T6 evidence). Preflight (dry-run) writes audit events as established in P3-A and retained.
+- **C8 (dry-run completeness or explicit boundaries + re-grant semantics)** — Dry-run now returns per-action plans (recipients + rendered text, per-field from/to/changed, create payload preview, workflow current state with re-evaluation note, WEBHOOK P3-D note) and a `boundaries` block stating what a dry run does not prove. Re-authorization semantics: calling `grant()` again constitutes a fresh approval (new approver/timestamp recorded); T6 proves a revoked-then-regranted narrow grant governs execution exactly as written.
+
+## Hosted CI
+
+Hosted CI failed at the post-suite audit step for every branch commit from the checkpoint onward (root cause: C5 note above). The rescoped audit passes locally against the post-suite database; the final branch HEAD's hosted run is reported with this delivery.
+
+---
+
+# P3-B Local Automation Actions - Completion Report
+
+Branch: `p3-b-automation-actions` (from P3-A `dce80f3`). Not merged to main; not deployed.
+
+## Deviations and unresolved semantics (read first)
+
+1. **Migration 0042 relaxes `notifications_record_source_check`.** RECORD notifications previously required `event_id NOT NULL`; T-4 manual runs have no source event, so their A-1 notifications could not be stored. The constraint now requires `app_id` + `record_id` for RECORD rows (SYSTEM branch unchanged). Consequence: manual-run notifications fall outside the `(tenant, app, event, user, rule_key)` unique key (event is NULL); deduplication for them is guaranteed by run-level idempotency (deduplicated manual-run requests return the existing run without executing; retries skip SUCCEEDED actions), not by a notification unique key. This is recorded as a deliberate, bounded deviation.
+2. **Brief-authorized test adaptation (not silent).** When real execution landed, the P3-A and guardrail fixtures gained real action parameters (recipient assignee, create mappings, update operations), and four terminal-state assertions were updated per the brief's replacement rule: runs now end `SUCCEEDED` with `error_code` NULL instead of `ACTIONS_NOT_IMPLEMENTED` / `NOT_EXECUTED` / `P3B_DEFERRED`. P3-A historical runs are not retroactively promoted and are never replayed.
+3. **Retention pruning writes no audit row.** `automation_audit_events.actor_id` is NOT NULL with a tenant-member FK and there is no system actor; the 90-day pruner therefore records counts in the worker log instead of an audit event. Audit events themselves are never deleted by the pruner.
+4. **Worker cadence.** Chain hops propagate on the worker's ~60s cycle (each outbox pass advances the chain); the ping-pong and cross-app chain tests observe this honestly instead of forcing synchronous execution.
+5. **Pre-existing unused statuses.** `RATE_LIMITED` / `BACKLOG_LIMITED` remain in the run-status CHECK but are never assigned by code (the signal is carried by audit events, per the P3-A design); they are reserved for a possible P3-C activation. Unlike the removed `POTENTIAL_CYCLE` dead value, this is intentional and documented here.
+
+## Checkpoint disposition (b56db33 audit)
+
+The checkpoint was audited before any new feature work was layered on it. Findings:
+
+- All red tests were **test-side wiring faults**, not product defects: eight `expectRequest` calls missing `method: 'POST'`, a misused `assert.rejects`, and 200-vs-201 status expectations. Fixed in `c5869a1`.
+- The BLOCKED_CYCLE / repeated-failure / depth legs originally fired events that could never match their rules; they were rewritten to drive genuine matching events with strong assertions (exact status, exact run counts, problem-chain rows).
+- The backlog leg backfills `started_at` to escape the 60-second rate window; the rate limiter counts by `started_at` — that is the product semantic, verified in code.
+- The migration test's expected-table list gained `automation_problem_chains`.
+- **One real product defect found and fixed:** the problem-chain routes did not declare `@Param('appId')` and the service did not scope by application. Routes now take the parameter; listing filters by the last run's app and resume validates app ownership.
+- Migration 0040 verified correct (zero-to-head migration suite green); `rule_versions` status convergence to draft/published is safe; `grant()` / `validateVersion` sourceAppId checks verified present (C6); guardrail behavior (paused-chain skip, rate/backlog audit without marking events processed, problem chain + SYSTEM admin notification on CHAIN_PAUSED / depth) verified in code and by test.
+- Baseline after repair: **101/101 tests green** on the verification stack.
+
+## Scope completion
+
+| Brief item | Status | Evidence |
+| --- | --- | --- |
+| A-1 in-app notification action | Done | `executeNotifyAction`; T1 test (field recipient + template rendering), V-10 dedup asserted |
+| A-2 update own-record fields | Done | set/copy/increment/decrement/clear via `persistUpdate`; T1 test incl. no-progress suppression |
+| A-3 cross-app record creation | Done | `executeCreateAction` with action-row idempotency key in `record_create_keys`; T2 test |
+| A-4 restricted workflow advance | Done | `WorkflowRuntimeService.executeAutomation`; opt-in flag (migration 0041), `actor_type='AUTOMATION'` + rule/run/action attribution on `workflow_events`; T3 test |
+| T-4 manual trigger | Done | `manualRun` with `trigger.allowManual`, idempotency-key dedup; T5 test |
+| Ordered execution, action-level idempotency, fail-stop, retry-failed-only | Done | Savepoint per action; SUCCEEDED actions skipped on retry; T2/T3 tests |
+| Run history detail + C4 query APIs | Done | runs list/detail, audit list, summary endpoints; T5 test |
+| Non-atomic chain risk notice in UI | Done | Automation settings tab states the non-rollback semantics verbatim |
+| WEBHOOK action | Deferred to P3-D by design | Fails explicitly with `WEBHOOK_NOT_IMPLEMENTED_P3D`; asserted in T2 |
+
+## Commit list (dce80f3..HEAD)
+
+- `b56db33` checkpoint (predecessor, audited above)
+- `c5869a1` checkpoint test repair + problem-chain app scoping fix
+- `d73aea5` foundations: migration 0041, action-parameter config types
+- `45f3baf` threading: persistUpdate extraction, causation on writes, workflow attribution + executeAutomation
+- `ad76189` engine: real execution of A-1..A-4, manual runs, retry, C4 APIs, 90-day retention, dry-run action plans; worker wiring
+- `6401076` fixture adaptation per replacement rule; **also contains the P3-B web UI** (automation settings tab: summary, run history/detail, retry, manual run, problem chains) — swept in by the same commit; content verified by full workspace build
+- `ea8691d` user-field recipient parsing accepts bare id and JSON array forms
+- `f96d660` P3-B integration tests (7) + migration 0042
+- (final) audit-integrity 3b rescoping + this report section
+
+## Test evidence
+
+- Full suite on the verification stack: **108/108 pass** (101 pre-P3-B baseline + 7 new `p3-b-actions` tests).
+- Full workspace build / typecheck: clean (`pnpm -r build`, including the web app).
+- Migrations from zero: covered by the in-suite migration tests (43 migrations applied on the verification stack, incl. 0041/0042).
+- Post-suite audit-integrity tool: all 6 checks PASS after the 3b rescoping (see C5 note).
+
+## Gate evidence (six items)
+
+1. **Retry never duplicates a created record** — T2: A-3 action row keeps `attempt_count = 1` across a failed-then-retried run; exactly one record exists in the target app; `record_create_keys` holds the action-row idempotency key.
+2. **Numeric increment/decrement never double-applies** — T1: increment executes once; repeated `processOutbox` passes and the V-10 re-drive leave value and revision unchanged after the first application.
+3. **Failure recovery never replays succeeded actions** — T2/T3: after a later action fails, retry resumes at the first non-SUCCEEDED action; succeeded rows keep `attempt_count = 1`; workflow state advances exactly once.
+4. **Unauthorized execution never writes** — T6: after publish-time grant narrowing, the run ends `SKIPPED_UNAUTHORIZED` and the record is unchanged (revision unchanged, no value change); revoked grants make retry and manual-run return 409 with zero writes.
+5. **No forged human approval** — T3: a non-opted-in workflow action fails `WORKFLOW_ACTION_NOT_AUTOMATION_ALLOWED` and **zero** workflow transition events exist; successful automation transitions carry `actor_type='AUTOMATION'` with rule/run/action attribution, never a user identity.
+6. **No-progress writes never loop** — T1: an update that changes nothing produces `result_ref = 'no-progress'`, no record event, no revision bump, and therefore no downstream trigger.
+
+## Admission conditions C2-C8
+
+- **C2 (runtime guardrails before real actions)** — Checkpoint implementation audited (rate limit, backlog limit, no-progress suppression, problem-chain isolation with default pause) and exercised by the repaired guardrail suite; the engine was layered on top only after this audit.
+- **C3 (first real action proven by a genuine chain)** — T4 ping-pong: two rules updating each other's records through real record writes and the real outbox; the third hop ends `BLOCKED_CYCLE`; exactly two executions; causation quintuple (root/parent/run/depth/rule) asserted field-by-field on every hop. T4b repeats the proof across applications. No SQL outbox fabrication anywhere in these tests.
+- **C4 (run/audit query APIs + E-6 admin surface + 90-day retention)** — Endpoints for runs (filter + pagination), run detail, audit events, and per-rule summary; the Automation settings tab consumes them; `pruneRunHistory` deletes terminal runs older than 90 days except problem-chain-referenced ones; audit events are never pruned. All asserted in T5.
+- **C5 (L2 idempotency + create uniqueness in the DB)** — Engine-level skip of SUCCEEDED actions plus the `record_create_keys` unique constraint as the database anchor for A-3; asserted in T2. The post-suite audit tool's duplicate check was rescoped to each population's real key (RECORD: event key; SYSTEM: dedup_key) after the checkpoint's guardrail tests exposed that the naive grouping counted distinct SYSTEM deliveries as duplicates — the same failure had failed hosted CI since the checkpoint commit.
+- **C6 (small-fix remainder)** — `grant()` and `validateVersion` verify `sourceAppId` for all trigger types (audited in the checkpoint, covered by suite); run-status CHECK cleanup from migration 0040 verified.
+- **C7 (F4 delegated identity / F8 preflight audit)** — All execution runs under the grant approver's delegated context; no system or forged identity exists in the write path (T3/T6 evidence). Preflight (dry-run) writes audit events as established in P3-A and retained.
+- **C8 (dry-run completeness or explicit boundaries + re-grant semantics)** — Dry-run now returns per-action plans (recipients + rendered text, per-field from/to/changed, create payload preview, workflow current state with re-evaluation note, WEBHOOK P3-D note) and a `boundaries` block stating what a dry run does not prove. Re-authorization semantics: calling `grant()` again constitutes a fresh approval (new approver/timestamp recorded); T6 proves a revoked-then-regranted narrow grant governs execution exactly as written.
+
+## Hosted CI
+
+Hosted CI failed at the post-suite audit step for every branch commit from the checkpoint onward (root cause: C5 note above). The rescoped audit passes locally against the post-suite database; the final branch HEAD's hosted run is reported with this delivery.
