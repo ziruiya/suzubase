@@ -194,7 +194,7 @@ export function AutomationSettings({ app, token }: { app: App; token: string }) 
     if (!rotateSecret) { setError('Enter the new signing secret before rotating.'); return; }
     void run(async () => {
       await api(path + '/webhook-endpoints/' + endpoint.id + '/rotate-secret', token,
-        json('POST', { secret: String(data.get('secret') ?? ''), }));
+        json('POST', { secret: rotateSecret }));
       setRotateSecret('');
       await loadEndpoints();
       setNotice('Signing secret rotated. New attempts sign with the new key version; ' +
