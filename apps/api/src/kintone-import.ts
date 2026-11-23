@@ -237,7 +237,7 @@ export function mapKintoneField(source: any, options: {
         .map(([code, value]: [string, any]) => ({ ...value, code })) }));
     const invalidChild = tableFields.find(({ status, targetType }) =>
       status !== 'EQUIVALENT' || !['text', 'multiline', 'number', 'calculation', 'radio', 'checkbox',
-        'select', 'multiselect', 'date', 'time', 'datetime', 'url', 'user', 'organization', 'group']
+        'select', 'multiselect', 'date', 'time', 'datetime', 'url', 'user', 'organization', 'group', 'attachment']
         .includes(String(targetType)));
     if (!tableFields.length) return {
       ...base, targetType: 'table', status: 'UNRESOLVED',

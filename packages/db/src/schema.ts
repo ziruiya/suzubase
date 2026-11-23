@@ -1008,6 +1008,33 @@ export const fileReferences = pgTable('file_references', {
   foreignKey({ columns: [t.tenantId, t.appId, t.fileId], foreignColumns: [files.tenantId, files.appId, files.id] }),
 ]);
 
+/**
+ * P4-T2: references from subtable (table) row attachment cells to files.
+ * Kept apart from file_references because the child field id is not a row
+ * in `fields`; the pair (field_id = table field, sub_field_id = child)
+ * plus row_id locates the cell. Reference counting, retention and the
+ * download authorization treat both tables as one reference system.
+ * There is deliberately no FK to record_table_rows: row replacement
+ * deletes and reinserts rows before the reference reconciliation runs in
+ * the same transaction, and the service rewrites these references from
+ * the same replacement set, so consistency is transactional.
+ */
+export const tableFileReferences = pgTable('table_file_references', {
+  tenantId: tenantId(),
+  appId: uuid('app_id').notNull(),
+  recordId: uuid('record_id').notNull(),
+  fieldId: uuid('field_id').notNull(),
+  rowId: uuid('row_id').notNull(),
+  subFieldId: uuid('sub_field_id').notNull(),
+  fileId: uuid('file_id').notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId, t.appId, t.recordId, t.fieldId, t.rowId, t.subFieldId, t.fileId] }),
+  index().on(t.tenantId, t.appId, t.fileId),
+  foreignKey({ columns: [t.tenantId, t.appId, t.recordId], foreignColumns: [records.tenantId, records.appId, records.id] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.fieldId], foreignColumns: [fields.tenantId, fields.appId, fields.fieldId] }),
+  foreignKey({ columns: [t.tenantId, t.appId, t.fileId], foreignColumns: [files.tenantId, files.appId, files.id] }),
+]);
+
 export const permissionAudit = pgTable('permission_audit', {
   tenantId: tenantId(),
   appId: uuid('app_id').notNull(),

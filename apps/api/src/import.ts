@@ -654,7 +654,7 @@ import {
   appCounters, appVersions, autoNumberCounters, automationRules, automationRuleVersions,
   automationWebhookEndpoints, commentMentions, fields as fieldRows, fileReferences, files,
   recordComments, recordEvents, recordReferences, recordTableRows, recordUniqueValues,
-  recordWorkflowState, records, workflowActions, workflowAssignments, workflowDefinitions, workflowEvents,
+  recordWorkflowState, records, tableFileReferences, workflowActions, workflowAssignments, workflowDefinitions, workflowEvents,
   workflowStates,
 } from '@suzubase/db';
 import {
@@ -1162,10 +1162,22 @@ export class ImportExecutionService {
       for (const tableRow of rowsByRecord.get(source.id) ?? []) {
         const targetFieldId = state.map.get('field', tableRow.fieldId);
         if (!targetFieldId) continue;
+        const targetTable = targetFields.find(({ fieldId }) => fieldId === targetFieldId)?.table;
         const rowData: Record<string, string> = {};
         for (const [childId, value] of Object.entries(tableRow.data)) {
           const targetChildId = state.map.get('tableField', childId);
-          if (targetChildId) rowData[targetChildId] = value;
+          if (!targetChildId) continue;
+          // P4-T2: attachment child values hold source file ids and are
+          // remapped like record-level attachment values.
+          if (targetTable?.fields.some(({ fieldId, type }) => fieldId === targetChildId && type === 'attachment')) {
+            try {
+              const ids = JSON.parse(value || '[]') as string[];
+              rowData[targetChildId] = JSON.stringify(ids
+                .map((id) => state.map.get('attachment', id)).filter((id): id is string => Boolean(id)));
+            } catch { rowData[targetChildId] = '[]'; }
+          } else {
+            rowData[targetChildId] = value;
+          }
         }
         const targetRowId = randomUUID();
         await tx.insert(recordTableRows).values({
@@ -1173,6 +1185,17 @@ export class ImportExecutionService {
           rowOrder: tableRow.rowOrder, data: rowData,
         });
         state.map.set('tableRow', tableRow.rowId, targetRowId);
+        // P4-T2: subtable attachment references for the restored row.
+        for (const child of targetTable?.fields ?? []) {
+          if (child.type !== 'attachment') continue;
+          const ids = JSON.parse(rowData[child.fieldId] || '[]') as string[];
+          for (const fileId of ids) {
+            await tx.insert(tableFileReferences).values({
+              ...identity, recordId: targetId, fieldId: targetFieldId, rowId: targetRowId,
+              subFieldId: child.fieldId, fileId,
+            }).onConflictDoNothing();
+          }
+        }
       }
       // Attachment references + reference counts (files become ATTACHED).
       for (const field of targetFields) {
@@ -1206,13 +1229,19 @@ export class ImportExecutionService {
         fieldSurface: ['status', 'assignees', 'createdBy', 'updatedBy', 'createdAt', 'updatedAt', 'data'],
       });
     }
-    // Recompute attachment reference counts from the restored references.
+    // Recompute attachment reference counts from the restored references
+    // (record-level and subtable references count as one system, P4-T2).
     await tx.execute(sql`
       UPDATE files f SET reference_count = (
-        SELECT count(*)::int FROM file_references r
-        WHERE r.tenant_id = f.tenant_id AND r.app_id = f.app_id AND r.file_id = f.id
+        (SELECT count(*)::int FROM file_references r
+          WHERE r.tenant_id = f.tenant_id AND r.app_id = f.app_id AND r.file_id = f.id)
+        + (SELECT count(*)::int FROM table_file_references r
+          WHERE r.tenant_id = f.tenant_id AND r.app_id = f.app_id AND r.file_id = f.id)
       ), state = CASE WHEN EXISTS (
         SELECT 1 FROM file_references r
+        WHERE r.tenant_id = f.tenant_id AND r.app_id = f.app_id AND r.file_id = f.id
+      ) OR EXISTS (
+        SELECT 1 FROM table_file_references r
         WHERE r.tenant_id = f.tenant_id AND r.app_id = f.app_id AND r.file_id = f.id
       ) THEN 'ATTACHED' ELSE f.state END
       WHERE f.tenant_id = ${tenantId} AND f.app_id = ${targetAppId}`);

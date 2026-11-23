@@ -6,6 +6,7 @@ import {
 } from '@suzubase/shared-types';
 import { z } from 'zod';
 import { normalizeValue } from './field-values';
+import { fileIds } from './files';
 import { calculateFields } from './formula';
 import { uniqueKey } from './schema-preflight';
 import { identifier } from './validation';
@@ -57,10 +58,24 @@ export async function prepareTableRows(
         const oldValue = previousData[field.fieldId];
         const priorChoices: string[] = oldValue && multiOptionFieldTypes.has(field.type) ? JSON.parse(oldValue) : oldValue ? [oldValue] : [];
         const options = field.options.map((option) => ({ ...option, disabled: option.disabled && !priorChoices.includes(option.value) }));
-        const result = value === '' ? '' : normalizeValue(field.type, value, options);
+        // P4-T2: attachment children store the same canonical form as
+        // record-level attachment fields (JSON array of file UUIDs,
+        // validated exactly like records.normalizeData validates them).
+        let result: string | undefined;
+        if (field.type === 'attachment') {
+          try {
+            const parsed = fileIds.safeParse(JSON.parse(value || '[]'));
+            result = parsed.success ? JSON.stringify(parsed.data) : undefined;
+          } catch {
+            result = undefined;
+          }
+        } else {
+          result = value === '' ? '' : normalizeValue(field.type, value, options);
+        }
         const prefix = 'Row ' + (index + 1) + ' · ' + field.name + ' · ';
         if (result === undefined || result !== oldValue && !await directory(field.type, result)) error(fieldId, prefix + 'invalid value');
-        if (field.required && (!result || result === '[]' && multiOptionFieldTypes.has(field.type))) error(fieldId, prefix + 'required');
+        if (field.required && (!result || result === '[]' &&
+          (multiOptionFieldTypes.has(field.type) || field.type === 'attachment'))) error(fieldId, prefix + 'required');
         if (!result) continue;
         const keys = seen.get(field.fieldId);
         if (keys) {
