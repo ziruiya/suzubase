@@ -179,7 +179,7 @@ test('P4 merge: a package whose floor exceeds the deployment is rejected explici
   const validated = await expectRequest(201, `/imports/${job.id}/validate`, { token: targetToken, method: 'POST' });
   assert.equal(validated.status, 'failed', JSON.stringify(validated));
   assert.match(JSON.stringify(validated.errorReport ?? {}),
-    /requires program version 2\.0\.0 or newer; this deployment runs 1\.1\.0/);
+    /requires program version 2\.0\.0 or newer; this deployment runs 1\.2\.0/);
   const leftovers = await dbQuery(
     'SELECT count(*)::int AS n FROM apps WHERE tenant_id = $1', [target.tenantId]);
   assert.equal(leftovers[0].n, 0, 'rejected package must leave no application behind');

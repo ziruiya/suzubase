@@ -152,3 +152,15 @@ dd { white-space: pre-wrap; }
 .automation-scroll { overflow-x: auto; }
 .automation-scroll table { border-collapse: collapse; width: 100%; }
 .automation-scroll th, .automation-scroll td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid #e0e8ef; vertical-align: top; }
+
+.sample-banner {
+  background: #fdf3e3; color: #7a4b00; border-bottom: 1px solid #e8cf9f;
+  padding: .45rem 1rem; text-align: center; font-size: .9rem;
+}
+.turnstile { min-height: 65px; }
+.login-back { text-align: center; margin: 1rem 0 0; }
+
+.sample-watermark {
+  position: fixed; inset: 0; z-index: 60; pointer-events: none;
+  background-repeat: repeat; overflow: hidden;
+}

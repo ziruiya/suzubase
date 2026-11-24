@@ -14,6 +14,8 @@ import { NotificationCenter, useUnread } from './notification-center';
 import { Comments } from './comments';
 import { Tasks, WorkflowDetail } from './workflow-runtime';
 import { AccountSecurity } from './account-security';
+import { Turnstile, sampleInfo, type SampleInfo } from './turnstile';
+import { SampleWatermark } from './watermark';
 import './style.css';
 
 type Item = Pick<RecordResponse, 'id' | 'recordNo' | 'data' | 'revision' | 'schemaVersion'> & { status?: string };
@@ -82,6 +84,42 @@ function Login({ onLogin, notice }: { onLogin: (session: Session) => void; notic
         <button className="primary" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
       </form>
       {error && <p className="error" role="alert">{error}</p>}
+    </section>
+  </main>;
+}
+
+function SampleLanding({ info, onLogin, onAdmin }: {
+  info: SampleInfo; onLogin: (session: Session) => void; onAdmin: () => void;
+}) {
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  async function enter() {
+    if (!turnstileToken) return;
+    setBusy(true); setError('');
+    try {
+      const { accessToken } = await api<{ accessToken: string }>('/auth/sample-session', undefined,
+        json('POST', { turnstileToken }));
+      const profile = await api<Profile>('/auth/profile', accessToken);
+      onLogin({ token: accessToken, profile, draftAllowed: { current: true } });
+    } catch (error) {
+      setError(message(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <main className="login">
+    <SampleWatermark />
+    <section className="panel stack">
+      <div className="brand"><span aria-hidden="true">S</span> SuzuBase</div>
+      <h1>公開サンプル</h1>
+      <p>SuzuBase の公開サンプルです。架空の不動産会社「ひだまり不動産株式会社」の業務システム（顧客管理、物件管理、商談・案内管理、契約管理、売上・入金管理）を公開しています。データはすべて架空のデモ用で、実在の企業・個人の情報は含まれていません。</p>
+      <p>ログインなしで入って閲覧できます。レコードの追加・変更もできますが、使えるのはプルダウン・数値・日付などの構造化項目のみで、テキスト項目は読み取り専用です。サンプルのデータは毎朝 4 時に自動でリセットされ、初期状態に戻ります。</p>
+      {info.siteKey && <Turnstile siteKey={info.siteKey} onToken={setTurnstileToken} />}
+      <button className="primary" disabled={busy || !turnstileToken} onClick={() => void enter()}>
+        {busy ? '入っています…' : 'サンプルに入る'}</button>
+      {error && <p className="error" role="alert">{error}</p>}
+      <button type="button" onClick={onAdmin}>管理者ログイン</button>
     </section>
   </main>;
 }
@@ -408,6 +446,8 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
 
 function Root() {
   const [session, setSession] = useState<Session>();
+  const [sample, setSample] = useState<SampleInfo>();
+  const [adminLogin, setAdminLogin] = useState(false);
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [current, setCurrent] = useState<{ appId: string; recordId?: string }>();
   const [security, setSecurity] = useState(false);
@@ -415,6 +455,9 @@ function Root() {
   const [notice, setNotice] = useState('');
   const narrow = useNarrow();
   const unread = useUnread(session?.token);
+  useEffect(() => {
+    if (!session) void sampleInfo().then(setSample).catch(() => undefined);
+  }, [session]);
   async function logout() {
     if (!session) return;
     session.draftAllowed.current = false;
@@ -423,6 +466,7 @@ function Root() {
     await removeDrafts((draft) => draft.scope[0] === tenantId && draft.scope[1] === userId).catch(() => undefined);
   }
   return session ? <>
+    {session.profile.sampleGuest && <SampleWatermark />}
     <header className="top"><div className="top-inner inline spread">
       <button className="brand" onClick={() => { setCurrent(undefined); setNotificationOpen(false); setSecurity(false); setDirectory(false); }}><span aria-hidden="true">S</span> SuzuBase</button>
       <div className="inline account"><span>{session.profile.displayName ?? session.profile.email}</span>
@@ -436,6 +480,8 @@ function Root() {
         </>}
         <button onClick={() => { setNotice(''); void logout(); }}>Sign out</button></div>
     </div></header>
+    {session.profile.sampleGuest && <div className="sample-banner" role="note">
+      公開サンプル環境です · ひだまり不動産株式会社（架空）の業務システム デモ · テキスト項目は読み取り専用 · データは毎日 04:00 に自動リセット</div>}
     <main className="workspace">
       {notificationOpen ? <NotificationCenter session={session} onRead={unread.reload} onOpen={(appId, recordId) => {
         setCurrent({ appId, recordId });
@@ -446,7 +492,15 @@ function Root() {
       }} /> : current ? <Records key={current.appId + (current.recordId ?? '')} appId={current.appId} initialRecord={current.recordId} refreshUnread={unread.reload} session={session} narrow={narrow} leave={() => setCurrent(undefined)} />
         : <Portal session={session} narrow={narrow} navigate={(appId, recordId) => setCurrent({ appId, recordId })} />}
     </main>
-  </> : <Login notice={notice} onLogin={(value) => { setSession(value); setNotice(''); }} />;
+  </> : sample?.enabled && !adminLogin
+    ? <SampleLanding info={sample} onAdmin={() => setAdminLogin(true)}
+      onLogin={(value) => { setSession(value); setNotice(''); }} />
+    : <>
+      {sample?.enabled && <SampleWatermark />}
+      {sample?.enabled && <p className="login-back">
+        <button type="button" onClick={() => setAdminLogin(false)}>← サンプルの入口に戻る</button></p>}
+      <Login notice={notice} onLogin={(value) => { setSession(value); setNotice(''); }} />
+    </>;
 }
 
 createRoot(document.getElementById('root')!).render(<Root />);

@@ -3,6 +3,7 @@ import { apiTokenActions, fieldTypes, indexPurposes, textSearchModes } from '@su
 import { z } from 'zod';
 import { appHttp } from './app-schema';
 import { authHttp } from './identity';
+import { sampleHttp } from './sample';
 import { notificationHttp, systemNotificationHttp } from './notifications';
 import { commentHttp } from './comments';
 import { csvHttp } from './csv';
@@ -144,7 +145,7 @@ const user = z.object({ id, email: text, loginName: text.nullable(), displayName
 const grants = z.object({ canManageRecycleBin: flag, canReadArchivedFields: flag, isAdmin: flag });
 const profile = user.pick({ email: true, displayName: true }).extend({
   tenantId: id, userId: id, ...grants.shape, canCreateApps: flag, allowAppCreation: flag, localDrafts: flag,
-  timeZone: text, localDraftLogout: z.literal('clear'), draftExpiryHours: integer,
+  timeZone: text, localDraftLogout: z.literal('clear'), draftExpiryHours: integer, sampleGuest: flag,
 });
 const organization = tenantId.extend({ id, name: text, parentId: nullableId });
 const group = tenantId.extend({ id, name: text });
@@ -222,6 +223,11 @@ const contracts: Record<string, Partial<Record<Method, Contract>>> = {
   '/auth/login': { post: { status: 200, body: authHttp.loginInput, description: 'Supply exactly one email or login name. Supply a factor after a two-factor challenge.',
     reply: z.union([z.object({ accessToken: text, expiresIn: integer }), z.object({ secondFactorRequired: z.literal(true) })]) } },
   '/auth/profile': { get: { reply: profile } },
+  '/auth/sample': { get: { reply: z.object({ enabled: flag, siteKey: text.optional() }),
+    description: 'Public discovery for the optional public sample site: whether it is enabled and its public Turnstile site key.' } },
+  '/auth/sample-session': { post: { status: 200, body: sampleHttp.sampleSessionInput,
+    reply: z.object({ accessToken: text, expiresIn: integer }),
+    description: 'Exchanges a passing Cloudflare Turnstile token for a one-hour session of the designated sample guest. The guest can only write structured field values; free-text writes, deletes, uploads and comments are refused.' } },
   '/auth/totp': { get: { reply: z.object({ enabled: flag }) } },
   '/auth/totp/enrollment': { post: { body: authHttp.enrollTotpInput, reply: z.object({ secret: text, expiresIn: integer }) } },
   '/auth/totp/enable': { post: { body: authHttp.changeTotpInput, reply: z.object({ enabled: z.literal(true), recoveryCodes: z.array(text).length(10) }),

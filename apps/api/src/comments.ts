@@ -12,6 +12,7 @@ import { AuthorizationService } from './authorization';
 import { AuthenticatedTenant, SessionGuard } from './identity';
 import { NotificationPlanner } from './notification-planner';
 import { serializeRecord, writeRecordEvent } from './record-events';
+import { SamplePolicy } from './sample';
 import { identifier, parseInput } from './validation';
 
 const text = z.string().min(1).max(4000).refine((value) => !/[\x00\p{Surrogate}]/u.test(value));
@@ -175,7 +176,7 @@ export class CommentService {
 @UseGuards(SessionGuard)
 @Controller('apps/:appId/records/:recordId/comments')
 export class CommentController {
-  constructor(private readonly comments: CommentService) {}
+  constructor(private readonly comments: CommentService, private readonly sample: SamplePolicy) {}
 
   @Get()
   list(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') recordId: string, @Query() query: unknown) {
@@ -186,13 +187,15 @@ export class CommentController {
     return this.comments.mentionOptions(context, parseInput(identifier, appId), parseInput(identifier, recordId));
   }
   @Post()
-  create(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') recordId: string, @Body() body: unknown) {
+  async create(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') recordId: string, @Body() body: unknown) {
+    await this.sample.assertNotGuest(context, 'コメントの投稿（コメントはテキスト入力のため）');
     return this.comments.create(context, parseInput(identifier, appId), parseInput(identifier, recordId), parseInput(createInput, body));
   }
   @Delete(':commentId')
-  remove(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+  async remove(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Param('recordId') recordId: string, @Param('commentId') commentId: string,
   ) {
+    await this.sample.assertNotGuest(context, 'コメントの削除');
     return this.comments.remove(context, parseInput(identifier, appId), parseInput(identifier, recordId), parseInput(identifier, commentId));
   }
 }
