@@ -239,7 +239,14 @@ async function draftFields(appId) {
 }
 
 async function registerFields(appCode, appId) {
-  for (const field of await draftFields(appId)) fieldIds.set(`${appCode}:${field.code}`, field.fieldId);
+  let fields = await draftFields(appId);
+  if (!fields.length) {
+    // After publish the working draft is empty; the published schema on the
+    // app detail is the authoritative field list (records-only/reset mode).
+    const detail = await call('GET', `/apps/${appId}`);
+    fields = detail.fields ?? [];
+  }
+  for (const field of fields) fieldIds.set(`${appCode}:${field.code}`, field.fieldId);
 }
 
 async function ensureAppSchema(app) {
