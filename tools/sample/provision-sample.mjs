@@ -52,7 +52,7 @@ BEGIN;
 INSERT INTO tenants (id, name, allow_app_creation, local_drafts, time_zone)
 VALUES ('${tenantId}', '${COMPANY}', false, false, 'Asia/Tokyo');
 ${userRow(adminId, ADMIN_EMAIL, 'サンプル管理者')}
-${userRow(guestId, 'guest@example.jp', 'ゲスト（样品访客）')}
+${userRow(guestId, 'guest@example.jp', 'ゲスト（サンプル閲覧）')}
 ${STAFF.map(([, name, email], i) => userRow(Object.values(staff)[i], email, name)).join('\n')}
 INSERT INTO tenant_members (tenant_id, user_id, is_admin, can_create_apps, can_manage_recycle_bin)
 VALUES ('${tenantId}', '${adminId}', true, true, true);

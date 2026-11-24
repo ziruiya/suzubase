@@ -323,7 +323,7 @@ export function RecordEditor({
     setError('');
     form.clearErrors();
     if (guest && !turnstileToken.current) {
-      setError('请先完成人机验证，再保存。');
+      setError('保存の前に、本人確認（Turnstile）を完了してください。');
       return;
     }
     if ([...pending.current.values()].some((names) => names.length) || reselect.length) {
@@ -472,7 +472,7 @@ export function RecordEditor({
         Choose unuploaded files again when recovering a draft.</p>
     </details> : <p className="muted">Local drafts are disabled in settings.</p>}
     {guest && <div className="stack">
-      <p className="muted">样品站：文本字段为只读，只能修改下拉、数字、日期等结构化字段；提交前请完成人机验证。</p>
+      <p className="muted">サンプル環境：テキスト項目は読み取り専用です。変更できるのはプルダウン・数値・日付などの構造化項目のみです。送信前に本人確認（Turnstile）が必要です。</p>
       {siteKey && <Turnstile siteKey={siteKey} resetSignal={turnstileReset}
         onToken={(token) => { turnstileToken.current = token; }} />}
     </div>}

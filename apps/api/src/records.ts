@@ -145,7 +145,7 @@ export class RecordService {
     const byId = new Map(definitions.map((field) => [field.fieldId, field]));
     const errors: { field: string; message: string }[] = [];
     const reject = (fieldId: string) => errors.push({
-      field: fieldId, message: '样品站访客只能填写下拉、数字、日期等结构化字段，不能录入文本或附件',
+      field: fieldId, message: 'サンプル環境のゲストが入力できるのは、プルダウン・数値・日付などの構造化項目のみです。テキストと添付ファイルは入力できません',
     });
     for (const [fieldId, value] of Object.entries(data)) {
       const field = byId.get(fieldId);
@@ -819,7 +819,7 @@ export class RecordService {
   }
 
   async changeLifecycle(context: TenantContext, appId: string, id: string, revision: number, restore: boolean) {
-    if (await isSampleGuest(context)) throw new ForbiddenException('样品站访客不能删除或恢复记录');
+    if (await isSampleGuest(context)) throw new ForbiddenException('サンプル環境のゲストはレコードの削除・復元はできません');
     return withTenantTransaction(context, async (tx) => {
       if (restore && !await this.authorization.requireRecycleAccess(tx, context)) throw new ForbiddenException('无权限');
       const { access } = await this.appSchema.writable(tx, context, appId, 'delete');

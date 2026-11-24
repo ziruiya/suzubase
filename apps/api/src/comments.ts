@@ -188,14 +188,14 @@ export class CommentController {
   }
   @Post()
   async create(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Param('recordId') recordId: string, @Body() body: unknown) {
-    await this.sample.assertNotGuest(context, '发表评论（评论属于文本内容）');
+    await this.sample.assertNotGuest(context, 'コメントの投稿（コメントはテキスト入力のため）');
     return this.comments.create(context, parseInput(identifier, appId), parseInput(identifier, recordId), parseInput(createInput, body));
   }
   @Delete(':commentId')
   async remove(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Param('recordId') recordId: string, @Param('commentId') commentId: string,
   ) {
-    await this.sample.assertNotGuest(context, '删除评论');
+    await this.sample.assertNotGuest(context, 'コメントの削除');
     return this.comments.remove(context, parseInput(identifier, appId), parseInput(identifier, recordId), parseInput(identifier, commentId));
   }
 }

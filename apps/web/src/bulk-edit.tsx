@@ -38,7 +38,7 @@ export function BulkEdit({ app, path, rows, session, done, close, directory }: {
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!field || !selection.length) return;
-    if (guest && !turnstileToken.current) { setError('请先完成人机验证'); return; }
+    if (guest && !turnstileToken.current) { setError('先に本人確認（Turnstile）を完了してください'); return; }
     setBusy(true); setError(''); setResults([]);
     try {
       const selected = selection.flatMap((id) => {

@@ -24,7 +24,7 @@ function loadTurnstile(): Promise<void> {
     script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
     script.async = true;
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error('人机验证组件加载失败'));
+    script.onerror = () => reject(new Error('本人確認コンポーネントの読み込みに失敗しました'));
     document.head.appendChild(script);
   });
   return window.__suzubaseTurnstileLoading;

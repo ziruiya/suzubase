@@ -111,14 +111,14 @@ export class SamplePolicy {
   async requireGuestTurnstile(context: TenantContext, token: string | undefined, remoteIp?: string): Promise<void> {
     if (!await this.isGuest(context)) return;
     if (!await this.verifyTurnstile(token, remoteIp)) {
-      throw new ForbiddenException('人机验证未通过：样品站提交前请完成人机验证');
+      throw new ForbiddenException('本人確認（Turnstile）が完了していません。送信の前に確認を完了してください');
     }
   }
 
   // Actions that are closed to the sample guest entirely (deletes, uploads,
   // comments -- comments are free text).
   async assertNotGuest(context: TenantContext, action: string): Promise<void> {
-    if (await this.isGuest(context)) throw new ForbiddenException(`样品站访客不能${action}`);
+    if (await this.isGuest(context)) throw new ForbiddenException(`サンプル環境のゲストは${action}できません`);
   }
 }
 
@@ -155,7 +155,7 @@ export class SampleController {
     }
     const { turnstileToken } = parseInput(sampleSessionInput, body);
     if (!await this.policy.verifyTurnstile(turnstileToken, ip)) {
-      throw new ForbiddenException('人机验证未通过');
+      throw new ForbiddenException('本人確認（Turnstile）が完了していません');
     }
     const identity = { tenantId: site.tenantId, userId: site.guestUserId };
     const member = await withTenantTransaction(identity, async (tx) => {

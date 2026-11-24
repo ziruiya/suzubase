@@ -225,7 +225,7 @@ export class FileController {
   @ApiConsumes('application/octet-stream')
   async upload(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Query() query: unknown, @Body() body: Buffer) {
-    await this.sample.assertNotGuest(context, '上传附件');
+    await this.sample.assertNotGuest(context, '添付ファイルのアップロード');
     return this.files.upload(context, parseInput(identifier, appId), parseInput(uploadInput, query), body);
   }
 

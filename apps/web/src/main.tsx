@@ -112,16 +112,14 @@ function SampleLanding({ info, onLogin, onAdmin }: {
     <SampleWatermark />
     <section className="panel stack">
       <div className="brand"><span aria-hidden="true">S</span> SuzuBase</div>
-      <h1>公开样品站</h1>
-      <p>这是 SuzuBase 的公开样品：虚构房产公司「ひだまり不動産株式会社」的业务系统
-        （顾客管理、物件管理、商談・案内管理、契約管理、売上・入金管理），数据全部为虚构演示数据，不含任何真实企业或个人信息。</p>
-      <p>免登录即可进入浏览。你可以新增、修改记录，但只能使用下拉、数字、日期等结构化字段；
-        文本字段为只读，不能录入文字。全部样品数据每天凌晨 4 点自动重置回初始状态。</p>
+      <h1>公開サンプル</h1>
+      <p>SuzuBase の公開サンプルです。架空の不動産会社「ひだまり不動産株式会社」の業務システム（顧客管理、物件管理、商談・案内管理、契約管理、売上・入金管理）を公開しています。データはすべて架空のデモ用で、実在の企業・個人の情報は含まれていません。</p>
+      <p>ログインなしで入って閲覧できます。レコードの追加・変更もできますが、使えるのはプルダウン・数値・日付などの構造化項目のみで、テキスト項目は読み取り専用です。サンプルのデータは毎朝 4 時に自動でリセットされ、初期状態に戻ります。</p>
       {info.siteKey && <Turnstile siteKey={info.siteKey} onToken={setTurnstileToken} />}
       <button className="primary" disabled={busy || !turnstileToken} onClick={() => void enter()}>
-        {busy ? '进入中…' : '进入样品'}</button>
+        {busy ? '入っています…' : 'サンプルに入る'}</button>
       {error && <p className="error" role="alert">{error}</p>}
-      <button type="button" onClick={onAdmin}>管理员登录</button>
+      <button type="button" onClick={onAdmin}>管理者ログイン</button>
     </section>
   </main>;
 }
@@ -483,7 +481,7 @@ function Root() {
         <button onClick={() => { setNotice(''); void logout(); }}>Sign out</button></div>
     </div></header>
     {session.profile.sampleGuest && <div className="sample-banner" role="note">
-      公开样品站 · ひだまり不動産株式会社（虚构）业务系统演示 · 文本字段只读 · 数据每日 04:00 自动重置</div>}
+      公開サンプル環境です · ひだまり不動産株式会社（架空）の業務システム デモ · テキスト項目は読み取り専用 · データは毎日 04:00 に自動リセット</div>}
     <main className="workspace">
       {notificationOpen ? <NotificationCenter session={session} onRead={unread.reload} onOpen={(appId, recordId) => {
         setCurrent({ appId, recordId });
@@ -500,7 +498,7 @@ function Root() {
     : <>
       {sample?.enabled && <SampleWatermark />}
       {sample?.enabled && <p className="login-back">
-        <button type="button" onClick={() => setAdminLogin(false)}>← 返回样品站入口</button></p>}
+        <button type="button" onClick={() => setAdminLogin(false)}>← サンプルの入口に戻る</button></p>}
       <Login notice={notice} onLogin={(value) => { setSession(value); setNotice(''); }} />
     </>;
 }
