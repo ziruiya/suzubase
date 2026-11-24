@@ -308,6 +308,24 @@ async function ensureAppSchema(app) {
     });
   }
 
+  // ACL: guests may view/create/edit records; free-text + attachment fields
+  // are editable by the sample admin only (field ACL -> read-only for guests
+  // in the UI and rejected by the API).
+  await call('PUT', `/apps/${appId}/draft/acl`, {
+    app: ['view', 'create', 'edit'].map((action) => ({
+      action, subject: { kind: 'user', id: STATE.guestUserId },
+    })),
+    record: [],
+    field: app.fields.filter((field) => FREE_TEXT.has(field.type)).map((field) => ({
+      action: 'edit', subject: { kind: 'user', id: STATE.adminUserId },
+      fieldId: fieldIds.get(`${app.code}:${field.code}`),
+    })),
+  });
+
+  // Publish the app schema BEFORE the workflow: workflow publish
+  // validates assignees against the published schema fields.
+  await call('POST', `/apps/${appId}/publish`, {});
+
   // Workflow.
   if (app.workflow) {
     const assignees = [{ kind: 'creator' }, { kind: 'user-field', id: fieldIds.get(`${app.code}:staff`) }];
@@ -326,21 +344,6 @@ async function ensureAppSchema(app) {
     await call('PATCH', `/apps/${appId}/workflow/enabled`, { enabled: true });
   }
 
-  // ACL: guests may view/create/edit records; free-text + attachment fields
-  // are editable by the sample admin only (field ACL -> read-only for guests
-  // in the UI and rejected by the API).
-  await call('PUT', `/apps/${appId}/draft/acl`, {
-    app: ['view', 'create', 'edit'].map((action) => ({
-      action, subject: { kind: 'user', id: STATE.guestUserId },
-    })),
-    record: [],
-    field: app.fields.filter((field) => FREE_TEXT.has(field.type)).map((field) => ({
-      action: 'edit', subject: { kind: 'user', id: STATE.adminUserId },
-      fieldId: fieldIds.get(`${app.code}:${field.code}`),
-    })),
-  });
-
-  await call('POST', `/apps/${appId}/publish`, {});
 }
 
 async function ensureRelated() {
