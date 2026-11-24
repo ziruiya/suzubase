@@ -36,7 +36,7 @@ import {
 // the P4 merge finalization together with MINIMUM_PROGRAM_VERSION (see
 // export-package.ts): this deployment understands P4 packages; pre-P4
 // deployments stay at 1.0.0 and reject them explicitly.
-export const PROGRAM_VERSION = '1.1.0';
+export const PROGRAM_VERSION = '1.2.0';
 /** Route-scoped body limit for POST /imports/upload (Wave C gap fix).
  * Import packages are tenant-admin-only whole-application archives and can
  * legitimately exceed the 8 MB single-attachment limit; the parser in

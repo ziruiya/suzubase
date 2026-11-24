@@ -76,6 +76,19 @@ export const loginCredentials = authentication.table('login_credentials', {
   foreignKey({ columns: [t.tenantId, t.userId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
 ]);
 
+// Public sample site designation (migration 0052). Read pre-auth only via the
+// authentication.sample_site() SECURITY DEFINER function; the guest member
+// never holds login credentials. Only the public Turnstile site key is stored.
+export const sampleSite = authentication.table('sample_site', {
+  tenantId: tenantId(),
+  guestUserId: uuid('guest_user_id').notNull(),
+  siteKey: text('site_key').notNull(),
+  enabled: boolean('enabled').notNull().default(true),
+}, (t) => [
+  primaryKey({ columns: [t.tenantId] }),
+  foreignKey({ columns: [t.tenantId, t.guestUserId], foreignColumns: [tenantMembers.tenantId, tenantMembers.userId] }),
+]);
+
 export const draftStatus = pgEnum('draft_status', ['editing', 'validation-failed', 'publishable']);
 
 export const apps = pgTable('apps', {

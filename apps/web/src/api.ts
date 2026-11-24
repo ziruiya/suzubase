@@ -13,6 +13,7 @@ export interface Profile {
   localDrafts: boolean;
   timeZone: string;
   draftExpiryHours: number;
+  sampleGuest?: boolean;
 }
 
 export interface AppSummary {

@@ -1,7 +1,8 @@
-import { useState, type FormEvent } from 'react';
+import { useRef, useState, type FormEvent } from 'react';
 import { api, json, message, type App, type Session } from './api';
 import type { SelectorOptions } from './selector-options';
 import { normalizeInForm, RuntimeField } from './forms';
+import { Turnstile, useSampleSiteKey } from './turnstile';
 
 type Row = { id: string; revision: number; recordNo: string };
 type Outcome = { id: string; status: number; error?: unknown };
@@ -29,19 +30,28 @@ export function BulkEdit({ app, path, rows, session, done, close, directory }: {
   const [results, setResults] = useState<(Outcome & { recordNo: string })[]>([]);
   const fields = app.fields.filter(({ editable }) => editable);
   const field = fields.find((field) => field.fieldId === fieldId);
+  const guest = session.profile.sampleGuest === true;
+  const siteKey = useSampleSiteKey(guest);
+  const turnstileToken = useRef<string | null>(null);
+  const [turnstileReset, setTurnstileReset] = useState(0);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!field || !selection.length) return;
+    if (guest && !turnstileToken.current) { setError('请先完成人机验证'); return; }
     setBusy(true); setError(''); setResults([]);
     try {
       const selected = selection.flatMap((id) => {
         const row = rows.find((row) => row.id === id);
         return row ? [row] : [];
       });
-      const { results } = await api<{ results: Outcome[] }>(path + '/batch', session.token, json('PATCH', {
-        fieldId, value: clear ? null : normalizeInForm(field, value, session.profile.timeZone), items: selected.map(({ id, revision }) => ({ id, revision })),
-      }));
+      const { results } = await api<{ results: Outcome[] }>(path + '/batch', session.token, {
+        ...json('PATCH', {
+          fieldId, value: clear ? null : normalizeInForm(field, value, session.profile.timeZone), items: selected.map(({ id, revision }) => ({ id, revision })),
+        }),
+        ...(guest ? { headers: { 'x-turnstile-token': turnstileToken.current! } } : {}),
+      });
+      if (guest) { turnstileToken.current = null; setTurnstileReset((n) => n + 1); }
       setResults(results.map((outcome) => ({ ...outcome, recordNo: selected.find(({ id }) => id === outcome.id)!.recordNo })));
       setSelection([]);
       await done();
@@ -75,6 +85,8 @@ export function BulkEdit({ app, path, rows, session, done, close, directory }: {
             session={session} app={app} disabled={busy} directory={directory} />
         </>}
       </div>}
+      {guest && siteKey && <Turnstile siteKey={siteKey} resetSignal={turnstileReset}
+        onToken={(token) => { turnstileToken.current = token; }} />}
       <button type="submit" disabled={!field || !selection.length || busy || pending && !clear}>Update selected records</button>
     </form>
     {error && <p role="alert">{error}</p>}

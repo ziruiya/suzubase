@@ -14,6 +14,8 @@ import { NotificationCenter, useUnread } from './notification-center';
 import { Comments } from './comments';
 import { Tasks, WorkflowDetail } from './workflow-runtime';
 import { AccountSecurity } from './account-security';
+import { Turnstile, sampleInfo, type SampleInfo } from './turnstile';
+import { SampleWatermark } from './watermark';
 import './style.css';
 
 type Item = Pick<RecordResponse, 'id' | 'recordNo' | 'data' | 'revision' | 'schemaVersion'> & { status?: string };
@@ -82,6 +84,44 @@ function Login({ onLogin, notice }: { onLogin: (session: Session) => void; notic
         <button className="primary" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
       </form>
       {error && <p className="error" role="alert">{error}</p>}
+    </section>
+  </main>;
+}
+
+function SampleLanding({ info, onLogin, onAdmin }: {
+  info: SampleInfo; onLogin: (session: Session) => void; onAdmin: () => void;
+}) {
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  async function enter() {
+    if (!turnstileToken) return;
+    setBusy(true); setError('');
+    try {
+      const { accessToken } = await api<{ accessToken: string }>('/auth/sample-session', undefined,
+        json('POST', { turnstileToken }));
+      const profile = await api<Profile>('/auth/profile', accessToken);
+      onLogin({ token: accessToken, profile, draftAllowed: { current: true } });
+    } catch (error) {
+      setError(message(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <main className="login">
+    <SampleWatermark />
+    <section className="panel stack">
+      <div className="brand"><span aria-hidden="true">S</span> SuzuBase</div>
+      <h1>公开样品站</h1>
+      <p>这是 SuzuBase 的公开样品：虚构房产公司「ひだまり不動産株式会社」的业务系统
+        （顾客管理、物件管理、商談・案内管理、契約管理、売上・入金管理），数据全部为虚构演示数据，不含任何真实企业或个人信息。</p>
+      <p>免登录即可进入浏览。你可以新增、修改记录，但只能使用下拉、数字、日期等结构化字段；
+        文本字段为只读，不能录入文字。全部样品数据每天凌晨 4 点自动重置回初始状态。</p>
+      {info.siteKey && <Turnstile siteKey={info.siteKey} onToken={setTurnstileToken} />}
+      <button className="primary" disabled={busy || !turnstileToken} onClick={() => void enter()}>
+        {busy ? '进入中…' : '进入样品'}</button>
+      {error && <p className="error" role="alert">{error}</p>}
+      <button type="button" onClick={onAdmin}>管理员登录</button>
     </section>
   </main>;
 }
@@ -408,6 +448,8 @@ function Records({ appId, initialRecord, session, narrow, leave, refreshUnread }
 
 function Root() {
   const [session, setSession] = useState<Session>();
+  const [sample, setSample] = useState<SampleInfo>();
+  const [adminLogin, setAdminLogin] = useState(false);
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [current, setCurrent] = useState<{ appId: string; recordId?: string }>();
   const [security, setSecurity] = useState(false);
@@ -415,6 +457,9 @@ function Root() {
   const [notice, setNotice] = useState('');
   const narrow = useNarrow();
   const unread = useUnread(session?.token);
+  useEffect(() => {
+    if (!session) void sampleInfo().then(setSample).catch(() => undefined);
+  }, [session]);
   async function logout() {
     if (!session) return;
     session.draftAllowed.current = false;
@@ -423,6 +468,7 @@ function Root() {
     await removeDrafts((draft) => draft.scope[0] === tenantId && draft.scope[1] === userId).catch(() => undefined);
   }
   return session ? <>
+    {session.profile.sampleGuest && <SampleWatermark />}
     <header className="top"><div className="top-inner inline spread">
       <button className="brand" onClick={() => { setCurrent(undefined); setNotificationOpen(false); setSecurity(false); setDirectory(false); }}><span aria-hidden="true">S</span> SuzuBase</button>
       <div className="inline account"><span>{session.profile.displayName ?? session.profile.email}</span>
@@ -436,6 +482,8 @@ function Root() {
         </>}
         <button onClick={() => { setNotice(''); void logout(); }}>Sign out</button></div>
     </div></header>
+    {session.profile.sampleGuest && <div className="sample-banner" role="note">
+      公开样品站 · ひだまり不動産株式会社（虚构）业务系统演示 · 文本字段只读 · 数据每日 04:00 自动重置</div>}
     <main className="workspace">
       {notificationOpen ? <NotificationCenter session={session} onRead={unread.reload} onOpen={(appId, recordId) => {
         setCurrent({ appId, recordId });
@@ -446,7 +494,15 @@ function Root() {
       }} /> : current ? <Records key={current.appId + (current.recordId ?? '')} appId={current.appId} initialRecord={current.recordId} refreshUnread={unread.reload} session={session} narrow={narrow} leave={() => setCurrent(undefined)} />
         : <Portal session={session} narrow={narrow} navigate={(appId, recordId) => setCurrent({ appId, recordId })} />}
     </main>
-  </> : <Login notice={notice} onLogin={(value) => { setSession(value); setNotice(''); }} />;
+  </> : sample?.enabled && !adminLogin
+    ? <SampleLanding info={sample} onAdmin={() => setAdminLogin(true)}
+      onLogin={(value) => { setSession(value); setNotice(''); }} />
+    : <>
+      {sample?.enabled && <SampleWatermark />}
+      {sample?.enabled && <p className="login-back">
+        <button type="button" onClick={() => setAdminLogin(false)}>← 返回样品站入口</button></p>}
+      <Login notice={notice} onLogin={(value) => { setSession(value); setNotice(''); }} />
+    </>;
 }
 
 createRoot(document.getElementById('root')!).render(<Root />);

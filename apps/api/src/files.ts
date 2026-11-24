@@ -11,6 +11,7 @@ import { AppSchemaService } from './app-schema';
 import { AuthorizationService } from './authorization';
 import { AllowApiToken, AuthenticatedTenant, SessionGuard } from './identity';
 import { attachmentKey, localAttachmentStorage } from './storage';
+import { SamplePolicy } from './sample';
 import { identifier, parseInput } from './validation';
 
 export const attachmentTypes = ['image/png', 'image/jpeg', 'application/pdf'] as const;
@@ -218,12 +219,13 @@ export class FileService {
 @UseGuards(SessionGuard)
 @Controller('apps/:appId/files')
 export class FileController {
-  constructor(private readonly files: FileService) {}
+  constructor(private readonly files: FileService, private readonly sample: SamplePolicy) {}
 
   @Post()
   @ApiConsumes('application/octet-stream')
-  upload(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
+  async upload(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Query() query: unknown, @Body() body: Buffer) {
+    await this.sample.assertNotGuest(context, '上传附件');
     return this.files.upload(context, parseInput(identifier, appId), parseInput(uploadInput, query), body);
   }
 

@@ -20,6 +20,7 @@ import { WorkflowRuntimeController, WorkflowRuntimeService } from './workflow-ru
 import { WorkflowDefinitionController, WorkflowDefinitionService } from './workflow-definitions';
 import { AutomationController, AutomationService } from './automation';
 import { RecordService, RecordsController } from './records';
+import { SampleController, SamplePolicy } from './sample';
 import { Controller, Get, Module, ServiceUnavailableException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
@@ -48,8 +49,8 @@ class HealthController {
     signOptions: { algorithm: 'HS256', expiresIn: '1h', issuer: 'suzubase', audience: 'suzubase-session' },
     verifyOptions: { algorithms: ['HS256'], issuer: 'suzubase', audience: 'suzubase-session' },
   })],
-  controllers: [HealthController, SessionController, SessionProfileController, AppSchemaController, RecordsController, WorkflowDefinitionController, AutomationController, WorkflowRuntimeController, TenantAdminController, FileController, NotificationController, SystemNotificationController, CommentController, CsvController, ApiTokenController, RuntimeIndexController, ExportController, ImportController, MigrationController, TokenReissueController],
-  providers: [AuthorizationService, SessionGuard, AppSchemaService, RecordService, RecordQueryService, WorkflowDefinitionService, AutomationService, WorkflowRuntimeService, TenantAdminService, FileService, SearchService, NotificationService, NotificationPlanner, CommentService, CsvService, ApiTokenService, RuntimeIndexService, ExportService, ImportService, ImportExecutionService, ImportFinalizer, ImportOrchestrator, MigrationGuard],
+  controllers: [HealthController, SessionController, SessionProfileController, SampleController, AppSchemaController, RecordsController, WorkflowDefinitionController, AutomationController, WorkflowRuntimeController, TenantAdminController, FileController, NotificationController, SystemNotificationController, CommentController, CsvController, ApiTokenController, RuntimeIndexController, ExportController, ImportController, MigrationController, TokenReissueController],
+  providers: [AuthorizationService, SessionGuard, SamplePolicy, AppSchemaService, RecordService, RecordQueryService, WorkflowDefinitionService, AutomationService, WorkflowRuntimeService, TenantAdminService, FileService, SearchService, NotificationService, NotificationPlanner, CommentService, CsvService, ApiTokenService, RuntimeIndexService, ExportService, ImportService, ImportExecutionService, ImportFinalizer, ImportOrchestrator, MigrationGuard],
 })
 class AppModule {}
 

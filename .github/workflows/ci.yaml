@@ -31,6 +31,10 @@ jobs:
       DATABASE_URL: postgres://suzubase_runtime:suzubase-runtime-ci@127.0.0.1:5432/suzubase
       TEST_API_URL: http://127.0.0.1:3000
       TEST_WEB_URL: http://127.0.0.1:5173
+      # Sample-site tests stub the Turnstile siteverify endpoint (the stub
+      # itself is started by packages/db/test/sample-guest.test.cjs).
+      TURNSTILE_SECRET_KEY: sample-test-secret
+      TURNSTILE_SITEVERIFY_URL: http://127.0.0.1:18777/siteverify
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

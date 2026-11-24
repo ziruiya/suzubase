@@ -10,6 +10,7 @@ import { RelatedRecords } from './related';
 import { FormGrid } from './form-layout';
 import { RichTextEditor, RichTextValue, richTextSummary } from './rich-text';
 import { draftKey, recoverDraft, removeDrafts, writeDraft, type Draft, type DraftScope } from './drafts';
+import { Turnstile, useSampleSiteKey } from './turnstile';
 
 type SaveState = 'editing' | 'local draft saved' | 'submitting' | 'success' | 'failed-retryable' | 'version conflict';
 const statusText: Record<SaveState, string> = {
@@ -260,6 +261,10 @@ export function RecordEditor({
   const [state, setState] = useState<SaveState>('editing');
   const [error, setError] = useState('');
   const { profile, token } = session;
+  const guest = profile.sampleGuest === true;
+  const siteKey = useSampleSiteKey(guest);
+  const turnstileToken = useRef<string | null>(null);
+  const [turnstileReset, setTurnstileReset] = useState(0);
   const allowDraft = profile.localDrafts && app.localDrafts;
   const scope: DraftScope = [profile.tenantId, profile.userId, app.id, record?.id ?? newId.current, app.schemaVersion];
   const form = useForm<RecordData>({ defaultValues: record?.data ?? {} });
@@ -317,6 +322,10 @@ export function RecordEditor({
   async function submit(values: RecordData) {
     setError('');
     form.clearErrors();
+    if (guest && !turnstileToken.current) {
+      setError('请先完成人机验证，再保存。');
+      return;
+    }
     if ([...pending.current.values()].some((names) => names.length) || reselect.length) {
       setError('Retry or discard pending attachments before saving.');
       return;
@@ -337,9 +346,11 @@ export function RecordEditor({
     const path = appPath(app.id) + '/records';
     const categories = app.categories?.enabled ? { categoryIds } : {};
     try {
+      const guestHeaders: Record<string, string> = guest ? { 'x-turnstile-token': turnstileToken.current! } : {};
       const saved = baseline
-        ? await api<RecordResponse>(path + '/' + baseline.id, token, json('PUT', { revision: baseline.revision, data, ...categories }))
-        : await api<RecordResponse>(path, token, { ...json('POST', { data, ...categories }), headers: { 'Idempotency-Key': replayKey.current } });
+        ? await api<RecordResponse>(path + '/' + baseline.id, token, { ...json('PUT', { revision: baseline.revision, data, ...categories }), headers: guestHeaders })
+        : await api<RecordResponse>(path, token, { ...json('POST', { data, ...categories }), headers: { 'Idempotency-Key': replayKey.current, ...guestHeaders } });
+      if (guest) { turnstileToken.current = null; setTurnstileReset((n) => n + 1); }
       setState('success');
       if (allowDraft) await removeDrafts(ownDraft).catch(() => undefined);
       onSaved(saved);
@@ -460,6 +471,11 @@ export function RecordEditor({
         Private browsing or clearing site data can remove drafts. File entries keep uploaded IDs or filenames.
         Choose unuploaded files again when recovering a draft.</p>
     </details> : <p className="muted">Local drafts are disabled in settings.</p>}
+    {guest && <div className="stack">
+      <p className="muted">样品站：文本字段为只读，只能修改下拉、数字、日期等结构化字段；提交前请完成人机验证。</p>
+      {siteKey && <Turnstile siteKey={siteKey} resetSignal={turnstileReset}
+        onToken={(token) => { turnstileToken.current = token; }} />}
+    </div>}
     <div className="save-bar inline" style={{ bottom: focusInset }}>
       {allowDraft && <button type="button" disabled={busy} onClick={() => void saveDraft()}>Save local draft</button>}
       <button className="primary" disabled={busy || Boolean(latest)} type="submit">Save to server</button>

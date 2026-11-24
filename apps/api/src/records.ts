@@ -27,6 +27,7 @@ import { uniqueKey } from './schema-preflight';
 import { calculateFields } from './formula';
 import { normalizeValue } from './field-values';
 import { identifier, parseInput } from './validation';
+import { SamplePolicy, clientIp, isFreeTextFieldType, isSampleGuest } from './sample';
 
 const dataInput = z.record(identifier, z.string());
 const createInput = z.strictObject({ data: dataInput, categoryIds: categoryIdsInput.optional() });
@@ -131,6 +132,50 @@ export class RecordService {
     return normalizedData;
   }
 
+  // Sample-guest write discipline (defense in depth on top of field ACL):
+  // a guest submit may only carry structured values. Free-text field types
+  // and attachments must arrive empty (create) or unchanged (update);
+  // subtable rows are checked per child field the same way. Lookup refresh
+  // never reaches here with client-supplied values (see persistUpdate).
+  private async assertSampleGuestData(
+    context: TenantContext, definitions: FieldDefinition[], data: RecordData,
+    existing?: RecordData, existingTables?: Map<string, TableRow[]>,
+  ) {
+    if (!await isSampleGuest(context)) return;
+    const byId = new Map(definitions.map((field) => [field.fieldId, field]));
+    const errors: { field: string; message: string }[] = [];
+    const reject = (fieldId: string) => errors.push({
+      field: fieldId, message: '样品站访客只能填写下拉、数字、日期等结构化字段，不能录入文本或附件',
+    });
+    for (const [fieldId, value] of Object.entries(data)) {
+      const field = byId.get(fieldId);
+      if (!field) continue;
+      if (existing && (existing[fieldId] ?? '') === value) continue;
+      if (isFreeTextFieldType(field.type)) {
+        if (value !== '') reject(fieldId);
+      } else if (field.type === 'attachment') {
+        if (value && value !== '[]') reject(fieldId);
+      } else if (field.type === 'table' && field.table && value) {
+        let rows: TableRow[] = [];
+        try {
+          const parsed: unknown = JSON.parse(value);
+          if (Array.isArray(parsed)) rows = parsed as TableRow[];
+        } catch { continue; }
+        const children = new Map(field.table.fields.map((child) => [child.fieldId, child]));
+        const prior = new Map((existingTables?.get(fieldId) ?? []).map((row) => [row.rowId, row.data]));
+        for (const row of rows) {
+          for (const [childId, childValue] of Object.entries(row.data ?? {})) {
+            const child = children.get(childId);
+            if (!child || !childValue) continue;
+            if (prior.get(row.rowId)?.[childId] === childValue) continue;
+            if (isFreeTextFieldType(child.type) || child.type === 'attachment') reject(fieldId);
+          }
+        }
+      }
+    }
+    if (errors.length) throw new BadRequestException(errors);
+  }
+
   private async validDirectoryValue(tx: TenantTransaction, context: TenantContext, type: string, id: string) {
     if (!id) return true;
     switch (type) {
@@ -174,6 +219,7 @@ export class RecordService {
       assertCategoryAssignments(configuration, categoryIds);
     }
     this.assertEditable(access, input, fields);
+    if (source === 'api') await this.assertSampleGuestData(context, fields, input);
     const identity = { tenantId: context.tenantId, appId };
     const counterScope = and(eq(appCounters.tenantId, context.tenantId), eq(appCounters.appId, appId));
     if (key !== undefined) {
@@ -399,11 +445,17 @@ export class RecordService {
         const type = inputTypes.get(input.fieldId);
         if (!type || type === 'table' || !isRecordInput(type)) throw new BadRequestException([{ field: input.fieldId, message: 'Field is not writable in this record version' }]);
         this.assertEditable(access, { [input.fieldId]: input.value ?? '' }, definitions);
+        await this.assertSampleGuestData(context, definitions, { [input.fieldId]: input.value ?? '' }, current.data);
         candidate = Object.fromEntries(Object.entries(current.data).filter(([id]) => isRecordInput(inputTypes.get(id))));
         if (input.value === null) delete candidate[input.fieldId];
         else candidate[input.fieldId] = input.value;
       } else {
         this.assertEditable(access, input.data, definitions);
+        const guestTableIds = definitions.filter((field) => field.type === 'table' && Object.hasOwn(input.data, field.fieldId))
+          .map(({ fieldId }) => fieldId);
+        const guestTables = guestTableIds.length
+          ? await this.readTableRows(tx, context, appId, recordId, guestTableIds) : undefined;
+        await this.assertSampleGuestData(context, definitions, input.data, current.data, guestTables);
         const retained = Object.fromEntries(Object.entries(current.data).filter(([id]) =>
           !this.authorization.editable(access, id) && isRecordInput(inputTypes.get(id))));
         candidate = { ...retained, ...input.data };
@@ -767,6 +819,7 @@ export class RecordService {
   }
 
   async changeLifecycle(context: TenantContext, appId: string, id: string, revision: number, restore: boolean) {
+    if (await isSampleGuest(context)) throw new ForbiddenException('样品站访客不能删除或恢复记录');
     return withTenantTransaction(context, async (tx) => {
       if (restore && !await this.authorization.requireRecycleAccess(tx, context)) throw new ForbiddenException('无权限');
       const { access } = await this.appSchema.writable(tx, context, appId, 'delete');
@@ -942,7 +995,16 @@ export class RecordService {
 export class RecordsController {
   constructor(
     private readonly service: RecordService, private readonly queries: RecordQueryService, private readonly search: SearchService,
+    private readonly sample: SamplePolicy,
   ) {}
+
+  private async guestGate(
+    context: TenantContext, token: string | undefined, cfIp: string | undefined, forwardedFor: string | undefined,
+  ) {
+    await this.sample.requireGuestTurnstile(context, token, clientIp({
+      headers: { 'cf-connecting-ip': cfIp, 'x-forwarded-for': forwardedFor },
+    }));
+  }
 
   @Post()
   @AllowApiToken('create')
@@ -952,10 +1014,13 @@ export class RecordsController {
     description: 'Scoped to tenant, user, app and record creation. Retained until physical deletion of the record. A replay returns the original 201 response.',
     schema: { type: 'string', pattern: keyPattern.source },
   })
-  create(
+  async create(
     @AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Body() body: unknown, @Headers('idempotency-key') key: unknown,
+    @Headers('x-turnstile-token') turnstile: string | undefined,
+    @Headers('cf-connecting-ip') cfIp: string | undefined, @Headers('x-forwarded-for') forwardedFor: string | undefined,
   ) {
+    await this.guestGate(context, turnstile, cfIp, forwardedFor);
     return this.service.create(context, parseInput(identifier, appId), parseInput(createInput, body), parseInput(createKey, key));
   }
 
@@ -1018,14 +1083,22 @@ export class RecordsController {
 
   @Post('batch')
   @AllowApiToken('create')
-  batch(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown) {
+  async batch(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown,
+    @Headers('x-turnstile-token') turnstile: string | undefined,
+    @Headers('cf-connecting-ip') cfIp: string | undefined, @Headers('x-forwarded-for') forwardedFor: string | undefined,
+  ) {
+    await this.guestGate(context, turnstile, cfIp, forwardedFor);
     const { items } = parseInput(batchCreateInput, body);
     return this.service.batchCreate(context, parseInput(identifier, appId), items);
   }
 
   @Patch('batch')
   @AllowApiToken('edit')
-  batchUpdate(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown) {
+  async batchUpdate(@AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string, @Body() body: unknown,
+    @Headers('x-turnstile-token') turnstile: string | undefined,
+    @Headers('cf-connecting-ip') cfIp: string | undefined, @Headers('x-forwarded-for') forwardedFor: string | undefined,
+  ) {
+    await this.guestGate(context, turnstile, cfIp, forwardedFor);
     return this.service.batchUpdate(context, parseInput(identifier, appId), parseInput(batchUpdateInput, body));
   }
 
@@ -1080,10 +1153,13 @@ export class RecordsController {
 
   @Put(':recordId')
   @AllowApiToken('edit')
-  update(
+  async update(
     @AuthenticatedTenant() context: TenantContext, @Param('appId') appId: string,
     @Param('recordId') id: string, @Body() body: unknown,
+    @Headers('x-turnstile-token') turnstile: string | undefined,
+    @Headers('cf-connecting-ip') cfIp: string | undefined, @Headers('x-forwarded-for') forwardedFor: string | undefined,
   ) {
+    await this.guestGate(context, turnstile, cfIp, forwardedFor);
     return this.service.update(context, parseInput(identifier, appId), parseInput(identifier, id), parseInput(updateInput, body));
   }
 }

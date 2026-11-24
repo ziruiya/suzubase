@@ -29,12 +29,12 @@ function withDatabase(connectionString, name) {
 // Part A: upgrade path. A database built at the pre-0050 shape (the
 // first 50 journal entries applied by hand, drizzle bookkeeping rows
 // inserted exactly as the migrator would) and seeded with old business
-// data must survive the real migrate.js run to all 52 migrations with
+// data must survive the real migrate.js run to all 53 migrations with
 // every record, file, reference and subtable row intact.
 // ---------------------------------------------------------------------
-test('P4-fix C4: pre-0050 database with business data upgrades to 52 migrations without loss', async () => {
+test('P4-fix C4: pre-0050 database with business data upgrades to 53 migrations without loss', async () => {
   const journal = JSON.parse(await readFile(join(migrationsDir, 'meta/_journal.json'), 'utf8'));
-  assert.equal(journal.entries.length, 52);
+  assert.equal(journal.entries.length, 53);
   const scratch = 'suzubase_p4fix_' + randomUUID().replaceAll('-', '').slice(0, 12);
   const adminUrl = withDatabase(process.env.ADMIN_DATABASE_URL, scratch);
   const migrationUrl = withDatabase(process.env.MIGRATION_DATABASE_URL, scratch);
@@ -67,7 +67,7 @@ test('P4-fix C4: pre-0050 database with business data upgrades to 52 migrations 
       await mig.query(`CREATE TABLE IF NOT EXISTS drizzle.__drizzle_migrations (
         id SERIAL PRIMARY KEY, hash text NOT NULL, created_at bigint)`);
       const files = (await readdir(migrationsDir)).filter((name) => name.endsWith('.sql')).sort();
-      assert.equal(files.length, 52);
+      assert.equal(files.length, 53);
       for (const entry of journal.entries.slice(0, 50)) {
         const file = files.find((name) => name.startsWith(entry.tag));
         assert.ok(file, entry.tag);
@@ -141,14 +141,14 @@ test('P4-fix C4: pre-0050 database with business data upgrades to 52 migrations 
         MIGRATION_DATABASE_URL: migrationUrl,
       },
     });
-    assert.match(stdout, /52 applied in total/);
+    assert.match(stdout, /53 applied in total/);
 
     const check = new Client({ connectionString: adminUrl });
     await check.connect();
     try {
       const [{ n: migrationCount }] = (await check.query(
         'SELECT count(*)::int AS n FROM drizzle.__drizzle_migrations')).rows;
-      assert.equal(migrationCount, 52);
+      assert.equal(migrationCount, 53);
       const records = (await check.query(
         'SELECT id, data FROM records WHERE tenant_id = $1 ORDER BY record_no', [tenantId])).rows;
       assert.equal(records.length, 2);

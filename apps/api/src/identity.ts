@@ -10,6 +10,7 @@ import { ApiTokenAction } from '@suzubase/shared-types';
 import { identifier, parseInput } from './validation';
 
 import { createSecret, lockTotp, memberScope } from './totp';
+import { isSampleGuest } from './sample';
 
 const passwordInput = z.string().min(1).max(1024).refine((value) => !/[\x00\p{Surrogate}]/u.test(value));
 const factorInput = z.string().trim().regex(/^(?:[0-9]{6}|[a-f0-9]{32})$/i);
@@ -188,7 +189,10 @@ export class SessionProfileController {
         eq(tenantMembers.tenantId, context.tenantId), eq(tenantMembers.userId, context.userId),
       ));
       if (!profile) throw new UnauthorizedException('无权限');
-      return { ...profile, ...context, localDraftLogout: 'clear', draftExpiryHours: 168 };
+      return {
+        ...profile, ...context, localDraftLogout: 'clear', draftExpiryHours: 168,
+        sampleGuest: await isSampleGuest(context),
+      };
     });
   }
 }

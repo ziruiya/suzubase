@@ -12,7 +12,7 @@ export {
   automationWebhookDeliveries, automationWebhookEndpoints, automationWebhookAttempts, automationAuditEvents, automationProblemChains, type AutomationRuleConfig, type AutomationConditionOperator,
   notifications, recordComments, commentMentions,
   workflowDefinitions, workflowStates, workflowActions, recordWorkflowState, workflowAssignments, workflowEvents,
-  groupMembers, loginCredentials, memberGroups, organizations, tenantMembers, tenants, users,
+  groupMembers, loginCredentials, memberGroups, organizations, sampleSite, tenantMembers, tenants, users,
 } from './schema';
 
 export interface TenantContext {
@@ -40,6 +40,20 @@ export async function verifyLogin(email: string, password: string): Promise<(Ten
   const result = await pool.query<{ tenantId: string; userId: string; sessionVersion: number }>(
     'SELECT tenant_id AS "tenantId", user_id AS "userId", session_version AS "sessionVersion" FROM authentication.verify_login($1, $2)',
     [email, password],
+  );
+  return result.rows[0];
+}
+
+export interface SampleSiteConfiguration {
+  tenantId: string;
+  guestUserId: string;
+  siteKey: string;
+}
+
+// The single enabled public-sample designation, if any (migration 0052).
+export async function getSampleSite(): Promise<SampleSiteConfiguration | undefined> {
+  const result = await pool.query<SampleSiteConfiguration>(
+    'SELECT tenant_id AS "tenantId", guest_user_id AS "guestUserId", site_key AS "siteKey" FROM authentication.sample_site()',
   );
   return result.rows[0];
 }

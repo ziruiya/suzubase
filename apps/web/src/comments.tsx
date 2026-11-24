@@ -56,7 +56,7 @@ export function Comments({ appId, recordId, session, archived, refresh }: {
   return <section className="stack" aria-label="Comments">
     <h2>Comments</h2>
     {error && <p role="alert">{error}</p>}
-    {!archived && <form className="stack" onSubmit={(event) => {
+    {!archived && !session.profile.sampleGuest && <form className="stack" onSubmit={(event) => {
       event.preventDefault();
       const payload = [...parts, ...(text ? [{ kind: 'text' as const, text }] : [])].map((part) =>
         part.kind === 'text' ? part : { kind: 'mention', userId: part.userId });
